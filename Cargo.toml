@@ -43,6 +43,8 @@ lynkeus-engine = { path = "crates/lynkeus-engine" }
 
 # Esterne.
 anyhow = "1.0.104"
+# Solo per i benchmark (dev-dependency), senza grafici né rayon.
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
 # Senza `default_fonts`: i font di egui includono Ubuntu-Light (licenza Ubuntu Font),
 # fuori dall'allowlist. I font si caricano dal sistema (`platform`).
 eframe = { version = "0.37.0", default-features = false, features = [
@@ -56,10 +58,14 @@ eframe = { version = "0.37.0", default-features = false, features = [
 egui = { version = "0.37.0", default-features = false }
 fluent-templates = "0.15.1"
 ignore = "0.4.34"
+# Solo per i test di proprietà (dev-dependency).
+proptest = "1.12.0"
 regex = "1.13.1"
 serde = { version = "1.0.229", features = ["derive"] }
 sys-locale = "0.3.2"
 thiserror = "2.0.21"
+# NFC/NFD dei termini e tabella delle varianti accentate (lynkeus-core).
+unicode-normalization = "0.1.26"
 # Solo per le feature Linux che eframe attiverebbe con `winit/default`: Wayland caricato a
 # runtime e decorazioni client su GNOME. `-notitle` evita `ab_glyph` → `ttf-parser`
 # (RUSTSEC-2026-0192, non mantenuto): la barra c'è, senza il titolo scritto.
