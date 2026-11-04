@@ -239,37 +239,37 @@ Ogni fase finisce con `cargo xtask check` verde e un commit. Il lavoro si orches
 - [x] `cargo xtask check` verde e commit
 
 ### Fase 1 Ã¢â‚¬â€ Motore di ricerca (core)
-- [ ] Compilazione dei termini: letterali, jolly, frasi, maiuscole, accenti (anche NFD)
-- [ ] Validazione dei termini
-- [ ] Parola fino agli spazi e punteggiatura ai bordi; troncamento e contesto
-- [ ] Unione dei risultati per parola e per termine; OR/AND con `FileAccumulator`
-- [ ] `Location` per tutti i formati
-- [ ] Test a partizioni e `proptest` (parola contiene la corrispondenza, niente a capo, confini UTF-8, blocchi = intero)
-- [ ] Benchmark `criterion`
-- [ ] Controlli verdi e commit
+- [x] Compilazione dei termini: letterali, jolly, frasi, maiuscole, accenti (anche NFD)
+- [x] Validazione dei termini
+- [x] Parola fino agli spazi e punteggiatura ai bordi; troncamento e contesto
+- [x] Unione dei risultati per parola e per termine; OR/AND con `FileAccumulator`
+- [x] `Location` per tutti i formati
+- [x] Test a partizioni e `proptest` (parola contiene la corrispondenza, niente a capo, confini UTF-8, blocchi = intero)
+- [x] Benchmark `criterion`
+- [x] Controlli verdi e commit
 
 ### Fase 2 Ã¢â‚¬â€ Scansione e file di testo
-- [ ] Radici miste (cartelle e file)
-- [ ] Filtri: estensioni, cartelle da saltare, nascosti e di sistema, dimensione massima, file solo online
-- [ ] Rilevamento dei binari e delle codifiche (BOM, UTF-8, chardetng, Windows-1252)
-- [ ] Lettura a blocchi con numeri di riga
-- [ ] Parallelismo, annulla, avanzamento, avvisi, limite dei risultati
-- [ ] Test d'integrazione su cartelle di prova
-- [ ] Controlli verdi e commit
+- [x] Radici miste (cartelle e file)
+- [x] Filtri: estensioni, cartelle da saltare, nascosti e di sistema, dimensione massima, file solo online
+- [x] Rilevamento dei binari e delle codifiche (BOM, UTF-8, chardetng, Windows-1252)
+- [x] Lettura a blocchi con numeri di riga
+- [x] Parallelismo, annulla, avanzamento, avvisi, limite dei risultati
+- [x] Test d'integrazione su cartelle di prova
+- [x] Controlli verdi e commit
 
 ### Fase 3 Ã¢â‚¬â€ Interfaccia principale
-- [ ] Layout (menu, modulo a sinistra, risultati/avvisi al centro, stato in basso) e `theme.rs`
-- [ ] Radici con drag & drop e dialoghi `rfd`
-- [ ] Righe dei termini con validazione, opzioni, OR/AND, filtri
-- [ ] Tabella virtualizzata ordinabile con evidenziazione e selezione multipla
-- [ ] Barra di stato e scheda Avvisi
-- [ ] Menu e scorciatoie
-- [ ] Persistenza in `settings.toml` (scrittura durevole)
-- [ ] Test `egui_kittest` ("ar" trova "aragosta")
-- [ ] Controlli verdi e commit
+- [x] Layout (menu, modulo a sinistra, risultati/avvisi al centro, stato in basso) e `theme.rs`
+- [x] Radici con drag & drop e dialoghi `rfd`
+- [x] Righe dei termini con validazione, opzioni, OR/AND, filtri
+- [x] Tabella virtualizzata ordinabile con evidenziazione e selezione multipla
+- [x] Barra di stato e scheda Avvisi
+- [x] Menu e scorciatoie
+- [x] Persistenza in `settings.toml` (scrittura durevole)
+- [x] Test `egui_kittest` ("ar" trova "aragosta")
+- [x] Controlli verdi e commit
 
 ### Fase 4 Ã¢â‚¬â€ Processo isolato e documenti moderni
-- [ ] Threat model del processo estrattore e degli archivi; ADR isolamento
+- [x] Threat model del processo estrattore e degli archivi; ADR isolamento
 - [ ] Prototipi in `experiments/` (`pdf_oxide`, Job Object) e ADR libreria PDF
 - [ ] Processo estrattore, protocollo, pool, Job Object / `RLIMIT_AS`, timeout, stop
 - [ ] Estrattori docx, xlsx, pptx, ODF, PDF
