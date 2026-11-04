@@ -272,10 +272,10 @@ Ogni fase finisce con `cargo xtask check` verde e un commit. Il lavoro si orches
 - [x] Threat model del processo estrattore e degli archivi; ADR isolamento
 - [x] Prototipi in `experiments/` (`pdf_oxide`, Job Object) e ADR libreria PDF
 - [ ] Processo estrattore, protocollo, pool, Job Object / `RLIMIT_AS`, timeout, stop
-- [ ] Estrattori docx, xlsx, pptx, ODF, PDF
-- [ ] Archivi zip annidati con limiti
+- [x] Estrattori docx, xlsx, pptx, ODF, PDF
+- [x] Archivi zip annidati con limiti
 - [ ] Cache su disco
-- [ ] File di prova (LibreOffice + casi malevoli)
+- [x] File di prova (LibreOffice + casi malevoli)
 - [ ] Controlli verdi e commit
 
 ### Fase 5 — Altri formati
