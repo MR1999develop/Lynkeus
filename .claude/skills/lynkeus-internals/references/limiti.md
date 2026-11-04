@@ -7,7 +7,12 @@
 | Contesto | circa 120 caratteri intorno alla parola |
 | Anteprima | unità di testo con ±20 unità vicine |
 | Rilevamento binari | NUL nei primi 8 KB (senza schema UTF-16) o firma nota |
-| Lettura dei file di testo | blocchi di circa 8 MB tagliati a fine riga |
+| Lettura dei file di testo | blocchi di circa 8 MB tagliati a fine riga; la codifica si decide sul primo blocco; una riga più lunga di un blocco si taglia dopo l'ultimo spazio (file con soli CR = una riga); passi di ricerca di 10.000 righe e 1 MiB |
+| Dimensione massima di un file | 200 MiB (modificabile o senza limite); vale anche per le radici; in `settings.toml` da 1 a 1.048.576 MiB |
+| Termini | 32 per ricerca, 256 caratteri ciascuno (spazi esterni esclusi) |
+| Estensioni nei filtri | 32 caratteri, senza punti interni |
+| Recenti | 10 radici, 10 termini |
+| `settings.toml` | letto fino a 1 MiB, elenchi fino a 256 voci, stringhe fino a 4096 byte |
 | Processi estrattori | `min(core/2, 4)`, avviati al primo documento |
 | Timeout per file | 60 s, poi processo terminato e sostituito |
 | Annulla | richiesta di stop (chiusura stdin), chiusura forzata dopo 500 ms; risposta attesa entro 1 s |
@@ -21,6 +26,8 @@
 | Token dell'istanza unica | 128 bit casuali |
 
 I limiti sugli archivi sono contati sui byte decompressi con `Read::take` (anche per docx e odt) e modificabili in "Avanzate".
+
+File nascosti: su Windows solo per attributo `HIDDEN` o `SYSTEM`, su Linux per il punto iniziale. File solo online: attributi `RECALL_ON_DATA_ACCESS`, `RECALL_ON_OPEN`, `OFFLINE`; saltati anche se sono una radice. Il confronto dei nomi di cartella da saltare ignora le maiuscole su Windows.
 
 Cartelle saltate per impostazione predefinita: `.git`, `node_modules`, `target`, `$RECYCLE.BIN`, `System Volume Information`.
 

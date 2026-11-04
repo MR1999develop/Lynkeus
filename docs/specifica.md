@@ -16,18 +16,19 @@ Cercare una porzione di testo in file singoli o in cartelle (con sottocartelle) 
 ## 3. Termini
 
 - Una riga per termine, aggiunta con il pulsante +.
-- Ogni termine è cercato così com'è, spazi compresi.
-- Un termine vuoto, o fatto solo di `*` e `?`, è un errore mostrato sotto il campo.
+- Ogni termine è cercato così com'è, spazi interni compresi; gli spazi (White_Space Unicode) iniziali e finali sono tolti, altrimenti la corrispondenza inizierebbe con uno spazio e la parola si estenderebbe oltre.
+- Un termine vuoto o di soli spazi, fatto solo di `*`, `?` e spazi (con i jolly accesi), con un a capo dentro, oltre 256 caratteri, o oltre 32 termini, è un errore mostrato sotto il campo.
 - Con i jolly spenti `*` e `?` sono caratteri letterali.
 
 ## 4. Regole di confronto
 
-- **Jolly:** `*` = zero o più caratteri non spazio; `?` = un carattere non spazio.
+- **Jolly:** `*` = zero o più caratteri non spazio; `?` = un carattere non spazio. Un "carattere" è una lettera con i suoi segni combinanti: `?` = `[^\s\p{Mn}]\p{Mn}*`, `*` = `(?:[^\s\p{Mn}]\p{Mn}*)*`. Così su testo decomposto (NFD) un jolly non separa una lettera dai suoi accenti: "e*" non trova la "é" decomposta, come non trova quella precomposta. Più `*` di fila valgono uno solo.
+- **Punteggiatura e `*` di bordo:** se il termine inizia (finisce) con `*`, dalla parte catturata da quel `*` si tolgono i segni di punteggiatura iniziali (finali): "c?rt*" su "carta," evidenzia "carta". Quella dentro la parola resta ("c*" su "c.a.r." evidenzia "c.a.r") e quella scritta nel termine non si tocca mai. Gli spazi ai bordi della parte catturata si tolgono allo stesso modo.
 - **Spazi:** uno spazio nel termine corrisponde a uno o più spazi orizzontali; nessuna corrispondenza attraversa un a capo (una frase spezzata da un a capo non si trova).
 - **Maiuscole:** ignorate per impostazione predefinita; una casella le distingue.
 - **Accenti:** distinti per impostazione predefinita; una casella li ignora.
-  - Accenti distinti: una lettera accentata nel termine accetta anche la sua forma decomposta (NFD) nel testo, quindi il testo non viene normalizzato e le posizioni restano quelle originali. Il termine è prima portato in NFC.
-  - Accenti ignorati: ogni lettera accetta le sue varianti accentate e gli eventuali segni combinanti.
+  - Accenti distinti: una lettera accentata nel termine accetta anche la sua forma decomposta (NFD) nel testo, quindi il testo non viene normalizzato e le posizioni restano quelle originali. Il termine è prima portato in NFC. Una corrispondenza non può essere seguita da un segno combinante: "citta" non trova la "città" decomposta. Il crate `regex` non ha il lookahead, quindi il pattern finisce con un gruppo che consuma il carattere seguente e il chiamante taglia la corrispondenza all'inizio del gruppo.
+  - Accenti ignorati: ogni lettera accetta le sue varianti accentate e gli eventuali segni combinanti. Le lettere senza decomposizione canonica (ø, ł, æ) restano distinte da "o", "l", "ae" anche con gli accenti ignorati.
 - **Parola restituita:** il testo tra due spazi (White_Space Unicode) attorno alla corrispondenza, senza i segni di punteggiatura ai bordi; la punteggiatura dentro la corrispondenza non si toglie mai.
 - **Righe:** più corrispondenze nella stessa parola, anche di termini diversi, danno una sola riga con tutti gli evidenziati.
 - **Troncamenti:** parole oltre 200 caratteri troncate con "…"; contesto di circa 120 caratteri intorno alla parola.
@@ -55,13 +56,17 @@ Testo e codice, docx, xlsx, pptx, odt, ods, odp, PDF, doc, xls, ppt, RTF, EML (c
 
 Il formato si sceglie dall'estensione e si verifica dal contenuto; se non coincidono si usa l'estrattore del contenuto solo nei casi comuni e innocui (.doc che è RTF, .xls che è HTML o CSV), altrimenti il file va negli avvisi.
 
+**File di testo.** La codifica si decide sul primo blocco letto (almeno 8 KB): BOM, firme binarie, NUL (salvo schema UTF-16), UTF-8 valido, altrimenti codifica a 8 bit rilevata (ripiego Windows-1252). Se il file è ASCII o UTF-8 nel primo blocco (fino a 8 MB) e ha byte non validi più avanti, questi diventano U+FFFD. Le righe finiscono con `\n`; un file con soli `\r` (vecchio Mac) è una riga sola, tagliata dopo l'ultimo spazio a ogni blocco, per cui una frase o una parola a cavallo del taglio può non essere trovata.
+
 ## 8. Filtri
 
 - Estensioni.
 - Cartelle da saltare (predefinite: `.git`, `node_modules`, `target`, `$RECYCLE.BIN`, `System Volume Information`).
-- File nascosti e di sistema (attributi Windows o punto iniziale).
+- File nascosti e di sistema: su Windows solo per attributo (`HIDDEN` o `SYSTEM`, un nome con il punto non basta); su Linux per il punto iniziale.
 - Dimensione massima.
-- File solo online (OneDrive): saltati per impostazione predefinita, una casella li include.
+- File solo online (OneDrive; attributi `RECALL_ON_DATA_ACCESS`, `RECALL_ON_OPEN`, `OFFLINE`): saltati per impostazione predefinita, anche se sono una radice scelta dall'utente; una casella li include. Gli attributi si leggono dall'elenco della cartella, senza aprire il file e quindi senza scaricarlo.
+- Una radice (cartella o file) scelta dall'utente non è mai esclusa per nome, estensione o attributi nascosto e di sistema; dimensione massima (predefinita 200 MiB) e stato solo online valgono anche per lei.
+- Radici duplicate (stesso percorso, anche scritto in modo diverso o con altre maiuscole su Windows; il confronto è sul testo, senza risolvere i link) sono una sola, la prima. Una radice dentro un'altra resta una radice a sé: l'esterna salta quel ramo e l'interna lo visita con le sue regole. Ogni file si legge una volta sola.
 - Link simbolici e junction non seguiti; i filtri gitignore non si applicano.
 
 ## 9. Limiti
@@ -97,4 +102,4 @@ Ogni avviso ha il suo motivo: protetto da password, danneggiato, tempo scaduto, 
 
 ## 14. Persistenza
 
-`settings.toml` proprio, versionato: radici e termini recenti, opzioni, filtri, larghezza dei pannelli, ordinamento, lingua, tema, impostazioni della cache. Cache su disco spegnibile e svuotabile dalle Impostazioni.
+`settings.toml` proprio, versionato (versione 1): lingua, tema, opzioni, radici e termini correnti e recenti (10), filtri, larghezza dei pannelli e delle colonne, ordinamento, impostazioni della cache. Formato e regole di lettura in `.claude/skills/lynkeus-internals/references/protocollo-e-cache.md`. Cache su disco spegnibile e svuotabile dalle Impostazioni.

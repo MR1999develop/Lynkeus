@@ -9,7 +9,7 @@ app-title = Lynkeus Searcher
 
 menu-file = File
 menu-edit = Edit
-menu-search-menu = Search
+menu-search-menu = Find
 menu-view = View
 menu-tools = Tools
 menu-help = Help
@@ -135,7 +135,7 @@ tab-warnings = Warnings ({ $count })
 column-word = Word
 column-term = Term
 column-file = File
-column-position = Position
+column-position = Location
 column-context = Context
 column-reason = Reason
 column-sort-tooltip = Sort by this column; click again to reverse the order.
