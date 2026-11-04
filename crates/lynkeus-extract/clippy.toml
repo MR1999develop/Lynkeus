@@ -1,0 +1,13 @@
+# Configurazione di Clippy per lynkeus-extract.
+
+# ADR 0002: sui PDF con struttura (quelli di LibreOffice) queste funzioni incollano i paragrafi
+# senza separatore. Per il testo dei PDF solo `PdfDocument::extract_text_lines`, pagina per pagina.
+disallowed-methods = [
+    { path = "pdf_oxide::document::PdfDocument::extract_text", reason = "ADR 0002: usare extract_text_lines" },
+    { path = "pdf_oxide::document::PdfDocument::extract_text_with_options", reason = "ADR 0002: usare extract_text_lines" },
+    { path = "pdf_oxide::document::PdfDocument::extract_all_text", reason = "ADR 0002: usare extract_text_lines" },
+    { path = "pdf_oxide::document::PdfDocument::to_plain_text", reason = "ADR 0002: usare extract_text_lines" },
+    { path = "pdf_oxide::document::PdfDocument::to_plain_text_all", reason = "ADR 0002: usare extract_text_lines" },
+    { path = "pdf_oxide::document::PdfDocument::to_markdown", reason = "ADR 0002: usare extract_text_lines" },
+    { path = "pdf_oxide::document::PdfDocument::to_markdown_all", reason = "ADR 0002: usare extract_text_lines" },
+]
