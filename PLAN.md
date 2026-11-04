@@ -276,16 +276,16 @@ Ogni fase finisce con `cargo xtask check` verde e un commit. Il lavoro si orches
 - [x] Archivi zip annidati con limiti
 - [x] Cache su disco
 - [x] File di prova (LibreOffice + casi malevoli)
-- [ ] Controlli verdi e commit
+- [x] Controlli verdi e commit
 
 ### Fase 5 — Altri formati
-- [ ] .doc, .xls, .ppt
-- [ ] RTF
-- [ ] EML con allegati
-- [ ] EPUB
-- [ ] 7z, tar, gz, tgz
-- [ ] File di prova
-- [ ] Controlli verdi e commit
+- [x] .doc, .xls, .ppt
+- [x] RTF
+- [x] EML con allegati
+- [x] EPUB
+- [x] 7z, tar, gz, tgz
+- [x] File di prova
+- [x] Controlli verdi e commit
 
 ### Fase 6 — Azioni sui risultati
 - [x] Anteprima con navigazione
