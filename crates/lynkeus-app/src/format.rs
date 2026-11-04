@@ -9,9 +9,10 @@ use std::time::Duration;
 
 use fluent_templates::fluent_bundle::FluentValue;
 use lynkeus_core::{Location, MailPart, QueryError, TermError, column_name};
-use lynkeus_engine::{LimitKind, Outcome, ProgressSnapshot, Summary, WarningKind};
+use lynkeus_engine::{ExtensionError, LimitKind, Outcome, ProgressSnapshot, Summary, WarningKind};
 
-use crate::app::{SearchStatus, StartError};
+use crate::app::SearchStatus;
+use crate::form::{ExtensionInputError, PathInputError, TermRowError};
 use crate::i18n::I18n;
 
 /// Carattere aggiunto dove una parola o un contesto è stato troncato.
@@ -82,26 +83,67 @@ pub fn warning_id(kind: WarningKind) -> &'static str {
     }
 }
 
-/// Messaggio per un errore all'avvio della ricerca, da mostrare sotto il modulo.
-pub fn start_error(i18n: &I18n, error: &StartError) -> String {
+/// Messaggio sotto una riga dei termini.
+pub fn term_error(i18n: &I18n, error: TermRowError) -> String {
     match error {
-        StartError::NoRoot => i18n.tr("error-no-folder"),
-        StartError::Term(TermError::Empty) | StartError::Query(QueryError::NoTerms) => {
-            i18n.tr("error-term-empty")
+        TermRowError::Invalid(TermError::Empty) => i18n.tr("error-term-empty"),
+        TermRowError::Invalid(TermError::OnlyWildcards) => i18n.tr("error-term-only-wildcards"),
+        TermRowError::Invalid(TermError::TooLong { max_chars }) => {
+            i18n.tr_args("error-term-too-long", &[("max", count(max_chars))])
         }
-        StartError::Term(TermError::OnlyWildcards) => i18n.tr("error-term-only-wildcards"),
-        StartError::Term(TermError::TooLong { max_chars }) => {
-            i18n.tr_args("error-term-too-long", &[("max", count(*max_chars))])
-        }
-        StartError::Term(TermError::LineBreak) => i18n.tr("error-term-line-break"),
-        StartError::Query(QueryError::TooManyTerms { max }) => {
-            i18n.tr_args("error-query-too-many", &[("max", count(*max))])
-        }
-        StartError::Query(
-            QueryError::TooComplex { .. } | QueryError::WildcardModeMismatch { .. },
-        ) => i18n.tr("error-query-too-complex"),
-        StartError::Spawn(_) => i18n.tr("error-start-failed"),
+        TermRowError::Invalid(TermError::LineBreak) => i18n.tr("error-term-line-break"),
+        TermRowError::TooComplex => i18n.tr("error-query-too-complex"),
     }
+}
+
+/// Messaggio per un errore della query che non riguarda una riga.
+pub fn query_error(i18n: &I18n, error: QueryError) -> String {
+    match error {
+        QueryError::TooManyTerms { max } => {
+            i18n.tr_args("error-query-too-many", &[("max", count(max))])
+        }
+        QueryError::NoTerms => i18n.tr("error-term-empty"),
+        QueryError::TooComplex { .. } | QueryError::WildcardModeMismatch { .. } => {
+            i18n.tr("error-query-too-complex")
+        }
+    }
+}
+
+/// Messaggio sotto il campo delle estensioni.
+pub fn extension_error(i18n: &I18n, error: &ExtensionInputError) -> String {
+    match error {
+        ExtensionInputError::Missing => i18n.tr("error-extensions-missing"),
+        ExtensionInputError::Invalid { text, error } => {
+            let text = FluentValue::from(text.clone());
+            match error {
+                ExtensionError::Empty | ExtensionError::InvalidChar => {
+                    i18n.tr_args("error-extension-invalid", &[("extension", text)])
+                }
+                ExtensionError::TooLong { max_chars } => i18n.tr_args(
+                    "error-extension-too-long",
+                    &[("extension", text), ("max", count(*max_chars))],
+                ),
+            }
+        }
+    }
+}
+
+/// Messaggio sotto il campo del percorso.
+pub fn path_error(i18n: &I18n, error: PathInputError) -> String {
+    match error {
+        PathInputError::NotFound => i18n.tr("error-path-not-found"),
+    }
+}
+
+/// Testo della colonna Termine: i termini di `terms` (indici in `texts`), separati da
+/// virgole.
+pub fn matched_terms(texts: &[String], terms: lynkeus_core::TermSet) -> String {
+    terms
+        .iter()
+        .filter_map(|index| texts.get(index))
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Riga di stato.

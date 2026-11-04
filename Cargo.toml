@@ -45,11 +45,15 @@ lynkeus-engine = { path = "crates/lynkeus-engine" }
 anyhow = "1.0.104"
 chardetng = "1.0.0"
 crossbeam-channel = "0.5.17"
+# Cartella di configurazione della piattaforma (settings.toml).
+directories = "6.0.0"
 # Senza `default_fonts`: i font di egui includono Ubuntu-Light (licenza Ubuntu Font),
 # fuori dall'allowlist. I font si caricano dal sistema (`platform`).
 eframe = { version = "0.37.0", default-features = false, features = [
     "accesskit",
     "clipboard",
+    # Solo per ricordare la finestra (`persist_window`): le impostazioni vanno in settings.toml.
+    "persistence",
     "system_fonts",
     "wayland",
     "wgpu",
@@ -57,15 +61,22 @@ eframe = { version = "0.37.0", default-features = false, features = [
 ] }
 egui = { version = "0.37.0", default-features = false }
 encoding_rs = "0.8.44"
+# Tabella virtualizzata dei risultati.
+egui_extras = { version = "0.37.0", default-features = false }
+# Test dell'interfaccia per ruolo e nome accessibile, sull'app eframe vera.
+egui_kittest = { version = "0.37.0", default-features = false, features = ["eframe"] }
 fluent-templates = "0.15.1"
 ignore = "0.4.34"
 memchr = "2.8.3"
 proptest = "1.12.0"
 regex = "1.13.1"
+# Dialoghi nativi per scegliere cartelle e file; su Linux tramite il portale XDG (nessuna libreria GTK).
+rfd = { version = "0.17.2", default-features = false, features = ["xdg-portal", "wayland"] }
 serde = { version = "1.0.229", features = ["derive"] }
 sys-locale = "0.3.2"
 tempfile = "3.27.0"
 thiserror = "2.0.21"
+toml = { version = "1.1.8", default-features = false, features = ["parse", "display", "serde"] }
 # Solo per le feature Linux che eframe attiverebbe con `winit/default`: Wayland caricato a
 # runtime e decorazioni client su GNOME. `-notitle` evita `ab_glyph` → `ttf-parser`
 # (RUSTSEC-2026-0192, non mantenuto): la barra c'è, senza il titolo scritto.
