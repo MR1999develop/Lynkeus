@@ -1,0 +1,22 @@
+# Prototipo della fase 4: confronto tra `pdf_oxide` e `pdf-extract`.
+# Progetto indipendente (workspace vuoto), fuori dal workspace del prodotto; si butta dopo l'ADR 0002.
+[package]
+name = "pdf-experiment"
+version = "0.0.0"
+edition = "2024"
+license = "GPL-3.0-only"
+authors = ["MR"]
+publish = false
+
+[workspace]
+
+[dependencies]
+pdf_oxide = { version = "=0.3.78", default-features = false, features = ["legacy-crypto"] }
+pdf-extract = "0.12"
+flate2 = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_ProcessStatus", "Win32_System_Threading"] }
+
+[profile.release]
+debug = "line-tables-only"
