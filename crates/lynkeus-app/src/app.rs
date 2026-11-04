@@ -18,9 +18,12 @@ use lynkeus_engine::{
     SearchRequest, Summary, Warning, start_search,
 };
 
-use crate::form::{FormErrors, PathInputError, RootKind, SearchForm, TermRowError};
+use crate::form::{
+    FormErrors, PathInputError, PathInputStatus, RootKind, SearchForm, TermRowError,
+};
 use crate::i18n::{I18n, Language};
 use crate::results::{ResultsView, SortColumn, SortSpec};
+use crate::root_check::{RootCheck, RootChecks};
 use crate::settings::{LayoutSettings, Settings, SettingsError, SettingsFile, push_recent};
 use crate::theme::ThemeChoice;
 
@@ -161,6 +164,7 @@ pub struct Application {
     view: ResultsView,
     job: JobState,
     current_file: Option<Arc<DocPath>>,
+    root_checks: RootChecks,
 }
 
 impl Application {
@@ -177,8 +181,13 @@ impl Application {
 
     fn with_file(settings: Settings, settings_file: Option<SettingsFile>) -> Application {
         let language = settings.language.unwrap_or_else(Language::from_system);
-        let form = SearchForm::from_settings(&settings, RootKind::probe);
+        // Le radici si verificano dopo, fuori dal thread dell'interfaccia.
+        let form = SearchForm::from_settings(&settings, |_| RootKind::Pending);
         let saved = settings_file.as_ref().map(|_| settings.clone());
+        let mut root_checks = RootChecks::new();
+        for root in &form.roots {
+            root_checks.request(root.path.clone());
+        }
         Application {
             i18n: I18n::new(language),
             limits: Limits::default(),
@@ -190,6 +199,7 @@ impl Application {
             view: ResultsView::new(settings.layout.sort),
             job: JobState::Idle,
             current_file: None,
+            root_checks,
             settings,
             settings_file,
             saved,
@@ -252,29 +262,72 @@ impl Application {
         self.add_root(root.to_owned());
     }
 
-    /// Aggiunge una radice; falso se c'era già.
+    /// Aggiunge una radice "da verificare" e ne avvia la verifica sul disco; falso se
+    /// c'era già.
     pub fn add_root(&mut self, root: PathBuf) -> bool {
-        let kind = RootKind::probe(&root);
-        self.form.add_root(root, kind)
+        let added = self.form.add_root(root.clone(), RootKind::Pending);
+        if added {
+            self.root_checks.request(root);
+        }
+        added
     }
 
-    /// Aggiunge il percorso scritto nel campo apposito, se esiste; altrimenti l'errore
-    /// resta in [`SearchForm::path_error`].
+    /// Verifica il percorso scritto nel campo apposito, senza bloccare: intanto
+    /// [`SearchForm::path_status`] è [`PathInputStatus::Checking`]; quando il disco
+    /// risponde ([`Application::pump_root_checks`]) il percorso diventa una radice se
+    /// esiste, altrimenti il campo mostra l'errore.
     pub fn add_typed_path(&mut self) {
         let typed = self.form.path_input.trim().trim_matches('"');
         if typed.is_empty() {
-            self.form.path_error = None;
+            self.form.path_status = PathInputStatus::Idle;
             return;
         }
         let path = PathBuf::from(typed);
-        match RootKind::probe(&path) {
-            RootKind::Missing => self.form.path_error = Some(PathInputError::NotFound),
-            kind => {
+        if self.form.roots.iter().any(|r| r.path == path) {
+            self.form.path_input.clear();
+            self.form.path_status = PathInputStatus::Idle;
+        } else if self.root_checks.request(path.clone()) {
+            self.form.path_status = PathInputStatus::Checking(path);
+        } else {
+            // Nessun thread per la verifica: la radice resta da verificare e, se manca,
+            // la ricerca lo segnalerà negli avvisi.
+            self.form.add_root(path, RootKind::Pending);
+            self.form.path_input.clear();
+            self.form.path_status = PathInputStatus::Idle;
+        }
+    }
+
+    /// Chi avvisare (di solito la richiesta di un nuovo frame) quando il disco risponde a
+    /// una verifica; vale solo la prima chiamata.
+    pub fn set_root_check_waker(&self, waker: Notify) {
+        self.root_checks.set_waker(waker);
+    }
+
+    /// Vero se c'è già chi avvisare per le verifiche delle radici.
+    pub fn has_root_check_waker(&self) -> bool {
+        self.root_checks.has_waker()
+    }
+
+    /// Applica le risposte arrivate dalle verifiche delle radici, senza attendere.
+    pub fn pump_root_checks(&mut self) {
+        while let Some(RootCheck { path, kind }) = self.root_checks.try_recv() {
+            self.form.set_root_kind(&path, kind);
+            if self.form.path_status != PathInputStatus::Checking(path.clone()) {
+                continue;
+            }
+            if kind == RootKind::Missing {
+                self.form.path_status = PathInputStatus::Error(PathInputError::NotFound);
+            } else {
                 self.form.add_root(path, kind);
                 self.form.path_input.clear();
-                self.form.path_error = None;
+                self.form.path_status = PathInputStatus::Idle;
             }
         }
+    }
+
+    /// Vero se qualche verifica delle radici non ha ancora risposto.
+    pub fn root_checks_pending(&self) -> bool {
+        self.root_checks.is_pending()
     }
 
     /// Sostituisce i termini con il solo `term`.
@@ -315,11 +368,15 @@ impl Application {
     /// Avvia una ricerca con i campi del modulo; una ricerca in corso viene annullata e i
     /// suoi risultati scartati.
     ///
+    /// Se il modulo non è valido nulla cambia: la ricerca precedente (in corso o finita) e
+    /// i suoi risultati restano. Se il modulo è valido la ricerca in corso si annulla prima
+    /// di avviare la nuova; se poi il thread non parte, la precedente finisce come
+    /// annullata e i suoi risultati restano.
+    ///
     /// `notify` è chiamata dal worker a ogni evento (la vista passa `request_repaint`).
     /// L'errore resta anche in [`Application::start_error`] e il modulo mostra da ora gli
     /// errori dei campi.
     pub fn start_search(&mut self, notify: Notify) -> Result<(), &StartError> {
-        self.job = JobState::Idle;
         self.start_error = None;
         self.form.reveal_all_errors();
         let search = match self.form.validate() {
@@ -332,6 +389,8 @@ impl Application {
             filters: search.filters,
             limits: self.limits,
         };
+        // Una sola ricerca alla volta sul disco.
+        self.cancel_search();
         let handle = match start_search(request, notify) {
             Ok(handle) => handle,
             Err(error) => return Err(self.start_error.insert(StartError::Spawn(error))),
@@ -527,26 +586,125 @@ mod tests {
         assert_eq!(empty_state(true, true, &finished), EmptyState::None);
     }
 
+    /// Una radice che non esiste: la ricerca finisce subito con un avviso.
+    fn missing_root() -> PathBuf {
+        std::env::temp_dir().join("lynkeus-non-esiste-7f3a9c")
+    }
+
+    /// Avvia la ricerca e legge gli eventi fino alla fine.
+    fn run_to_end(app: &mut Application) {
+        app.start_search(Arc::new(|| {})).expect("ricerca avviata");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while app.pump_events(usize::MAX) != Pump::Ended {
+            assert!(Instant::now() < deadline, "ricerca non finita");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn a_refused_start_keeps_the_previous_search() {
+        let mut app = Application::build(Settings::default()).expect("app");
+        app.form.add_root(missing_root(), RootKind::Missing);
+        app.set_term("ar");
+        run_to_end(&mut app);
+        let before = app.status();
+        assert!(matches!(before, SearchStatus::Finished(_)));
+        let generation = app.results().generation;
+
+        app.set_term("  ");
+        assert!(app.start_search(Arc::new(|| {})).is_err());
+        assert_eq!(
+            app.status(),
+            before,
+            "lo stato della ricerca precedente resta"
+        );
+        assert_eq!(app.results().generation, generation);
+    }
+
+    #[test]
+    fn recent_terms_are_trimmed_and_unique() {
+        let mut app = Application::build(Settings::default()).expect("app");
+        app.form.add_root(missing_root(), RootKind::Missing);
+        app.set_terms(&[" ar", "ar  ", "carta"]);
+        run_to_end(&mut app);
+        assert_eq!(app.recent_terms(), ["ar", "carta"]);
+        assert_eq!(app.results().terms, ["ar", "ar", "carta"]);
+    }
+
+    /// Legge le risposte delle verifiche delle radici finché non ne restano.
+    fn settle_root_checks(app: &mut Application) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            app.pump_root_checks();
+            if !app.root_checks_pending() {
+                return;
+            }
+            assert!(Instant::now() < deadline, "verifiche senza risposta");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
     #[test]
     fn typed_path_must_exist() {
         let mut app = Application::build(Settings::default()).expect("app");
         app.form.path_input = "  ".to_owned();
         app.add_typed_path();
-        assert!(app.form.roots.is_empty() && app.form.path_error.is_none());
+        assert!(app.form.roots.is_empty());
+        assert_eq!(app.form.path_status, PathInputStatus::Idle);
 
-        let missing = std::env::temp_dir().join("lynkeus-non-esiste-7f3a9c");
+        // Il percorso si verifica fuori dal thread dell'interfaccia: prima "in verifica".
+        let missing = missing_root();
         app.form.path_input = missing.display().to_string();
         app.add_typed_path();
-        assert_eq!(app.form.path_error, Some(PathInputError::NotFound));
+        assert_eq!(app.form.path_status, PathInputStatus::Checking(missing));
+        settle_root_checks(&mut app);
+        assert_eq!(
+            app.form.path_status,
+            PathInputStatus::Error(PathInputError::NotFound)
+        );
         assert!(app.form.roots.is_empty());
 
         let here = env!("CARGO_MANIFEST_DIR");
         app.form.path_input = format!("\"{here}\"");
         app.add_typed_path();
-        assert_eq!(app.form.path_error, None);
+        assert!(app.form.roots.is_empty(), "aggiunta solo dopo la verifica");
+        settle_root_checks(&mut app);
+        assert_eq!(app.form.path_status, PathInputStatus::Idle);
         assert_eq!(app.form.roots.len(), 1);
         assert_eq!(app.form.roots[0].kind, RootKind::Folder);
         assert!(app.form.path_input.is_empty());
+    }
+
+    #[test]
+    fn a_typed_path_edited_during_the_check_is_left_alone() {
+        let mut app = Application::build(Settings::default()).expect("app");
+        app.form.path_input = env!("CARGO_MANIFEST_DIR").to_owned();
+        app.add_typed_path();
+        // L'utente cambia il campo: la vista rimette lo stato a riposo.
+        app.form.path_input = "altro".to_owned();
+        app.form.path_status = PathInputStatus::Idle;
+        settle_root_checks(&mut app);
+        assert!(app.form.roots.is_empty());
+        assert_eq!(app.form.path_input, "altro");
+    }
+
+    #[test]
+    fn roots_are_pending_until_the_disk_answers() {
+        let here = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let settings = Settings {
+            roots: vec![here.clone(), missing_root()],
+            ..Settings::default()
+        };
+        let mut app = Application::build(settings).expect("app");
+        let kinds = |app: &Application| app.form.roots.iter().map(|r| r.kind).collect::<Vec<_>>();
+        assert_eq!(kinds(&app), [RootKind::Pending, RootKind::Pending]);
+        assert!(app.add_root(here.join("Cargo.toml")));
+        assert_eq!(app.form.roots[2].kind, RootKind::Pending);
+        settle_root_checks(&mut app);
+        assert_eq!(
+            kinds(&app),
+            [RootKind::Folder, RootKind::Missing, RootKind::File]
+        );
     }
 
     #[test]

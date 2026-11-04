@@ -20,9 +20,11 @@ use lynkeus_engine::{
 
 use crate::settings::{ExtensionMode, FilterSettings, MAX_FILE_SIZE_MIB_RANGE, Settings};
 
-/// Che cosa è una radice sul disco, visto quando è stata aggiunta.
+/// Che cosa è una radice sul disco, visto quando è stata aggiunta (o all'avvio).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RootKind {
+    /// Da verificare: la risposta del disco non è ancora arrivata.
+    Pending,
     /// Una cartella, cercata con le sottocartelle.
     Folder,
     /// Un file.
@@ -33,7 +35,8 @@ pub enum RootKind {
 
 impl RootKind {
     /// Guarda sul disco che cosa è `path` (una chiamata ai metadati, senza seguire i link
-    /// oltre quanto fa il sistema).
+    /// oltre quanto fa il sistema). Può bloccare a lungo (rete scollegata): mai sul thread
+    /// dell'interfaccia; l'app la chiama in un thread suo.
     pub fn probe(path: &Path) -> RootKind {
         match std::fs::metadata(path) {
             Ok(meta) if meta.is_dir() => RootKind::Folder,
@@ -240,6 +243,18 @@ pub enum PathInputError {
     NotFound,
 }
 
+/// Stato del campo del percorso scritto a mano.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum PathInputStatus {
+    /// Niente da mostrare.
+    #[default]
+    Idle,
+    /// Verifica in corso del percorso indicato (quello scritto, ripulito).
+    Checking(PathBuf),
+    /// Il percorso non va: l'errore sotto il campo.
+    Error(PathInputError),
+}
+
 /// Errori del modulo, uno per campo.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct FormErrors {
@@ -268,7 +283,8 @@ impl FormErrors {
 pub struct ValidSearch {
     /// Le radici, nell'ordine dell'elenco.
     pub roots: Vec<PathBuf>,
-    /// I termini come scritti, per la colonna Termine.
+    /// I termini validati (senza spazi esterni), nell'ordine delle righe: per la colonna
+    /// Termine e i recenti.
     pub terms: Vec<String>,
     /// La query compilata.
     pub query: CompiledQuery,
@@ -283,8 +299,8 @@ pub struct SearchForm {
     pub roots: Vec<RootEntry>,
     /// Percorso scritto o incollato, da aggiungere con Invio.
     pub path_input: String,
-    /// Errore del percorso scritto, mostrato sotto il campo.
-    pub path_error: Option<PathInputError>,
+    /// Verifica o errore del percorso scritto, mostrato sotto il campo.
+    pub path_status: PathInputStatus,
     /// Vero dopo un tentativo di ricerca senza radici.
     pub show_roots_error: bool,
     terms: Vec<TermRow>,
@@ -308,13 +324,13 @@ impl Default for SearchForm {
 }
 
 impl SearchForm {
-    /// Il modulo per le impostazioni salvate; `probe` dice che cosa è ogni radice (di
-    /// solito [`RootKind::probe`]).
+    /// Il modulo per le impostazioni salvate; `probe` dice che cosa è ogni radice (l'app
+    /// passa `|_| RootKind::Pending` e verifica dopo, fuori dal thread dell'interfaccia).
     pub fn from_settings(settings: &Settings, probe: impl Fn(&Path) -> RootKind) -> SearchForm {
         let mut form = SearchForm {
             roots: Vec::new(),
             path_input: String::new(),
-            path_error: None,
+            path_status: PathInputStatus::Idle,
             show_roots_error: false,
             terms: Vec::new(),
             next_row_id: 0,
@@ -356,6 +372,13 @@ impl SearchForm {
         self.roots.push(RootEntry { path, kind });
         self.show_roots_error = false;
         true
+    }
+
+    /// Registra che cosa è `path` sul disco, per tutte le radici con quel percorso.
+    pub fn set_root_kind(&mut self, path: &Path, kind: RootKind) {
+        for root in self.roots.iter_mut().filter(|r| r.path == path) {
+            root.kind = kind;
+        }
     }
 
     /// Toglie la radice in posizione `index` (nessun effetto fuori dai limiti).
@@ -516,6 +539,8 @@ impl SearchForm {
         } else {
             Combine::Any
         };
+        // I termini validati, senza spazi esterni: per la colonna Termine e i recenti.
+        let term_texts = terms.iter().map(|t| t.as_str().to_owned()).collect();
         let compiled = Query::new(terms, self.match_options(), combine).and_then(|q| q.compile());
         let query = match compiled {
             Ok(query) => query,
@@ -533,7 +558,7 @@ impl SearchForm {
         match filters {
             Ok(filters) => Ok(ValidSearch {
                 roots: self.roots.iter().map(|r| r.path.clone()).collect(),
-                terms: self.terms.iter().map(|r| r.text.clone()).collect(),
+                terms: term_texts,
                 query,
                 filters,
             }),
@@ -565,6 +590,13 @@ mod tests {
         assert_eq!(search.roots, [PathBuf::from("dati")]);
         assert_eq!(search.terms, ["ar"]);
         assert_eq!(search.filters, Filters::default());
+    }
+
+    #[test]
+    fn search_terms_are_the_validated_ones_without_outer_spaces() {
+        let form = form_with(&["dati"], &["  ar ", "	c?rta"]);
+        let search = form.validate().expect("valido");
+        assert_eq!(search.terms, ["ar", "c?rta"]);
     }
 
     #[test]

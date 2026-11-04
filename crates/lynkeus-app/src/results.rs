@@ -8,10 +8,12 @@
 //! permutazione mostrata e la selezione per indice di risultato, così un riordino non
 //! perde la selezione.
 
-use std::cmp::Reverse;
+use std::cmp::{Ordering, Reverse};
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
-use lynkeus_engine::Hit;
+use lynkeus_engine::{DocPath, Hit};
 use serde::{Deserialize, Serialize};
 
 /// Colonna su cui ordinare.
@@ -283,15 +285,19 @@ impl ResultsView {
 }
 
 /// Ordina la permutazione `order` (stabile: a parità resta l'ordine precedente).
+///
+/// Per File e Posizione la chiave del file (percorso relativo in minuscolo) si calcola una
+/// volta per documento, non per riga: con 200 000 righe l'ordinamento resta sotto i 50 ms
+/// (misura in `sort_200k_timing`).
 fn sort_order(order: &mut [usize], spec: SortSpec, hits: &[Hit], roots: &[PathBuf]) {
-    let file_key = |hit: &Hit| {
-        let relative = roots.get(hit.root).map_or_else(
-            || hit.doc.to_string(),
-            |root| hit.doc.display_relative(root),
-        );
-        (hit.root, relative.to_lowercase())
-    };
     let descending = spec.order == SortOrder::Descending;
+    let directed = |ordering: Ordering| {
+        if descending {
+            ordering.reverse()
+        } else {
+            ordering
+        }
+    };
     macro_rules! by_key {
         ($key:expr) => {{
             let key = $key;
@@ -305,18 +311,69 @@ fn sort_order(order: &mut [usize], spec: SortSpec, hits: &[Hit], roots: &[PathBu
     match spec.column {
         SortColumn::Word => by_key!(|hit: &Hit| hit.word.to_lowercase()),
         SortColumn::Term => by_key!(|hit: &Hit| hit.terms.iter().next().unwrap_or(usize::MAX)),
-        SortColumn::File => by_key!(|hit: &Hit| (file_key(hit), hit.location.clone())),
-        SortColumn::Position => by_key!(|hit: &Hit| (hit.location.clone(), file_key(hit))),
         SortColumn::Context => by_key!(|hit: &Hit| hit.snippet.text.to_lowercase()),
+        SortColumn::File | SortColumn::Position => {
+            let ranks = file_ranks(hits, roots);
+            let file = |i: usize| ranks.get(i).copied();
+            let location = |i: usize| hits.get(i).map(|hit| &hit.location);
+            let file_first = spec.column == SortColumn::File;
+            order.sort_by(|&a, &b| {
+                let by_file = file(a).cmp(&file(b));
+                let by_location = location(a).cmp(&location(b));
+                directed(if file_first {
+                    by_file.then(by_location)
+                } else {
+                    by_location.then(by_file)
+                })
+            });
+        }
     }
+}
+
+/// Per ogni riga, il posto del suo file nell'ordine dei file: radice, poi percorso
+/// relativo in minuscolo. Righe dello stesso file hanno lo stesso posto.
+///
+/// La chiave testuale si calcola una volta per documento (le righe di un file condividono
+/// lo stesso `Arc<DocPath>`), poi si ordinano solo i documenti distinti.
+fn file_ranks(hits: &[Hit], roots: &[PathBuf]) -> Vec<usize> {
+    let mut slot_of: HashMap<(*const DocPath, usize), usize> = HashMap::new();
+    let mut keys: Vec<(usize, String)> = Vec::new();
+    let slots: Vec<usize> = hits
+        .iter()
+        .map(|hit| {
+            *slot_of
+                .entry((Arc::as_ptr(&hit.doc), hit.root))
+                .or_insert_with(|| {
+                    keys.push(file_key(hit, roots));
+                    keys.len() - 1
+                })
+        })
+        .collect();
+    let mut sorted: Vec<usize> = (0..keys.len()).collect();
+    sorted.sort_by(|&a, &b| keys[a].cmp(&keys[b]));
+    let mut rank_of_slot = vec![0; keys.len()];
+    let mut rank = 0;
+    for (position, &slot) in sorted.iter().enumerate() {
+        if position > 0 && keys[sorted[position - 1]] != keys[slot] {
+            rank += 1;
+        }
+        rank_of_slot[slot] = rank;
+    }
+    slots.into_iter().map(|slot| rank_of_slot[slot]).collect()
+}
+
+/// Chiave del file di una riga: la radice, poi il percorso relativo in minuscolo.
+fn file_key(hit: &Hit, roots: &[PathBuf]) -> (usize, String) {
+    let relative = roots.get(hit.root).map_or_else(
+        || hit.doc.to_string(),
+        |root| hit.doc.display_relative(root),
+    );
+    (hit.root, relative.to_lowercase())
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use lynkeus_core::{Location, Snippet, TermSet};
-    use lynkeus_engine::DocPath;
 
     use super::*;
 
@@ -326,7 +383,8 @@ mod tests {
             root: 0,
             location: Location::Line(line),
             word: word.to_owned(),
-            word_truncated: false,
+            word_truncated_start: false,
+            word_truncated_end: false,
             snippet: Snippet {
                 text: word.to_owned(),
                 highlights: Vec::new(),
@@ -404,6 +462,19 @@ mod tests {
             shown(&view, &hits),
             ["mare", "chitarra", "carta", "Aragosta"]
         );
+        // File decrescente: file e posizione entrambi invertiti.
+        let file_down = SortSpec::after_click(Some(other), SortColumn::File);
+        view.set_sort(file_down, &hits, &roots());
+        assert_eq!(
+            shown(&view, &hits),
+            ["carta", "chitarra", "Aragosta", "mare"]
+        );
+        // Posizione: prima la riga, a parità il file.
+        view.set_sort(SortSpec::ascending(SortColumn::Position), &hits, &roots());
+        assert_eq!(
+            shown(&view, &hits),
+            ["chitarra", "mare", "carta", "Aragosta"]
+        );
     }
 
     #[test]
@@ -462,5 +533,47 @@ mod tests {
         let mut empty = ResultsView::new(None);
         empty.move_cursor(1, false);
         assert_eq!(empty.cursor_position(), None);
+    }
+
+    /// 200 000 righe da 2 000 file (100 righe per file, file condivisi come nel motore),
+    /// in ordine d'arrivo mescolato.
+    fn many_hits() -> Vec<Hit> {
+        let docs: Vec<Arc<DocPath>> = (0..2_000)
+            .map(|f| {
+                let path = PathBuf::from("radice")
+                    .join(format!("cartella {}", f % 37))
+                    .join("sotto cartella con un nome lungo")
+                    .join(format!("Documento numero {f}.txt"));
+                Arc::new(DocPath::file(path))
+            })
+            .collect();
+        (0..200_000u32)
+            .map(|i| {
+                let doc = &docs[(i as usize * 7919) % docs.len()];
+                let mut row = hit("x", i % 5000, &format!("parola{}", i % 977));
+                row.doc = Arc::clone(doc);
+                row
+            })
+            .collect()
+    }
+
+    /// Misura dell'ordinamento finale: `cargo test --release -p lynkeus-app --lib
+    /// sort_200k -- --ignored --nocapture`. Obiettivo: meno di ~50 ms per colonna.
+    #[test]
+    #[ignore = "misura di prestazioni, da eseguire in release"]
+    fn sort_200k_timing() {
+        let hits = many_hits();
+        for column in [
+            SortColumn::File,
+            SortColumn::Position,
+            SortColumn::Word,
+            SortColumn::Term,
+            SortColumn::Context,
+        ] {
+            let mut view = ResultsView::new(Some(SortSpec::ascending(column)));
+            let started = std::time::Instant::now();
+            view.finish(&hits, &roots());
+            println!("{column:?}: {:?}", started.elapsed());
+        }
     }
 }

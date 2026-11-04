@@ -34,7 +34,8 @@ impl DocPath {
         !self.inner.is_empty()
     }
 
-    /// Percorso da mostrare relativo a `root`: "sotto/archivio.zip › doc.docx".
+    /// Percorso da mostrare relativo a `root`: "sotto/archivio.zip › doc.docx", con i
+    /// caratteri neutralizzati come in [`Display`](fmt::Display).
     ///
     /// Se `path` non sta sotto `root` (o coincide con la radice-file), il nome del file.
     pub fn display_relative(&self, root: &Path) -> String {
@@ -50,23 +51,37 @@ impl DocPath {
 }
 
 impl fmt::Display for DocPath {
-    /// Percorso completo: "C:\dati\archivio.zip › doc.docx". I caratteri di controllo dei
-    /// nomi delle voci sono sostituiti con U+FFFD.
+    /// Percorso completo: "C:\dati\archivio.zip › doc.docx". I caratteri di controllo e
+    /// di direzione del testo (bidi), nel percorso come nei nomi delle voci, diventano
+    /// U+FFFD: è un testo da mostrare, mai un percorso da riaprire.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&join_display(&self.path, &self.inner))
     }
 }
 
 fn join_display(path: &Path, inner: &[String]) -> String {
-    let mut out = path.display().to_string();
+    let mut out: String = path.display().to_string().chars().map(neutralize).collect();
     for name in inner {
         out.push_str(INNER_SEPARATOR);
-        out.extend(
-            name.chars()
-                .map(|c| if c.is_control() { '\u{FFFD}' } else { c }),
-        );
+        out.extend(name.chars().map(neutralize));
     }
     out
+}
+
+/// Sostituisce con U+FFFD i caratteri che, mostrati, potrebbero ingannare: quelli di
+/// controllo e quelli che cambiano la direzione del testo (incorporamenti, override e
+/// isolamenti bidi U+202A–U+202E e U+2066–U+2069, più i segni LRM, RLM e ALM). Un nome come
+/// "fattura\u{202E}fdp.exe" apparirebbe altrimenti come "fatturaexe.pdf".
+fn neutralize(c: char) -> char {
+    let bidi = matches!(
+        c,
+        '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{200E}' | '\u{200F}' | '\u{061C}'
+    );
+    if c.is_control() || bidi {
+        '\u{FFFD}'
+    } else {
+        c
+    }
 }
 
 #[cfg(test)]
@@ -87,6 +102,29 @@ mod tests {
         assert_eq!(
             doc.display_relative(Path::new("musica")),
             "archivio.zip › elenco\u{FFFD}.pdf"
+        );
+    }
+
+    #[test]
+    fn control_and_bidi_chars_are_neutralized_in_the_path_too() {
+        let root = PathBuf::from("dati\u{202E}txt.exe");
+        let doc = DocPath {
+            path: root.join("a\u{7}b\u{2066}.zip"),
+            inner: vec!["voce\u{2069}\u{202A}.txt".to_owned()],
+        };
+        let shown = doc.to_string();
+        for bad in ['\u{202E}', '\u{7}', '\u{2066}', '\u{2069}', '\u{202A}'] {
+            assert!(!shown.contains(bad), "{bad:?} in {shown:?}");
+        }
+        assert_eq!(
+            doc.display_relative(&root),
+            "a\u{FFFD}b\u{FFFD}.zip › voce\u{FFFD}\u{FFFD}.txt"
+        );
+        // Gli altri caratteri restano: lettere accentate, spazi, separatori.
+        let plain = Path::new("città nuove").join("perché.txt");
+        assert_eq!(
+            DocPath::file(&plain).to_string(),
+            plain.display().to_string()
         );
     }
 

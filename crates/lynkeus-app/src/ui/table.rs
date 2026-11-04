@@ -117,10 +117,7 @@ pub(super) fn results(app: &mut Application, ui: &mut Ui, actions: &mut Vec<Acti
                 };
                 row.set_selected(view.is_selected(hit_index));
                 row.col(|ui| {
-                    let mut word = hit.word.clone();
-                    if hit.word_truncated {
-                        word.push_str(ELLIPSIS);
-                    }
+                    let word = format::word(hit);
                     ui.add(Label::new(word).truncate().selectable(false));
                 });
                 if with_terms {

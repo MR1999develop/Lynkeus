@@ -22,10 +22,13 @@ pub struct Hit {
     pub root: usize,
     /// Posizione nel documento.
     pub location: Location,
-    /// La parola, eventualmente troncata (senza "…").
+    /// La parola, o un suo pezzo se troppo lunga (senza "…": lo aggiunge chi la mostra,
+    /// dal lato indicato da `word_truncated_start` e `word_truncated_end`).
     pub word: String,
-    /// Vero se `word` è troncata.
-    pub word_truncated: bool,
+    /// Vero se `word` non comprende l'inizio della parola.
+    pub word_truncated_start: bool,
+    /// Vero se `word` non comprende la fine della parola.
+    pub word_truncated_end: bool,
     /// Il contesto con le corrispondenze evidenziate.
     pub snippet: Snippet,
     /// Termini che corrispondono nella parola.

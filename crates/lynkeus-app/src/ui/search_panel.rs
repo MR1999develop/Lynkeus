@@ -11,7 +11,7 @@ use egui::{Button, CollapsingHeader, DragValue, Label, RichText, TextEdit, Ui, v
 
 use super::{Action, Command};
 use crate::app::Application;
-use crate::form::{RootKind, TermRowError};
+use crate::form::{PathInputStatus, RootKind, TermRowError};
 use crate::format;
 use crate::i18n::I18n;
 use crate::settings::{ExtensionMode, MAX_FILE_SIZE_MIB_RANGE};
@@ -92,6 +92,7 @@ fn roots_section(app: &mut Application, ui: &mut Ui, actions: &mut Vec<Action>) 
                         RootKind::Folder => "root-kind-folder",
                         RootKind::File => "root-kind-file",
                         RootKind::Missing => "root-kind-missing",
+                        RootKind::Pending => "root-kind-pending",
                     };
                     caption(ui, i18n.tr(kind));
                     ui.add(Label::new(short_name(&root.path)).truncate())
@@ -125,10 +126,12 @@ fn roots_section(app: &mut Application, ui: &mut Ui, actions: &mut Vec<Action>) 
         actions.push(Action::AddTypedPath);
     }
     if field.changed() {
-        app.form.path_error = None;
+        app.form.path_status = PathInputStatus::Idle;
     }
-    if let Some(error) = app.form.path_error {
-        error_text(ui, format::path_error(&i18n, error));
+    match &app.form.path_status {
+        PathInputStatus::Idle => {}
+        PathInputStatus::Checking(_) => caption(ui, i18n.tr("form-path-checking")),
+        PathInputStatus::Error(error) => error_text(ui, format::path_error(&i18n, *error)),
     }
 }
 

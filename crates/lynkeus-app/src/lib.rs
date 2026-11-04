@@ -16,6 +16,7 @@ pub mod format;
 pub mod i18n;
 pub mod platform;
 pub mod results;
+mod root_check;
 pub mod settings;
 pub mod theme;
 mod ui;

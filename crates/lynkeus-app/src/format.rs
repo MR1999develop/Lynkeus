@@ -9,7 +9,9 @@ use std::time::Duration;
 
 use fluent_templates::fluent_bundle::FluentValue;
 use lynkeus_core::{Location, MailPart, QueryError, TermError, column_name};
-use lynkeus_engine::{ExtensionError, LimitKind, Outcome, ProgressSnapshot, Summary, WarningKind};
+use lynkeus_engine::{
+    ExtensionError, Hit, LimitKind, Outcome, ProgressSnapshot, Summary, WarningKind,
+};
 
 use crate::app::SearchStatus;
 use crate::form::{ExtensionInputError, PathInputError, TermRowError};
@@ -146,6 +148,20 @@ pub fn matched_terms(texts: &[String], terms: lynkeus_core::TermSet) -> String {
         .join(", ")
 }
 
+/// Testo della colonna Parola: la parola con "…" dal lato (o dai lati) in cui è stata
+/// troncata.
+pub fn word(hit: &Hit) -> String {
+    let mut text = String::with_capacity(hit.word.len() + 2 * ELLIPSIS.len());
+    if hit.word_truncated_start {
+        text.push_str(ELLIPSIS);
+    }
+    text.push_str(&hit.word);
+    if hit.word_truncated_end {
+        text.push_str(ELLIPSIS);
+    }
+    text
+}
+
 /// Riga di stato.
 pub fn status(i18n: &I18n, status: &SearchStatus, max_results: usize) -> String {
     match status {
@@ -203,6 +219,34 @@ mod tests {
     /// Toglie i caratteri d'isolamento bidi che Fluent mette intorno alle variabili.
     fn plain(text: &str) -> String {
         text.replace(['\u{2068}', '\u{2069}'], "")
+    }
+
+    #[test]
+    fn word_shows_the_ellipsis_on_the_truncated_side() {
+        use std::sync::Arc;
+
+        use lynkeus_core::{Snippet, TermSet};
+        use lynkeus_engine::DocPath;
+
+        let hit = |start: bool, end: bool| Hit {
+            doc: Arc::new(DocPath::file("a.txt")),
+            root: 0,
+            location: Location::Line(1),
+            word: "carta".to_owned(),
+            word_truncated_start: start,
+            word_truncated_end: end,
+            snippet: Snippet {
+                text: "carta".to_owned(),
+                highlights: Vec::new(),
+                truncated_start: false,
+                truncated_end: false,
+            },
+            terms: TermSet::single(0),
+        };
+        assert_eq!(word(&hit(false, false)), "carta");
+        assert_eq!(word(&hit(true, false)), "…carta");
+        assert_eq!(word(&hit(false, true)), "carta…");
+        assert_eq!(word(&hit(true, true)), "…carta…");
     }
 
     #[test]

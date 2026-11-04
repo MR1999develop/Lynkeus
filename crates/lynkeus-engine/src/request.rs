@@ -70,7 +70,11 @@ impl Default for Filters {
     }
 }
 
-/// File nascosti e di sistema (attributi di Windows o nome che inizia con un punto).
+/// File e cartelle nascosti o di sistema.
+///
+/// Su Windows contano solo gli attributi `HIDDEN` e `SYSTEM`: un nome che inizia con un
+/// punto (".git") non basta. Su Linux, dove quegli attributi non esistono, conta solo il
+/// punto iniziale del nome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub enum HiddenPolicy {
     /// Saltati (predefinito).

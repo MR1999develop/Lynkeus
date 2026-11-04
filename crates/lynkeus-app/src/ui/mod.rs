@@ -24,6 +24,7 @@ use std::time::Duration;
 use egui::{Align2, Id, RichText, Ui};
 
 use crate::app::{Application, MAX_HITS_PER_FRAME, Pump, Tab};
+use crate::form::RootKind;
 use crate::i18n::Language;
 use crate::results::{ClickKind, SortColumn};
 use crate::settings::LayoutSettings;
@@ -61,6 +62,11 @@ pub fn setup_context(ctx: &egui::Context, app: &Application) {
 
 impl eframe::App for Application {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if !self.has_root_check_waker() {
+            let ctx = ctx.clone();
+            self.set_root_check_waker(Arc::new(move || ctx.request_repaint()));
+        }
+        self.pump_root_checks();
         if self.pump_events(MAX_HITS_PER_FRAME) == Pump::MorePending {
             ctx.request_repaint();
         }
@@ -347,10 +353,11 @@ fn run_command(
 fn dialog(app: &Application, frame: &eframe::Frame, title_id: &str) -> rfd::FileDialog {
     let mut dialog = rfd::FileDialog::new().set_title(app.i18n().tr(title_id));
     if let Some(last) = app.form.roots.last() {
-        let folder = if last.path.is_dir() {
-            Some(last.path.as_path())
-        } else {
-            last.path.parent()
+        // Dal tipo già verificato: mai una chiamata al disco sul thread dell'interfaccia.
+        let folder = match last.kind {
+            RootKind::Folder => Some(last.path.as_path()),
+            RootKind::File => last.path.parent(),
+            RootKind::Missing | RootKind::Pending => None,
         };
         if let Some(folder) = folder {
             dialog = dialog.set_directory(folder);
