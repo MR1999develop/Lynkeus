@@ -269,7 +269,7 @@ warning-extractor-unavailable = Lettore dei documenti non avviato
 
 preview-empty = Fai clic su un risultato per vederne l'anteprima.
 preview-loading = Lettura del file…
-preview-context-only = L'anteprima completa di questo tipo di documento arriverà con l'estrattore dei documenti; intanto ecco il contesto trovato.
+preview-context-only = L'anteprima completa di questo documento non è disponibile; ecco il contesto trovato.
 preview-previous-file = « File
 preview-previous = ‹ Precedente
 preview-next = Successivo ›

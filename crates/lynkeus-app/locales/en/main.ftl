@@ -269,7 +269,7 @@ warning-extractor-unavailable = Document reader not started
 
 preview-empty = Click a result to see its preview.
 preview-loading = Reading the file…
-preview-context-only = The full preview of this kind of document will come with the document extractor; meanwhile, here is the context found.
+preview-context-only = The full preview of this document is not available; here is the context found.
 preview-previous-file = « File
 preview-previous = ‹ Previous
 preview-next = Next ›
