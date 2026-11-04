@@ -43,6 +43,8 @@ lynkeus-engine = { path = "crates/lynkeus-engine" }
 
 # Esterne.
 anyhow = "1.0.104"
+# Fogli di calcolo xlsx e ods (processo estrattore).
+calamine = { version = "0.38.0", default-features = false }
 chardetng = "1.0.0"
 crossbeam-channel = "0.5.17"
 # Cartella di configurazione della piattaforma (settings.toml).
@@ -74,9 +76,17 @@ memchr = "2.8.3"
 # (SHOpenFolderAndSelectItems). Solo su Windows: su Linux opener cercherebbe `xdg-open`
 # per nome, quindi lì si usa il portale XDG con `zbus`.
 opener = { version = "0.9.0", default-features = false, features = ["reveal"] }
+# PDF (ADR 0002): versione bloccata, solo `legacy-crypto` per i PDF cifrati con password vuota.
+pdf_oxide = { version = "=0.3.78", default-features = false, features = ["legacy-crypto"] }
+# Messaggi del protocollo del processo estrattore (e della cache).
+postcard = { version = "1.1.3", default-features = false, features = ["use-std"] }
 # Solo per i test di proprietà (dev-dependency).
 proptest = "1.12.0"
+# XML di docx, pptx e ODF, senza DTD.
+quick-xml = "0.42.0"
 regex = "1.13.1"
+# Limite di memoria (`RLIMIT_AS`) del processo estrattore su Linux.
+rlimit = "0.11.0"
 # Dialoghi nativi per scegliere cartelle e file; su Linux tramite il portale XDG (nessuna libreria GTK).
 rfd = { version = "0.17.2", default-features = false, features = ["xdg-portal", "wayland"] }
 serde = { version = "1.0.229", features = ["derive"] }
@@ -97,6 +107,8 @@ winit = { version = "0.30.13", default-features = false, features = [
     "wayland-dlopen",
     "wayland-csd-adwaita-notitle",
 ] }
+# Archivi zip e contenitori docx, xlsx, pptx, ODF: solo deflate (gli stessi metodi di calamine).
+zip = { version = "9.3.0", default-features = false, features = ["deflate"] }
 
 # `trim-paths` non è stabile in cargo 1.99.1: i percorsi locali li toglie
 # `cargo xtask dist` con `--remap-path-prefix` calcolati al momento.

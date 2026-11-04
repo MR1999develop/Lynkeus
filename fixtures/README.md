@@ -64,6 +64,7 @@ da LibreOffice, senza autore. Le date interne dei PDF possono variare tra le gen
 | `archivio.7z` | 7-Zip (`7z a -t7z`), senza date | come `archivio.tar` (percorsi con `/`) |
 | `annidato.zip` | zipfile, 3 zip annidati | `annidato.zip` > `livello2.zip` > `livello3.zip` > `interno.docx`, paragrafo 2 (`aragosta`, `città`); profondità 3, entro il limite 5 |
 | `protetto-password.docx` | `protetto.fodt` cifrato con `cifra_docx.py` (password `segreto`, contenitore OOXML cifrato) | atteso: avviso "protetto da password", nessun testo (contenuto nascosto: paragrafo 1) |
+| `protetto-password.pdf` | `catalogo.fodt` esportato con `python -I fixtures/src/genera_pdf_protetto.py` (password d'apertura `segreto`, RC4 128 bit); date e ID del PDF cambiano a ogni generazione | atteso: avviso "protetto da password", nessun testo |
 
 ### malevoli/
 

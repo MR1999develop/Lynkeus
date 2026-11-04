@@ -16,6 +16,10 @@ ignore = [
     { id = "RUSTSEC-2026-0370", reason = "zvariant non mantenuto, arriva da zbus 5 (AccessKit su Linux e portale XDG di lynkeus-app) senza alternative" },
     { id = "RUSTSEC-2026-0371", reason = "zbus_names non mantenuto, arriva da zbus 5 (AccessKit su Linux e portale XDG di lynkeus-app) senza alternative" },
     { id = "RUSTSEC-2026-0372", reason = "zvariant_derive non mantenuto, arriva da zbus 5 (AccessKit su Linux e portale XDG di lynkeus-app) senza alternative" },
+    # PDF (ADR 0002): pdf_oxide 0.3.78 (versione bloccata) → ttf-parser per i font incorporati.
+    # Solo "unmaintained", nessuna vulnerabilità nota; il decoder gira nel processo estrattore
+    # isolato. Da rivedere quando pdf_oxide passa a skrifa o a ogni aggiornamento di pdf_oxide.
+    { id = "RUSTSEC-2026-0192", reason = "ttf-parser non mantenuto, arriva da pdf_oxide (ADR 0002) senza alternative" },
 ]
 unmaintained = "all"
 unsound = "all"
