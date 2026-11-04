@@ -1,0 +1,24 @@
+# Prototipo della fase 4: processo figlio in un Job Object con `win32job`.
+# Progetto indipendente (workspace vuoto), fuori dal workspace del prodotto; si butta dopo la decisione.
+[package]
+name = "jobobject-experiment"
+version = "0.0.0"
+edition = "2024"
+license = "GPL-3.0-only"
+authors = ["MR"]
+publish = false
+
+[workspace]
+
+[target.'cfg(windows)'.dependencies]
+win32job = "2"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_JobObjects",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
