@@ -16,12 +16,18 @@
 | Processi estrattori | `min(core/2, 4)`, avviati al primo documento |
 | Timeout per file | 60 s, poi processo terminato e sostituito |
 | Annulla | richiesta di stop (chiusura stdin), chiusura forzata dopo 500 ms; risposta attesa entro 1 s |
+| Memoria per processo estrattore | 1 GiB (minimo accettato dal figlio 64 MiB); Windows: memoria impegnata, Job Object; Linux: `RLIMIT_AS` |
+| Messaggio del protocollo | 16 MiB per frame (lunghezza, versione e corpo) |
+| Coda dei messaggi per processo | 16 messaggi non ancora consumati |
 | Archivi: profondità | 5 |
 | Archivi: voci | 100.000 |
 | Archivi: byte per voce | 512 MB |
 | Archivi: byte per archivio | 4 GB |
 | Archivi: rapporto di compressione | 200:1 |
-| Cache | LRU, 500 MB |
+| Cache | LRU, 500 MB predefiniti (`[cache] max_size_mib`, da 16 a 65.536 MiB; menu: 100, 250, 500, 1000, 2000) |
+| Voce di cache | al più 64 MiB di frame decompressi; oltre, il documento non si salva |
+| Temporanei di cache | più vecchi di 1 ora: cancellati |
+| Voce d'archivio aperta | al più 64 MiB di testo ricomposto; solo voci di testo |
 | Barra di avanzamento | compare dopo 1 s |
 | Token dell'istanza unica | 128 bit casuali |
 

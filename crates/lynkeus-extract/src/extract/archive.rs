@@ -174,12 +174,36 @@ fn entry_info(container: &Container, index: usize) -> Result<EntryInfo, ExtractE
     })
 }
 
-/// Estrae ogni voce di un archivio zip come documento a sé.
-pub(crate) fn extract_zip(ctx: &mut Ctx<'_>, input: Input<'_>) -> Result<(), Fail> {
+/// Un contenitore di altri documenti (archivio, allegati di un messaggio) si apre solo se le
+/// sue voci non superano la profondità massima; altrimenti [`LimitKind::ArchiveDepth`].
+pub(crate) fn check_depth(ctx: &Ctx<'_>) -> Result<(), ExtractError> {
     let max_depth = usize::try_from(ctx.budget().max_depth()).unwrap_or(usize::MAX);
     if ctx.depth() >= max_depth {
-        return Err(ExtractError::LimitExceeded(LimitKind::ArchiveDepth).into());
+        return Err(ExtractError::LimitExceeded(LimitKind::ArchiveDepth));
     }
+    Ok(())
+}
+
+/// Legge una voce già "entrata" nel contesto da un flusso già limitato: in flusso se è
+/// testo, altrimenti in memoria (entro il massimo per voce del flusso).
+pub(crate) fn read_entry_stream(
+    ctx: &mut Ctx<'_>,
+    declared: Format,
+    reader: &mut dyn Read,
+) -> Result<(), Stopped> {
+    if declared == Format::Text {
+        return read_document(ctx, declared, Input::Stream(reader));
+    }
+    let mut bytes = Vec::new();
+    if let Err(error) = reader.read_to_end(&mut bytes) {
+        return ctx.report(classify_io(error));
+    }
+    read_document(ctx, declared, Input::Bytes(bytes))
+}
+
+/// Estrae ogni voce di un archivio zip come documento a sé.
+pub(crate) fn extract_zip(ctx: &mut Ctx<'_>, input: Input<'_>) -> Result<(), Fail> {
+    check_depth(ctx)?;
     let mut container = Container::open(ctx, input)?;
     let count = container.zip.len();
     ctx.budget()
@@ -222,15 +246,7 @@ fn read_entry(
         Ok(reader) => reader,
         Err(error) => return ctx.report(error),
     };
-    if declared == Format::Text {
-        return read_document(ctx, declared, Input::Stream(&mut reader));
-    }
-    let mut bytes = Vec::new();
-    if let Err(error) = reader.read_to_end(&mut bytes) {
-        return ctx.report(classify_io(error));
-    }
-    drop(reader);
-    read_document(ctx, declared, Input::Bytes(bytes))
+    read_entry_stream(ctx, declared, &mut reader)
 }
 
 #[cfg(test)]

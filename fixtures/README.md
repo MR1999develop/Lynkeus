@@ -56,12 +56,12 @@ da LibreOffice, senza autore. Le date interne dei PDF possono variare tra le gen
 | `in-realta-rtf.doc` | stesso RTF con estensione `.doc` | paragrafo 3; atteso: letto come RTF (contenuto diverso dall'estensione, caso innocuo) |
 | `ordine.eml` | modulo `email` di Python, data fissa | oggetto (`Ordine di aragosta`); corpo testo (riga 2); allegato `allegato.docx` paragrafo 2; allegato `nota.txt` riga 1. `città` in corpo e allegati |
 | `saluti.eml` | idem | solo corpo (riga 2); `città` nel corpo; oggetto senza la parola |
-| `libro.epub` | zipfile, EPUB 3 minimo (`mimetype` non compresso per primo) | `OEBPS/cap2.xhtml` (capitolo 2, paragrafo 1); `città` e `Perché` in `OEBPS/cap1.xhtml` |
+| `libro.epub` | zipfile, EPUB 3 minimo (`mimetype` non compresso per primo) | `OEBPS/cap2.xhtml` (capitolo 2, paragrafo 2: il titolo `h1` è il paragrafo 1, come i titoli di docx e odt); `città` paragrafo 2 e `Perché` paragrafo 3 in `OEBPS/cap1.xhtml` |
 | `spesa.txt` | script Python, UTF-8 | riga 6 ("Oggi compriamo l'aragosta in città.") |
 | `appunti.txt.gz` | gzip, nome interno vuoto, mtime 0 | riga 2 del testo decompresso (`aragosta`, `città`) |
 | `archivio.tar` | tarfile, mtime fisso | voce `cartella/ricetta.txt` riga 2 (`aragosta`, `città`); `cartella/nota.txt` senza la parola |
 | `archivio.tar.gz` | stesso tar compresso con gzip | come `archivio.tar` |
-| `archivio.7z` | 7-Zip (`7z a -t7z`), senza date | come `archivio.tar` (percorsi con `/`) |
+| `archivio.7z` | 7-Zip (`7z a -t7z`), senza date | come `archivio.tar` (percorsi con `/`; 7-Zip mette `nota.txt` prima di `ricetta.txt`) |
 | `annidato.zip` | zipfile, 3 zip annidati | `annidato.zip` > `livello2.zip` > `livello3.zip` > `interno.docx`, paragrafo 2 (`aragosta`, `città`); profondità 3, entro il limite 5 |
 | `protetto-password.docx` | `protetto.fodt` cifrato con `cifra_docx.py` (password `segreto`, contenitore OOXML cifrato) | atteso: avviso "protetto da password", nessun testo (contenuto nascosto: paragrafo 1) |
 | `protetto-password.pdf` | `catalogo.fodt` esportato con `python -I fixtures/src/genera_pdf_protetto.py` (password d'apertura `segreto`, RC4 128 bit); date e ID del PDF cambiano a ogni generazione | atteso: avviso "protetto da password", nessun testo |

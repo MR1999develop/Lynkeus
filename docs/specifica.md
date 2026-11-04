@@ -11,7 +11,7 @@ Cercare una porzione di testo in file singoli o in cartelle (con sottocartelle) 
 - Rust + egui 0.37, Windows 10/11 e Ubuntu, eseguibile portatile.
 - Interfaccia in italiano e inglese; licenza GPLv3 (`GPL-3.0-only`).
 - Partenza: elenco misto di cartelle (ricorsive) e file, anche trascinati nella finestra.
-- Lettura diretta a ogni ricerca, con cache del testo estratto da documenti e archivi.
+- Lettura diretta a ogni ricerca: i file di testo si leggono nel processo principale, i documenti e gli archivi (PDF, Office, ODF, zip) in processi estrattori isolati (ADR 0001), con cache su disco del testo estratto.
 
 ## 3. Termini
 
@@ -58,6 +58,8 @@ Il formato si sceglie dall'estensione e si verifica dal contenuto; se non coinci
 
 **File di testo.** La codifica si decide sul primo blocco letto (almeno 8 KB): BOM, firme binarie, NUL (salvo schema UTF-16), UTF-8 valido, altrimenti codifica a 8 bit rilevata (ripiego Windows-1252). Se il file è ASCII o UTF-8 nel primo blocco (fino a 8 MB) e ha byte non validi più avanti, questi diventano U+FFFD. Le righe finiscono con `\n`; un file con soli `\r` (vecchio Mac) è una riga sola, tagliata dopo l'ultimo spazio a ogni blocco, per cui una frase o una parola a cavallo del taglio può non essere trovata.
 
+**Documenti cercati.** Ogni documento (il file stesso o una voce d'archivio) è cercato per conto suo: OR e AND valgono per documento, e il risultato porta il file più il percorso delle voci. Il testo arriva dalla cache, se c'è una voce valida per quel file (stesso percorso, dimensione, data di modifica, versione del programma e limiti), altrimenti da un processo estrattore. Un guasto dell'estrattore (tempo scaduto, memoria superata, uscita improvvisa) dà un avviso per quel documento e la ricerca continua. Formati ancora non letti: doc, xls, ppt, RTF, EML, EPUB, 7z, tar, gz (fase 5).
+
 ## 8. Filtri
 
 - Estensioni.
@@ -71,7 +73,7 @@ Il formato si sceglie dall'estensione e si verifica dal contenuto; se non coinci
 
 ## 9. Limiti
 
-Vedi `.claude/skills/lynkeus-internals/references/limiti.md`: risultati (200.000), archivi (profondità 5, 100.000 voci, 512 MB per voce, 4 GB per archivio, rapporto 200:1), timeout 60 s per file, cache 500 MB. I limiti sugli archivi sono modificabili in "Avanzate".
+Vedi `.claude/skills/lynkeus-internals/references/limiti.md`: risultati (200.000), archivi (profondità 5, 100.000 voci, 512 MB per voce, 4 GB per archivio, rapporto 200:1), timeout 60 s per file, memoria 1 GiB per processo estrattore, cache 500 MB. I limiti sugli archivi sono modificabili in "Avanzate".
 
 ## 10. Avvisi
 
@@ -89,9 +91,9 @@ Ogni avviso ha il suo motivo: protetto da password, danneggiato, tempo scaduto, 
 
 ## 12. Azioni sui risultati
 
-- Doppio clic o Invio apre il file con il programma predefinito del sistema; una voce dentro un archivio è prima estratta in una cartella temporanea dell'app, cancellata all'uscita (finché l'estrattore non c'è, un messaggio avvisa che non è disponibile). I file che il sistema eseguirebbe (programmi, script, collegamenti: `exe`, `bat`, `ps1`, `lnk`, `sh`, `py`, …) non si aprono: resta "Mostra nella cartella".
+- Doppio clic o Invio apre il file con il programma predefinito del sistema; una voce di testo dentro un archivio è prima ricomposta in un file `.txt` di una cartella temporanea privata dell'app, svuotata all'avvio e all'uscita; per una voce che è un documento (PDF, Office) servono i byte originali, che il processo estrattore non restituisce ancora, e un messaggio avvisa che non è disponibile. I file che il sistema eseguirebbe (programmi, script, collegamenti: `exe`, `bat`, `ps1`, `lnk`, `sh`, `py`, …) non si aprono: resta "Mostra nella cartella".
 - "Mostra nella cartella" (Ctrl+Maiusc+R); per una voce d'archivio mostra l'archivio. Le stesse azioni sono nel menu del clic destro sulla riga.
-- Anteprima (Ctrl+3 la mostra o nasconde; altezza ridimensionabile): per un file di testo le righe da −20 a +20 intorno al risultato (ognuna al massimo 4 KiB), con le corrispondenze evidenziate, ricalcolate con la stessa query della ricerca; precedente/successiva. Per documenti e voci d'archivio, finché non c'è la cache dell'estrattore, mostra il solo contesto del risultato (differenza dal requisito "±20 unità vicine", da completare nella fase 4B).
+- Anteprima (Ctrl+3 la mostra o nasconde; altezza ridimensionabile): per un file di testo le righe da −20 a +20 intorno al risultato (ognuna al massimo 4 KiB), con le corrispondenze evidenziate, ricalcolate con la stessa query della ricerca; precedente/successiva. Per i documenti e le voci d'archivio mostra le unità di testo (paragrafi, celle, righe di pagina, diapositive) fino a 20 prima e 20 dopo, lette dalla cache o rilette dal processo estrattore; se il documento non si legge più, resta il contesto del risultato. Le unità di più righe con posizione a righe si dividono in una per riga.
 - Esporta (Ctrl+E; Ctrl+Maiusc+E apre le impostazioni di esportazione): tutte le righe mostrate o solo le selezionate, nell'ordine della tabella. Colonne Parola, Termine (solo con più termini), File (percorso completo), Posizione, Contesto.
   - CSV: UTF-8 con BOM, `;` in italiano e `,` in inglese, righe CRLF, campi tra virgolette secondo RFC 4180.
   - TXT: UTF-8 con BOM, colonne separate da tabulazioni, tabulazioni e a capo nelle celle resi spazi.
@@ -128,4 +130,4 @@ Ctrl+A, Ctrl+Maiusc+A, Esc, Ctrl+C e Invio, con il focus in un campo di testo, r
 
 ## 14. Persistenza
 
-`settings.toml` proprio, versionato (versione 1): lingua, tema, opzioni, radici e termini correnti e recenti (10), filtri, larghezza dei pannelli e delle colonne, ordinamento, impostazioni della cache. Formato e regole di lettura in `.claude/skills/lynkeus-internals/references/protocollo-e-cache.md`. Cache su disco spegnibile e svuotabile dalle Impostazioni.
+`settings.toml` proprio, versionato (versione 1): lingua, tema, opzioni, radici e termini correnti e recenti (10), filtri, larghezza dei pannelli e delle colonne, ordinamento, impostazioni della cache. Formato e regole di lettura in `.claude/skills/lynkeus-internals/references/protocollo-e-cache.md`. Cache su disco accesa per impostazione predefinita, con limite 500 MB (LRU), spegnibile, ridimensionabile e svuotabile dal menu Strumenti > Cache (accesa, dimensione 100, 250, 500, 1000 o 2000 MiB, svuota); il sottomenu è disabilitato, con il motivo, se non c'è una cartella per la cache. Le impostazioni stanno nella sezione `[cache]` di `settings.toml`.

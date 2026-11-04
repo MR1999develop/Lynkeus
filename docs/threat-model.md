@@ -69,7 +69,7 @@ Metodo: le Quattro Domande e STRIDE. Il processo estrattore e gli archivi sono a
 
 ### 4.7 Dettaglio: file, archivi e processo estrattore (fase 4)
 
-Approfondisce 4.1 e 4.2 (confini 1 e 2). La scelta di isolare i decoder è nell'ADR `docs/adr/0001-estrazione-in-processo-isolato.md`. Il codice dell'estrattore non esiste ancora: i test indicati sono quelli previsti e, finché non sono scritti, la mitigazione non è verificata. Le fixture sono in `fixtures/malevoli/` e `fixtures/formati/` (descrizione in `fixtures/README.md`).
+Approfondisce 4.1 e 4.2 (confini 1 e 2). La scelta di isolare i decoder è nell'ADR `docs/adr/0001-estrazione-in-processo-isolato.md`. Le fasi 4A (crate `lynkeus-extract`) e 4B (pool, cache e Job Object in `lynkeus-engine` e `lynkeus-app`) sono implementate: nelle tabelle, "Implementato" elenca i test che ci sono (nome della funzione di test); "Previsto" ciò che manca ancora. Una mitigazione senza test implementato non è verificata. Le fixture sono in `fixtures/malevoli/` e `fixtures/formati/` (descrizione in `fixtures/README.md`).
 
 **Asset**
 
@@ -99,8 +99,9 @@ file su disco, poi (A) scelta del formato, (B) decoder nel processo estrattore, 
 | Processi del pool | `min(core/2, 4)` |
 | Cache su disco | 500 MB, LRU |
 | Blocco di lettura dei file di testo | circa 8 MB, tagliato a fine riga |
-| Memoria per processo estrattore | da fissare col prototipo del Job Object (fase 4) e scrivere qui |
-| Dimensione massima di un messaggio del protocollo | da fissare nel codice e scrivere qui |
+| Memoria per processo estrattore | 1 GiB (`DEFAULT_MEMORY_LIMIT`; minimo accettato dal figlio 64 MiB). Windows: memoria impegnata per processo, Job Object. Linux: `RLIMIT_AS` imposto dal figlio |
+| Dimensione massima di un messaggio del protocollo | 16 MiB (`MAX_FRAME_BYTES`) |
+| Voce di cache | 64 MiB di frame decompressi (`MAX_ENTRY_BYTES`) |
 
 I byte si contano sul flusso decompresso (`Read::take`), mai sulle dimensioni dichiarate nelle intestazioni.
 
@@ -108,7 +109,7 @@ I byte si contano sul flusso decompresso (`Read::take`), mai sulle dimensioni di
 
 | STRIDE | Minaccia | Mitigazione | Test previsto |
 |---|---|---|---|
-| S | Estensione che mente: un decoder sbagliato legge dati scelti dall'attaccante | Formato scelto dall'estensione e verificato dal contenuto; se non coincidono, avviso "contenuto diverso dall'estensione", salvo i casi innocui del piano (.doc che è RTF, .xls che è HTML o CSV) | `malevoli/immagine-finta.pdf`: avviso, decoder PDF non eseguito. `formati/in-realta-rtf.doc`: letto come RTF |
+| S | Estensione che mente: un decoder sbagliato legge dati scelti dall'attaccante | Formato scelto dall'estensione e verificato dal contenuto; se non coincidono, avviso "contenuto diverso dall'estensione", salvo i casi innocui del piano (.doc che è RTF, .xls che è HTML o CSV) | `malevoli/immagine-finta.pdf`: avviso, decoder PDF non eseguito. `formati/in-realta-rtf.doc`: letto come RTF (previsto: `HARMLESS` è vuota finché non ci sono gli estrattori della fase 5). Implementato: `name_partitions`, `sniff_partitions`, `verify_partitions` (`format.rs`) e `malicious_files_give_warnings_without_blocking` (`ContentMismatch` per `immagine-finta.pdf`) |
 | T | Binario spacciato per testo | NUL nei primi 8 KB e firme note controllati prima della lettura come testo | Fixture di `demo/binario/`: saltati e contati |
 | D | File o riga enormi | Filtro sulla dimensione prima dell'apertura; lettura a blocchi di circa 8 MB; numero di riga con `memchr` | `malevoli/riga-lunga.txt` (riga di 2.000.000 di caratteri): memoria limitata, `aragosta` a riga 2 |
 | E | Estensione che porta a un decoder più pericoloso del necessario | Mappa estensione-decoder fissa (allowlist); estensioni sconosciute mai provate "per vedere" | Test unitario sulla mappa: estensione non in elenco, doppia estensione, maiuscole, nome con NUL |
@@ -119,11 +120,11 @@ I byte si contano sul flusso decompresso (`Read::take`), mai sulle dimensioni di
 |---|---|---|---|
 | T | Dati malformati: lettura fuori buffer, cicli, allocazioni da numeri dichiarati | Rust sicuro (`forbid(unsafe_code)` in `lynkeus-extract`); parser propri (.doc, .ppt, RTF) con lunghezze e offset confrontati con i byte presenti prima di allocare (`checked_*`, `try_from`); errore di parsing = avviso "danneggiato" | `malevoli/troncato.pdf`: avviso, nessun blocco. Fuzzing dei parser propri (fase 5) con corpus da `formati/` |
 | T | XML con DTD ed entità annidate (billion laughs, XXE) | `quick-xml` senza espansione; `<!DOCTYPE>` rifiutato; nessun XInclude né risorsa esterna | `malevoli/entita.docx`: avviso, nessuna espansione, memoria entro il limite |
-| D | Decoder che non termina o consuma memoria | Timeout di 60 s con kill e nuovo processo; limite di memoria del processo; flussi con `Read::take` | Decoder finto che dorme e decoder finto che alloca (test del pool); `malevoli/bomba.zip` |
-| D | Panic o abort del decoder abbattono l'app | Il decoder gira nel figlio: la sua morte dà "danneggiato" per quel file, il pool ne avvia un altro, la ricerca continua | Test: il figlio esce a metà di un file, gli altri file del lotto sono elaborati |
+| D | Decoder che non termina o consuma memoria | Timeout di 60 s con kill e nuovo processo; limite di memoria del processo; flussi con `Read::take` | Decoder finto che dorme e decoder finto che alloca (test del pool); `malevoli/bomba.zip`. Implementato: `misbehaving_workers_are_replaced_and_reported` (lento = `Timeout`), `malicious_files_give_warnings_without_blocking` (`bomba.zip`), `exceeding_the_memory_limit_kills_and_is_recognized` (Job Object, Windows) |
+| D | Panic o abort del decoder abbattono l'app | Il decoder gira nel figlio: la sua morte dà "danneggiato" per quel file, il pool ne avvia un altro, la ricerca continua | Test: il figlio esce a metà di un file, gli altri file del lotto sono elaborati. Implementato: `misbehaving_workers_are_replaced_and_reported` ("muore": `Corrupt`, `note.docx` letto con un processo nuovo) |
 | I | Il decoder legge altro o apre la rete | Il figlio riceve il percorso e nulla di più; nessuna dipendenza che usi la rete (`cargo deny` e revisione); ambiente svuotato | Controllo delle dipendenze in CI; test sulle variabili d'ambiente del figlio |
 | I | Testo protetto da password | Avviso "protetto da password", nessun tentativo di indovinare | `formati/protetto-password.docx`: avviso, nessun testo |
-| E | Esecuzione di codice (macro, OLE, JavaScript nei PDF, collegamenti esterni) | Si estrae solo testo; macro, oggetti incorporati e collegamenti ignorati; nessun avvio di programmi | Controllo in CI: nessun uso di `std::process::Command` nei moduli dei decoder (il pool che avvia il figlio ne è escluso) |
+| E | Esecuzione di codice (macro, OLE, JavaScript nei PDF, collegamenti esterni) | Si estrae solo testo; macro, oggetti incorporati e collegamenti ignorati; nessun avvio di programmi | Controllo in CI: nessun uso di `std::process::Command` nei moduli dei decoder (il pool che avvia il figlio ne è escluso). Previsto: il controllo non c'è ancora; il solo `Command` è in `launcher.rs` dell'engine |
 | E | Compromissione del figlio per un bug | Risorse limitate, nessuna scrittura sui dati dell'utente, ambiente e handle minimi; il resto è rischio accettato (sezione 5) | Sezione D e ADR 0001 |
 
 #### C. Archivi e allegati annidati (zip, tar, gz, 7z, docx, odt, EPUB, EML)
@@ -143,25 +144,32 @@ I byte si contano sul flusso decompresso (`Read::take`), mai sulle dimensioni di
 
 | STRIDE | Minaccia | Mitigazione | Test previsto |
 |---|---|---|---|
-| S | Avvio di un eseguibile diverso | Percorso assoluto di `current_exe()`, mai `PATH` né cartella corrente | Test sul comando costruito |
-| T | Messaggio alterato, troncato o con lunghezza falsa | Lunghezza in testa confrontata con il massimo prima di allocare; `postcard` in tipi concreti; violazione = figlio terminato e sostituito | Test con messaggi troncati, lunghezza `u32::MAX`, byte casuali (proptest); poi fuzzing del decodificatore |
-| T | Il figlio scrive su stdout cose estranee al protocollo | Stdout riservato al protocollo; log solo su stderr, letto con tetto | Decoder finto che stampa su stdout: figlio sostituito |
+| S | Avvio di un eseguibile diverso | Percorso assoluto di `current_exe()`, mai `PATH` né cartella corrente | Previsto e implementato: `relative_executables_are_refused` e `the_command_has_a_minimal_environment` (`launcher.rs`), `relative_paths_are_refused` (`windows_ffi.rs`) |
+| T | Messaggio alterato, troncato o con lunghezza falsa | Lunghezza in testa confrontata con il massimo prima di allocare; `postcard` in tipi concreti; violazione = figlio terminato e sostituito | Implementato: `every_truncation_is_detected`, `oversized_length_is_rejected_before_reading`, `short_length_wrong_version_and_trailing_bytes`, `oversized_message_is_not_written`, `random_bytes_never_panic` (proptest), `events_round_trip` (`protocol.rs`); lato figlio `malformed_frame_is_rejected_then_exit` e `truncated_request_is_rejected` (`worker.rs`). Previsto: fuzzing del decodificatore |
+| T | Il figlio scrive su stdout cose estranee al protocollo | Stdout riservato al protocollo; log solo su stderr, letto con tetto | Decoder finto che stampa su stdout: figlio sostituito. Implementato: "sporco" in `misbehaving_workers_are_replaced_and_reported` |
 | R | Non rilevante | | |
-| I | Il figlio riceve più del necessario | `env_clear` salvo poche variabili di sistema; nessun handle ereditato oltre a stdin, stdout, stderr (lista esplicita su Windows, chiusura dei descrittori su Linux) | Test sugli handle e sull'ambiente del figlio |
-| I | Contenuto dei documenti nei log o nei rapporti di crash | Gli errori portano motivo e percorso, mai estratti di testo | Test sul log dopo un file con testo riconoscibile |
-| D | Figlio muto, che inonda stdout o ignora l'annulla | Timeout 60 s con kill; lettura con tetto; annulla = stdin chiuso e kill dopo 500 ms; `KILL_ON_JOB_CLOSE` (Windows) e uscita alla chiusura dello stdin (Linux) evitano orfani se l'app muore | Figlio muto; figlio che scrive senza fine; annulla durante un file; app terminata con figli vivi (nessun processo resta) |
-| E | Un figlio compromesso chiede al padre cose non previste | Il padre accetta solo i messaggi previsti nello stato corrente (richiesta, risposta, fine); nessun comando dal figlio al padre; i risultati sono solo testo da cercare | Risposta fuori sequenza o a un id non richiesto |
+| I | Il figlio riceve più del necessario | `env_clear` salvo poche variabili di sistema; nessun handle ereditato oltre a stdin, stdout, stderr (lista esplicita su Windows, chiusura dei descrittori su Linux) | Implementato: ambiente (`the_child_sees_only_system_root`, Windows; `the_command_has_a_minimal_environment`). Previsto: test sugli handle ereditati (la `HANDLE_LIST` è impostata ma nessun test conta gli handle del figlio) |
+| I | Contenuto dei documenti nei log o nei rapporti di crash | Gli errori portano motivo e percorso, mai estratti di testo | Previsto: test sul log dopo un file con testo riconoscibile (il figlio ha stderr nullo e non scrive log) |
+| D | Figlio muto, che inonda stdout o ignora l'annulla | Timeout 60 s con kill; lettura con tetto; annulla = stdin chiuso e kill dopo 500 ms; `KILL_ON_JOB_CLOSE` (Windows) e uscita alla chiusura dello stdin (Linux) evitano orfani se l'app muore | Implementato: figlio muto con timeout ("lento"), annulla entro 1 s (`cancel_stops_a_busy_worker_within_one_second`), chiusura del job che termina il figlio (`closing_the_job_kills_the_child`), `terminate_kills_and_is_idempotent`. Previsto: figlio che scrive senza fine; app terminata con figli vivi su Linux |
+| E | Un figlio compromesso chiede al padre cose non previste | Il padre accetta solo i messaggi previsti nello stato corrente (richiesta, risposta, fine); nessun comando dal figlio al padre; i risultati sono solo testo da cercare | Implementato: "fuori-sequenza" e "altro-id" in `misbehaving_workers_are_replaced_and_reported`; `sequence_partitions` (`event.rs`) |
 
 #### E. Cache su disco
 
 | STRIDE | Minaccia | Mitigazione | Test previsto |
 |---|---|---|---|
-| I | Altri utenti o processi leggono il testo dei documenti | Descrittore esplicito (solo utente e SYSTEM) su Windows, 0700 e 0600 su Linux; cache spegnibile e svuotabile; avviso nel README | Verifica di ACL e permessi dopo la creazione |
-| T | Voce alterata, troncata o di versione diversa | Intestazione con versione e CRC; voce non valida ignorata e cancellata; stessi limiti di lunghezza del protocollo | Voce troncata, CRC errato, versione futura, lunghezze enormi nel contenuto |
-| T | Voce valida per la chiave ma con testo diverso dal documento | Chiave `blake3` di percorso, dimensione, data di modifica, versione degli estrattori e limiti. Chi scrive nella cache ha già i diritti dell'utente: rischio accettato | Cambiando dimensione, data o versione la voce non viene riusata |
-| T | Scrittura a metà, nomi pericolosi, file preesistenti | Scrittura su temporaneo e rinomina; creazione che fallisce se il file esiste; nomi dei file derivati dall'hash, mai dal nome del documento o della voce | Nome di documento con caratteri speciali dà un nome esadecimale; interruzione a metà non lascia una voce valida |
-| D | Crescita illimitata | LRU a 500 MB; una voce che da sola non entra non si salva | Sfratto con limite piccolo |
-| D | Dimensione decompressa `lz4_flex` dichiarata falsa | Dimensione dichiarata nell'intestazione confrontata con il massimo prima di decomprimere | Voce con dimensione dichiarata enorme |
+| I | Altri utenti o processi leggono il testo dei documenti | Descrittore esplicito (solo utente e SYSTEM) su Windows, 0700 e 0600 su Linux; cache spegnibile e svuotabile; avviso nel README | Previsto: verifica di ACL e permessi dopo la creazione (fase 7: su Windows la cartella eredita ancora i permessi dell'utente, descrittore esplicito non ancora impostato) |
+| T | Voce alterata, troncata o di versione diversa | Intestazione con versione e CRC; voce non valida ignorata e cancellata; stessi limiti di lunghezza del protocollo | Implementato: `corrupt_entries_are_ignored_and_removed` (CRC, troncata, versione futura, lunghezza enorme, altra chiave, spazzatura), `entries_with_a_bad_event_sequence_are_corrupt`, `entries_round_trip` (byte casuali) e `second_search_reads_from_the_cache_and_corrupt_entries_are_dropped` |
+| T | Voce valida per la chiave ma con testo diverso dal documento | Chiave `blake3` di percorso, dimensione, data di modifica, versione degli estrattori e limiti. Chi scrive nella cache ha già i diritti dell'utente: rischio accettato | Implementato: `key_partitions` (percorso, dimensione, data, limiti); la versione del programma e del protocollo sono nell'hash ma non hanno un test proprio |
+| T | Scrittura a metà, nomi pericolosi, file preesistenti | Scrittura su temporaneo e rinomina; creazione che fallisce se il file esiste; nomi dei file derivati dall'hash, mai dal nome del documento o della voce | Implementato: nome esadecimale in `key_partitions`. Previsto: interruzione a metà scrittura |
+| D | Crescita illimitata | LRU a 500 MB; una voce che da sola non entra non si salva | Implementato: `least_recently_used_entries_are_evicted`, `an_entry_larger_than_the_cache_is_not_saved` |
+| D | Dimensione decompressa `lz4_flex` dichiarata falsa | Dimensione dichiarata nell'intestazione confrontata con il massimo prima di decomprimere | Implementato: lunghezza dichiarata `u32::MAX` in `corrupt_entries_are_ignored_and_removed` |
+
+#### Limiti noti di 4.7
+
+- **Linux: memoria superata non distinta da un aborto.** `RLIMIT_AS` fa fallire le allocazioni e il figlio abortisce: il padre vede `WorkerExit::Failed` e dà l'avviso "danneggiato" invece di "limite superato (memoria)". Su Windows il Job Object (messaggio sulla porta di completamento, o picco entro 1/16 dal limite) lo distingue. Il limite è sulla memoria impegnata/virtuale, non sul working set.
+- **Voci d'archivio non di testo non ancora apribili.** Il protocollo porta solo testo: una voce PDF o Office dentro un archivio si trova e si mostra in anteprima, ma "Apri" dà il messaggio di non disponibilità (servono i byte originali della voce). Le voci di testo si ricompongono in un file della cartella privata (al più 64 MiB).
+- **Controllo "nessun `Command` nei decoder" e test degli handle ereditati ancora da scrivere.**
+- **Windows: cartelle private con permessi ereditati** fino alla fase 7.
 
 ## 5. Rischi accettati
 

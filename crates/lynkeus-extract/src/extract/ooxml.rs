@@ -224,7 +224,7 @@ fn relationship_targets<R: BufRead>(
 
 /// Il nome della parte a cui punta `target`, relativo alla cartella `base` del pacchetto
 /// (assoluto se inizia con `/`). `None` se esce dal pacchetto.
-fn resolve_target(base: &str, target: &str) -> Option<String> {
+pub(crate) fn resolve_target(base: &str, target: &str) -> Option<String> {
     let (start, rest) = match target.strip_prefix('/') {
         Some(absolute) => ("", absolute),
         None => (base, target),

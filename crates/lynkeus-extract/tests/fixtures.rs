@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use lynkeus_core::{Location, TextUnit};
+use lynkeus_core::{Location, MailPart, TextUnit};
 use lynkeus_extract::{
     ExtractEvent, ExtractOptions, Format, LimitKind, SequenceCheck, SkipReason, WarningKind,
     extract_path, line_location,
@@ -206,6 +206,187 @@ fn password_protected_pdf() {
 fn plain_text_line_numbers() {
     let events = extract("formati/spesa.txt");
     assert_eq!(locations_of(&events, "aragosta"), [Location::Line(6)]);
+}
+
+// ── formati/ della fase 5 ─────────────────────────────────────────────────────────────────
+
+#[test]
+fn doc_paragraphs() {
+    let events = extract("formati/vecchia-lettera.doc");
+    assert_eq!(starts(&events), [(Vec::new(), Format::Doc)]);
+    assert_eq!(locations_of(&events, "aragosta"), [Location::Paragraph(3)]);
+    assert_eq!(locations_of(&events, "città"), [Location::Paragraph(2)]);
+    assert!(warnings(&events).is_empty());
+}
+
+#[test]
+fn xls_cells() {
+    let events = extract("formati/vecchia-spesa.xls");
+    assert_eq!(starts(&events), [(Vec::new(), Format::Xls)]);
+    let spesa = |row, col| Location::Cell {
+        sheet: "Spesa".to_owned(),
+        row,
+        col,
+    };
+    assert_eq!(locations_of(&events, "aragosta"), [spesa(7, 2)]);
+    assert_eq!(locations_of(&events, "città"), [spesa(2, 3)]);
+}
+
+#[test]
+fn ppt_slides() {
+    let events = extract("formati/vecchia-presentazione.ppt");
+    assert_eq!(starts(&events), [(Vec::new(), Format::Ppt)]);
+    assert_eq!(locations_of(&events, "aragosta"), [Location::Slide(3)]);
+    assert_eq!(locations_of(&events, "città"), [Location::Slide(2)]);
+    assert!(warnings(&events).is_empty());
+}
+
+#[test]
+fn rtf_paragraphs_with_hex_and_unicode() {
+    let events = extract("formati/lettera.rtf");
+    assert_eq!(starts(&events), [(Vec::new(), Format::Rtf)]);
+    assert_eq!(locations_of(&events, "aragosta"), [Location::Paragraph(3)]);
+    // `citt\'e0` e `perch\u233?`.
+    assert_eq!(locations_of(&events, "città"), [Location::Paragraph(2)]);
+    assert_eq!(locations_of(&events, "perché"), [Location::Paragraph(2)]);
+    assert_eq!(locations_of(&events, "c'è"), [Location::Paragraph(2)]);
+}
+
+#[test]
+fn doc_that_is_rtf_is_read_as_rtf() {
+    let events = extract("formati/in-realta-rtf.doc");
+    assert_eq!(starts(&events), [(Vec::new(), Format::Rtf)]);
+    assert_eq!(locations_of(&events, "aragosta"), [Location::Paragraph(3)]);
+    assert!(warnings(&events).is_empty());
+}
+
+fn mail(part: MailPart, line: u32) -> Location {
+    Location::Mail { part, line }
+}
+
+#[test]
+fn eml_with_attachments() {
+    let events = extract("formati/ordine.eml");
+    assert_eq!(
+        starts(&events),
+        [
+            (Vec::new(), Format::Eml),
+            (names(&["allegato.docx"]), Format::Docx),
+            (names(&["nota.txt"]), Format::Text),
+        ]
+    );
+    assert_eq!(
+        locations_of(&events, "aragosta"),
+        [
+            mail(MailPart::Subject, 1),
+            mail(MailPart::Body, 2),
+            Location::Paragraph(2),
+            Location::Line(1),
+        ]
+    );
+    assert_eq!(
+        locations_of(&events, "mittente@example.com"),
+        [mail(MailPart::From, 1)]
+    );
+    assert_eq!(
+        locations_of(&events, "destinatario@example.com"),
+        [mail(MailPart::To, 1)]
+    );
+    assert!(warnings(&events).is_empty());
+}
+
+#[test]
+fn eml_body_only() {
+    let events = extract("formati/saluti.eml");
+    assert_eq!(starts(&events), [(Vec::new(), Format::Eml)]);
+    assert_eq!(locations_of(&events, "aragosta"), [mail(MailPart::Body, 2)]);
+    assert_eq!(locations_of(&events, "città"), [mail(MailPart::Body, 2)]);
+}
+
+#[test]
+fn epub_chapters() {
+    let events = extract("formati/libro.epub");
+    let cap1 = names(&["OEBPS/cap1.xhtml"]);
+    let cap2 = names(&["OEBPS/cap2.xhtml"]);
+    assert_eq!(
+        starts(&events),
+        [(cap1.clone(), Format::Epub), (cap2.clone(), Format::Epub)]
+    );
+    // Il titolo h1 è il paragrafo 1 di ogni capitolo.
+    assert_eq!(
+        located(&events, "aragosta"),
+        [(cap2, Location::Paragraph(2))]
+    );
+    assert_eq!(
+        located(&events, "città"),
+        [(cap1.clone(), Location::Paragraph(2))]
+    );
+    assert_eq!(located(&events, "Perché"), [(cap1, Location::Paragraph(3))]);
+}
+
+/// Come [`locations_of`], con il documento (`inner`) di ogni posizione.
+fn located(events: &[ExtractEvent], word: &str) -> Vec<(Vec<String>, Location)> {
+    let mut inner = Vec::new();
+    let mut found = Vec::new();
+    for event in events {
+        match event {
+            ExtractEvent::DocumentStart { inner: i, .. } => inner.clone_from(i),
+            ExtractEvent::Unit(unit) => {
+                for (k, line) in unit.text.split('\n').enumerate() {
+                    if line.contains(word) {
+                        let k = u32::try_from(k).unwrap_or(u32::MAX);
+                        found.push((inner.clone(), line_location(&unit.location, k)));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    found
+}
+
+fn ricetta_in(relative: &str) {
+    let events = extract(relative);
+    // 7-Zip ordina le voci a modo suo: conta l'insieme.
+    let mut documents = starts(&events);
+    documents.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(
+        documents,
+        [
+            (names(&["cartella/nota.txt"]), Format::Text),
+            (names(&["cartella/ricetta.txt"]), Format::Text),
+        ],
+        "{relative}"
+    );
+    assert_eq!(
+        located(&events, "aragosta"),
+        [(names(&["cartella/ricetta.txt"]), Location::Line(2))],
+        "{relative}"
+    );
+    assert!(warnings(&events).is_empty(), "{relative}");
+}
+
+#[test]
+fn tar_entries() {
+    ricetta_in("formati/archivio.tar");
+}
+
+#[test]
+fn tar_gz_entries() {
+    ricetta_in("formati/archivio.tar.gz");
+}
+
+#[test]
+fn sevenz_entries() {
+    ricetta_in("formati/archivio.7z");
+}
+
+#[test]
+fn gz_single_file() {
+    let events = extract("formati/appunti.txt.gz");
+    assert_eq!(starts(&events), [(names(&["appunti.txt"]), Format::Text)]);
+    assert_eq!(locations_of(&events, "aragosta"), [Location::Line(2)]);
+    assert_eq!(locations_of(&events, "città"), [Location::Line(2)]);
 }
 
 // ── malevoli/ ─────────────────────────────────────────────────────────────────────────────

@@ -177,6 +177,11 @@ pub(crate) struct LimitedReader<R> {
     /// Byte compressi della voce, per il rapporto; `None` se il flusso non è compresso.
     compressed: Option<u64>,
     budget: Rc<Budget>,
+    /// Falso per il flusso di un archivio intero (il tar dentro un `.tar.gz`): i suoi byte li
+    /// contano già le voci.
+    counted: bool,
+    /// Limite che il superamento di `max_entry` fa scattare.
+    over_max: LimitKind,
 }
 
 impl<R: Read> LimitedReader<R> {
@@ -190,6 +195,24 @@ impl<R: Read> LimitedReader<R> {
             max_entry,
             compressed,
             budget,
+            counted: true,
+            over_max: LimitKind::EntrySize,
+        }
+    }
+
+    /// Avvolge il flusso decompresso di un archivio intero (il tar di un `.tar.gz`): al più
+    /// il massimo per archivio, rapporto controllato su `compressed`, byte non sommati al
+    /// totale (li sommano le voci che se ne leggono).
+    pub fn for_container(inner: R, budget: Rc<Budget>, compressed: u64) -> LimitedReader<R> {
+        let max = budget.limits().max_archive_size.bytes();
+        LimitedReader {
+            inner: inner.take(max.saturating_add(1)),
+            read: 0,
+            max_entry: max,
+            compressed: Some(compressed),
+            budget,
+            counted: false,
+            over_max: LimitKind::ArchiveSize,
         }
     }
 }
@@ -200,14 +223,16 @@ impl<R: Read> Read for LimitedReader<R> {
         let counted = u64::try_from(n).unwrap_or(u64::MAX);
         self.read = self.read.saturating_add(counted);
         if self.read > self.max_entry {
-            return Err(limit_error(LimitKind::EntrySize));
+            return Err(limit_error(self.over_max));
         }
         if let Some(compressed) = self.compressed
             && ratio_exceeded(self.read, compressed, self.budget.limits())
         {
             return Err(limit_error(LimitKind::CompressionRatio));
         }
-        self.budget.add_bytes(counted).map_err(limit_error)?;
+        if self.counted {
+            self.budget.add_bytes(counted).map_err(limit_error)?;
+        }
         Ok(n)
     }
 }
@@ -282,6 +307,46 @@ mod tests {
         ));
         // Stesso flusso, ma compresso abbastanza poco.
         assert!(read_through(&vec![0; grace + 1], &budget, Some(grace as u64)).is_ok());
+    }
+
+    #[test]
+    fn container_stream_is_bounded_but_not_counted() {
+        let budget = Rc::new(Budget::new(limits(40, 100)));
+        // Oltre il massimo per voce ma entro quello per archivio: ammesso, non sommato.
+        let data = [b'a'; 80];
+        let read = read_all(LimitedReader::for_container(
+            &data[..],
+            Rc::clone(&budget),
+            80,
+        ));
+        assert_eq!(read.map(|b| b.len()).ok(), Some(80));
+        // Le voci lette dal flusso contano: 40 + 40 + 20 = 100, entro il totale.
+        assert!(read_through(&[0; 40], &budget, None).is_ok());
+        assert!(read_through(&[0; 40], &budget, None).is_ok());
+        assert!(read_through(&[0; 20], &budget, None).is_ok());
+        assert!(!budget.exhausted());
+        // Oltre il massimo per archivio: limite dell'archivio.
+        let data = [b'a'; 101];
+        assert!(matches!(
+            read_all(LimitedReader::for_container(
+                &data[..],
+                Rc::clone(&budget),
+                101
+            )),
+            Err(ExtractError::LimitExceeded(LimitKind::ArchiveSize))
+        ));
+        // Rapporto sul flusso intero.
+        let big = u64::MAX / 2;
+        let budget = Rc::new(Budget::new(limits(10, big)));
+        let grace = usize::try_from(RATIO_GRACE_BYTES).unwrap_or(usize::MAX);
+        assert!(matches!(
+            read_all(LimitedReader::for_container(
+                &vec![0; grace + 1][..],
+                budget,
+                10
+            )),
+            Err(ExtractError::LimitExceeded(LimitKind::CompressionRatio))
+        ));
     }
 
     #[test]

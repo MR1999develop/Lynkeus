@@ -13,7 +13,7 @@
 //! - [`text`]: file di testo (codifiche, binari, lettura a blocchi), usato anche dal processo
 //!   principale;
 //! - [`format`]: scelta del formato dall'estensione, verifica dal contenuto, registro degli
-//!   estrattori (il punto da estendere con i formati della fase 5);
+//!   estrattori (il punto da estendere con nuovi formati);
 //! - [`event`]: eventi d'estrazione ([`ExtractEvent`]) e il loro destinatario ([`EventSink`]);
 //! - [`extract_path`]: estrazione nello stesso processo (per il processo estrattore e i test);
 //! - [`protocol`]: frame e messaggi tra processo principale e processo estrattore;
@@ -29,6 +29,9 @@ pub mod error;
 pub mod event;
 mod extract;
 pub mod format;
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub mod fuzzing;
 pub mod limits;
 mod platform;
 pub mod protocol;

@@ -18,7 +18,7 @@ Esempio: cercando `ar` si ottiene "aragosta" nel file X, "carta" nel file Y, "ch
 ## Uso dei risultati
 
 - **Apri**: doppio clic su una riga o Invio apre il file con il programma predefinito del sistema. I programmi e gli script (per esempio `.exe`, `.bat`, `.ps1`, `.sh`) non vengono mai aperti da qui: si può solo mostrarli nella cartella. **Mostra nella cartella**: Ctrl+Maiusc+R o clic destro.
-- **Anteprima**: sotto la tabella, mostra le righe intorno al risultato con le corrispondenze evidenziate; per i documenti e gli archivi mostra per ora solo il contesto del risultato. Ctrl+3 la mostra o la nasconde; l'altezza si può cambiare e viene ricordata.
+- **Anteprima**: sotto la tabella, mostra le righe intorno al risultato con le corrispondenze evidenziate; per i documenti e gli archivi mostra le unità di testo vicine (paragrafi, celle, righe di pagina) fino a 20 prima e 20 dopo il risultato. Ctrl+3 la mostra o la nasconde; l'altezza si può cambiare e viene ricordata.
 - **Esporta**: Ctrl+E salva le righe mostrate o solo quelle selezionate in CSV (UTF-8; separatore `;` in italiano, `,` in inglese) o in TXT tabulato. Le celle che inizierebbero come una formula (`=`, `+`, `-`, `@`) ricevono un apostrofo davanti, così il foglio di calcolo non le esegue.
 - **Copia**: Ctrl+C copia le righe selezionate come testo con colonne separate da tabulazioni, pronto da incollare in un foglio di calcolo.
 
@@ -43,19 +43,24 @@ cargo xtask check
 
 Testo e codice (con rilevamento della codifica), docx, xlsx, pptx, odt, ods, odp, PDF, doc, xls, ppt, RTF, EML, EPUB, e gli archivi zip, 7z, tar e gz, anche annidati.
 
+In questa versione di sviluppo sono già letti testo e codice, docx, xlsx, pptx, odt, ods, odp, PDF e zip; gli altri formati dell'elenco (doc, xls, ppt, RTF, EML, EPUB, 7z, tar, gz) sono in arrivo.
+
 ## Limiti noti
 
 - Una frase spezzata da un a capo (frequente nei PDF) non viene trovata.
 - I PDF scansionati non hanno testo: servirebbe l'OCR, che non c'è. Il file finisce negli avvisi.
 - Dei file .doc e .ppt si estrae il testo principale; commenti, note e caselle di testo potrebbero mancare.
 - I file .rar non sono supportati.
+- Una voce di archivio che è un documento (per esempio un PDF dentro uno zip) si trova e si vede nell'anteprima, ma per ora non si può aprire dal programma; le voci di testo sì.
 - I file protetti da password o danneggiati, e quelli che superano i limiti di tempo o di dimensione (anche degli archivi), non vengono letti: compaiono nella scheda Avvisi con il loro motivo.
 - Il numero di risultati è limitato (200.000 per impostazione predefinita); al limite la ricerca si ferma e un avviso invita a restringerla.
 - I file presenti solo online (per esempio in OneDrive) sono saltati per non scaricarli, salvo diversa scelta.
 
 ## Cache e privacy
 
-Per non rileggere i documenti a ogni ricerca, il programma conserva su disco il **testo estratto** da documenti e archivi. La cache contiene quindi frammenti del contenuto dei tuoi file: sta in una cartella privata dell'utente. Dalle Impostazioni si può spegnere la cache e svuotarla in qualsiasi momento. Il programma non invia dati in rete.
+Per non rileggere i documenti a ogni ricerca, il programma conserva su disco il **testo estratto** da documenti e archivi. La cache contiene quindi frammenti del contenuto dei tuoi file: sta in una cartella privata dell'utente. Dal menu Strumenti > Cache si può spegnerla, scegliere la dimensione massima (predefinita 500 MB, le voci meno usate si cancellano per prime) e svuotarla in qualsiasi momento. Il programma non invia dati in rete.
+
+I documenti (PDF, Office, archivi) sono letti da processi separati con memoria e tempo limitati: un file danneggiato o ostile non blocca il programma, ma compare negli avvisi.
 
 ## Firma dell'eseguibile e verifica
 

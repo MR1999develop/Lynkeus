@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Copyright (C) 2026 MR
 
-//! Fogli di calcolo xlsx e ods con `calamine`: un'unità per cella non vuota
+//! Fogli di calcolo xlsx, xls e ods con `calamine`: un'unità per cella non vuota
 //! ([`Location::Cell`] con il nome del foglio come etichetta), fogli nell'ordine del file.
 //!
 //! `calamine` legge le parti in memoria senza i nostri limiti, quindi prima si fa un
@@ -16,7 +16,7 @@
 
 use std::io::{self, BufReader};
 
-use calamine::{Data, Ods, Reader, Xlsx};
+use calamine::{Data, Ods, Reader, Xls, XlsError, Xlsx};
 use lynkeus_core::Location;
 
 use crate::error::ExtractError;
@@ -45,6 +45,21 @@ pub(crate) fn extract_ods(ctx: &mut Ctx<'_>, input: Input<'_>) -> Result<(), Fai
     check_package(ctx, &mut container, ODS_MIME)?;
     preflight(ctx, &mut container)?;
     let workbook: Ods<Seekable> = Ods::new(container.into_source()?).map_err(|_| corrupt())?;
+    cells(ctx, workbook)
+}
+
+/// Estrae le celle di un xls (Excel 97-2003).
+///
+/// `calamine` legge da sé il file composto: il file è già in memoria entro il massimo per
+/// voce, e il resto (allocazioni dai record) lo limita il processo estrattore. Una cartella
+/// di lavoro cifrata dà "protetto da password".
+pub(crate) fn extract_xls(ctx: &mut Ctx<'_>, input: Input<'_>) -> Result<(), Fail> {
+    let (source, _) = input.into_seekable(ctx)?;
+    let workbook: Xls<Seekable> = Xls::new(source).map_err(|error| match error {
+        XlsError::Password => ExtractError::Encrypted,
+        XlsError::Io(io) => classify_io(io),
+        _ => corrupt(),
+    })?;
     cells(ctx, workbook)
 }
 

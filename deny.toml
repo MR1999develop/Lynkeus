@@ -57,7 +57,11 @@ ignore = true
 multiple-versions = "warn"
 wildcards = "deny"
 allow-wildcard-paths = true
-deny = []
+deny = [
+    # ADR 0002: i PDF si leggono solo con pdf_oxide (versione bloccata), senza ripiego.
+    { crate = "pdf-extract", reason = "ADR 0002: libreria PDF scartata, nessun ripiego" },
+    { crate = "lopdf", reason = "ADR 0002: base di pdf-extract, nessun secondo decoder PDF" },
+]
 skip = []
 skip-tree = []
 
