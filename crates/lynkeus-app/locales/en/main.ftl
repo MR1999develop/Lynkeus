@@ -274,7 +274,7 @@ preview-previous = ‹ Previous
 preview-next = Next ›
 preview-next-file = File »
 preview-open = Open
-# $file (text): file path; $location (text): position, e.g. "line 12".
+# $file (text): file path; $location (text): location, e.g. "line 12".
 preview-title = { $file } — { $location }
 # $reason (text): reason, as in the Warnings tab.
 preview-unreadable = Preview not available: { $reason }.

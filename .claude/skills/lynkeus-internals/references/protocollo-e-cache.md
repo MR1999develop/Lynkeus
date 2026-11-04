@@ -31,9 +31,10 @@ Formato, versione 1 (`format_version = 1`), chiavi stabili e valori come testo l
 - radice: `language` ("system", "it", "en"), `theme` ("system", "light", "dark");
 - `[search]`: `case` ("insensitive", "sensitive"), `accents` ("distinct", "ignored"), `wildcards` (bool), `combine` ("any", "all"), `roots`, `terms`, `recent_roots`, `recent_terms`;
 - `[filters]`: `extension_mode` ("all", "include", "exclude"), `extensions`, `skip_dirs`, `include_hidden`, `include_online_only`, `limit_file_size`, `max_file_size_mib`;
-- `[layout]`: `search_panel_width`, `search_panel_visible`, `column_word`, `column_term`, `column_file`, `column_position`, `sort_column` ("none", "word", "term", "file", "position", "context"), `sort_descending`.
+- `[layout]`: `search_panel_width`, `search_panel_visible`, `column_word`, `column_term`, `column_file`, `column_position`, `sort_column` ("none", "word", "term", "file", "position", "context"), `sort_descending`, `preview_visible` (bool, predefinito vero), `preview_height` (altezza dell'anteprima, 80-900, predefinita 220);
+- `[export]`: `format` ("csv", "txt"; altro = "csv"), `scope` ("visible", "selected"; altro = "visible"), `last_dir` (ultima cartella di salvataggio; assente se non c'è, scartata se vuota o troppo lunga; un percorso non UTF-8 non si salva).
 
-Lettura tollerante: non fallisce mai. Ogni campo si legge da solo; un valore mancante o del tipo sbagliato prende il predefinito senza perdere gli altri; i numeri fuori intervallo si riportano ai limiti (larghezza colonne 40-2000, pannello 260-560); le estensioni non valide e i percorsi vuoti si scartano. `skip_dirs` assente = predefinite, presente ma vuoto = nessuna.
+Lettura tollerante: non fallisce mai. Ogni campo si legge da solo; un valore mancante o del tipo sbagliato prende il predefinito senza perdere gli altri; i numeri fuori intervallo si riportano ai limiti (larghezza colonne 40-2000, pannello 260-560, anteprima 80-900); le estensioni non valide e i percorsi vuoti si scartano. `skip_dirs` assente = predefinite, presente ma vuoto = nessuna.
 
 Campi sconosciuti (di versioni future o scritti a mano) conservati: il documento letto si tiene in memoria e a ogni salvataggio le tabelle si fondono chiave per chiave con quelle scritte dal programma.
 

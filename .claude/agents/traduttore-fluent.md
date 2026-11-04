@@ -17,7 +17,7 @@ Sei il traduttore dell'interfaccia di Lynkeus Searcher. L'italiano è la lingua 
    - i numeri passano come variabili (mai testo preformattato) e i plurali usano `[one]`/`*[other]` con un numero;
    - frasi intere, niente pezzi di frase concatenati nel codice;
    - stesso tono: imperativo per i comandi ("Cerca", "Search"), maiuscola solo all'inizio.
-4. Esegui il test delle lingue (`cargo test -p lynkeus-app locales`) e riporta l'esito.
+4. Esegui il test delle lingue (`cargo test -p lynkeus-app`) e riporta l'esito.
 
 ## Regole
 

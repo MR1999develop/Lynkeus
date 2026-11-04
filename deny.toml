@@ -10,12 +10,12 @@ all-features = true
 # Ogni eccezione va in `ignore` con l'ID dell'advisory e il motivo:
 # ignore = [{ id = "RUSTSEC-AAAA-NNNN", reason = "..." }]
 ignore = [
-    # Accessibilità su Linux: eframe 0.37 → accesskit_unix 0.24.1 (ultima versione) → zbus 5.
+    # zbus 5 su Linux: eframe 0.37 → accesskit_unix 0.24.1 (ultima versione) e portale XDG di lynkeus-app.
     # Solo "unmaintained", nessuna vulnerabilità nota. Da rivedere quando accesskit passa a zbus 6
     # o a ogni aggiornamento di eframe.
-    { id = "RUSTSEC-2026-0370", reason = "zvariant non mantenuto, arriva da AccessKit su Linux senza alternative" },
-    { id = "RUSTSEC-2026-0371", reason = "zbus_names non mantenuto, arriva da AccessKit su Linux senza alternative" },
-    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive non mantenuto, arriva da AccessKit su Linux senza alternative" },
+    { id = "RUSTSEC-2026-0370", reason = "zvariant non mantenuto, arriva da zbus 5 (AccessKit su Linux e portale XDG di lynkeus-app) senza alternative" },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names non mantenuto, arriva da zbus 5 (AccessKit su Linux e portale XDG di lynkeus-app) senza alternative" },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive non mantenuto, arriva da zbus 5 (AccessKit su Linux e portale XDG di lynkeus-app) senza alternative" },
 ]
 unmaintained = "all"
 unsound = "all"

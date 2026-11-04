@@ -62,8 +62,10 @@ Metodo: le Quattro Domande e STRIDE. Il processo estrattore e gli archivi sono a
 
 ### 4.6 File esportati
 
-- **T/E**: iniezione di formule nei CSV aperti con un foglio di calcolo (testo che inizia con `=`, `+`, `-`, `@`). Da trattare nella fase 6.
+- **T/E**: iniezione di formule nei CSV aperti con un foglio di calcolo (testo che inizia con `=`, `+`, `-`, `@`, tabulazione o CR). Mitigazione (`crates/lynkeus-app/src/export.rs`): `neutralize_formula` antepone un apostrofo a ogni cella che inizia con uno di questi caratteri, in CSV, TXT e TSV degli appunti; nei TXT e TSV la neutralizzazione avviene dopo l'appiattimento di tabulazioni e a capo. Verifica: test `formula_partitions`, `formulas_are_neutralized_in_every_format` e proptest `csv_round_trip_any_cells` (nessuna cella esportata inizia con un carattere a rischio). Limite: l'apostrofo resta visibile se il file è riletto da un programma che non è un foglio di calcolo.
+- **T/E**: "Apri" su un risultato che sia un programma o uno script (doppio clic su `pulisci.bat` in una cartella cercata). Mitigazione (`crates/lynkeus-app/src/launch.rs`): `open_plan` non apre i file con estensione eseguibile (`exe`, `bat`, `cmd`, `ps1`, `vbs`, `js`, `lnk`, `url`, `sh`, `py` e simili, elenco largo; punti e spazi finali e maiuscole non contano) e propone solo "Mostra nella cartella"; per una voce d'archivio si guarda il nome della voce. I file si aprono con il programma predefinito del sistema, mai con un programma cercato per nome, e con percorso assoluto. Verifica: test `executable_name_partitions` e `plan_partitions`. Limite: l'elenco è per estensione; un tipo di file con un gestore che esegue codice (per esempio un documento con macro) si apre come il sistema stabilisce.
 - **I**: l'esportazione contiene contesto dei documenti: scelta esplicita dell'utente.
+- **T**: scrittura del file esportato. Mitigazione: scrittura atomica e durevole (`write_export`: temporaneo nuovo, `sync_all`, rinomina); la conferma della sovrascrittura la chiede il dialogo di salvataggio del sistema.
 
 ### 4.7 Dettaglio: file, archivi e processo estrattore (fase 4)
 

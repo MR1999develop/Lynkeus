@@ -15,6 +15,13 @@ Esempio: cercando `ar` si ottiene "aragosta" nel file X, "carta" nel file Y, "ch
 - Interfaccia in italiano e in inglese.
 - Filtri su estensioni, cartelle da saltare, file nascosti e di sistema, dimensione massima.
 
+## Uso dei risultati
+
+- **Apri**: doppio clic su una riga o Invio apre il file con il programma predefinito del sistema. I programmi e gli script (per esempio `.exe`, `.bat`, `.ps1`, `.sh`) non vengono mai aperti da qui: si può solo mostrarli nella cartella. **Mostra nella cartella**: Ctrl+Maiusc+R o clic destro.
+- **Anteprima**: sotto la tabella, mostra le righe intorno al risultato con le corrispondenze evidenziate; per i documenti e gli archivi mostra per ora solo il contesto del risultato. Ctrl+3 la mostra o la nasconde; l'altezza si può cambiare e viene ricordata.
+- **Esporta**: Ctrl+E salva le righe mostrate o solo quelle selezionate in CSV (UTF-8; separatore `;` in italiano, `,` in inglese) o in TXT tabulato. Le celle che inizierebbero come una formula (`=`, `+`, `-`, `@`) ricevono un apostrofo davanti, così il foglio di calcolo non le esegue.
+- **Copia**: Ctrl+C copia le righe selezionate come testo con colonne separate da tabulazioni, pronto da incollare in un foglio di calcolo.
+
 ## Requisiti
 
 - Windows 10 o 11, oppure Ubuntu.

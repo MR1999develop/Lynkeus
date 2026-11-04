@@ -89,11 +89,37 @@ Ogni avviso ha il suo motivo: protetto da password, danneggiato, tempo scaduto, 
 
 ## 12. Azioni sui risultati
 
-- Doppio clic o Invio apre il file; una voce dentro un archivio è prima estratta in una cartella temporanea dell'app, cancellata all'uscita.
-- "Mostra nella cartella".
-- Anteprima: unità di testo con ±20 unità vicine, corrispondenze evidenziate, precedente/successiva.
-- Esporta CSV (UTF-8 con BOM; `;` in italiano, `,` in inglese) o TXT tabulato.
-- Ctrl+C copia le righe selezionate come TSV.
+- Doppio clic o Invio apre il file con il programma predefinito del sistema; una voce dentro un archivio è prima estratta in una cartella temporanea dell'app, cancellata all'uscita (finché l'estrattore non c'è, un messaggio avvisa che non è disponibile). I file che il sistema eseguirebbe (programmi, script, collegamenti: `exe`, `bat`, `ps1`, `lnk`, `sh`, `py`, …) non si aprono: resta "Mostra nella cartella".
+- "Mostra nella cartella" (Ctrl+Maiusc+R); per una voce d'archivio mostra l'archivio. Le stesse azioni sono nel menu del clic destro sulla riga.
+- Anteprima (Ctrl+3 la mostra o nasconde; altezza ridimensionabile): per un file di testo le righe da −20 a +20 intorno al risultato (ognuna al massimo 4 KiB), con le corrispondenze evidenziate, ricalcolate con la stessa query della ricerca; precedente/successiva. Per documenti e voci d'archivio, finché non c'è la cache dell'estrattore, mostra il solo contesto del risultato (differenza dal requisito "±20 unità vicine", da completare nella fase 4B).
+- Esporta (Ctrl+E; Ctrl+Maiusc+E apre le impostazioni di esportazione): tutte le righe mostrate o solo le selezionate, nell'ordine della tabella. Colonne Parola, Termine (solo con più termini), File (percorso completo), Posizione, Contesto.
+  - CSV: UTF-8 con BOM, `;` in italiano e `,` in inglese, righe CRLF, campi tra virgolette secondo RFC 4180.
+  - TXT: UTF-8 con BOM, colonne separate da tabulazioni, tabulazioni e a capo nelle celle resi spazi.
+  - Le celle che iniziano con `=`, `+`, `-`, `@`, tabulazione o CR hanno un apostrofo davanti (iniezione di formule, threat model 4.6).
+  - Scrittura atomica e durevole; formato, righe e ultima cartella si ricordano.
+- Ctrl+C copia le righe selezionate come TSV (senza intestazione né BOM, stessa neutralizzazione delle formule).
+
+Scorciatoie (tabella in `crates/lynkeus-app/src/ui/commands.rs`):
+
+| Comando | Scorciatoia |
+|---|---|
+| Aggiungi cartella / file | Ctrl+O / Ctrl+Maiusc+O |
+| Apri | Invio |
+| Mostra nella cartella | Ctrl+Maiusc+R |
+| Esporta / impostazioni di esportazione | Ctrl+E / Ctrl+Maiusc+E |
+| Esci | Ctrl+Q |
+| Copia | Ctrl+C |
+| Seleziona tutto / niente | Ctrl+A / Ctrl+Maiusc+A |
+| Cerca nei termini | Ctrl+F |
+| Cerca | F5 |
+| Annulla | Esc |
+| Risultato successivo / precedente nel file | F3 / Maiusc+F3 |
+| File successivo / precedente | Ctrl+F3 / Ctrl+Maiusc+F3 |
+| Scheda Risultati / Avvisi | Ctrl+1 / Ctrl+2 |
+| Mostra o nascondi anteprima | Ctrl+3 |
+| Mostra o nascondi il modulo di ricerca | F9 |
+
+Ctrl+A, Ctrl+Maiusc+A, Esc, Ctrl+C e Invio, con il focus in un campo di testo, restano al campo. Aggiungi termine, Filtri e Informazioni non hanno scorciatoia.
 
 ## 13. Integrazione con il sistema
 
