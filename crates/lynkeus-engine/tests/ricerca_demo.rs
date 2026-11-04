@@ -32,8 +32,9 @@ fn ar_in_the_text_files_of_demo() {
     assert!(found.warnings.is_empty(), "{:?}", found.warnings);
     let counts = found.summary.counts;
     assert_eq!(counts.hits, 6);
-    // Binari: immagine.png, archivio.zip, note.docx (fase 2: solo testo).
-    assert_eq!(counts.binary_skipped, 3);
+    // Binari: immagine.png. Senza fonte dei documenti archivio.zip e note.docx si saltano.
+    assert_eq!(counts.binary_skipped, 1);
+    assert_eq!(counts.files_skipped, 2);
     assert_eq!(counts.files_seen, 7);
     assert_eq!(counts.files_searched, 4);
 }

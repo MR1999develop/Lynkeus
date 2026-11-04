@@ -263,6 +263,7 @@ warning-limit-ratio = Compressione sospetta, possibile archivio malevolo
 warning-limit-memory = Memoria esaurita durante la lettura
 warning-content-mismatch = Il contenuto non corrisponde all'estensione
 warning-no-text = Nessun testo, forse una scansione
+warning-extractor-unavailable = Lettore dei documenti non avviato
 
 ## Anteprima
 
@@ -284,7 +285,7 @@ preview-no-thread = Anteprima non disponibile: il sistema non ha risorse libere.
 ## Messaggi sopra la tabella
 
 notice-executable = Per sicurezza i programmi e gli script non si aprono da qui: usa "Mostra nella cartella" e aprilo da lì se ti fidi.
-notice-archive-entry = I file dentro gli archivi non si possono ancora aprire da qui: usa "Mostra nella cartella" per aprire l'archivio.
+notice-archive-entry = I documenti dentro gli archivi (PDF, Office) non si possono ancora aprire da qui: usa "Mostra nella cartella" per aprire l'archivio.
 # $file (testo): percorso del file.
 notice-open-failed = Errore: { $file } non si è aperto. Controlla che esista ancora e che ci sia un programma per aprirlo.
 # $file (testo): percorso del file.
@@ -319,3 +320,18 @@ export-scope-selected = Solo le righe selezionate ({ $count })
 export-dialog-confirm = Esporta…
 # Nome proposto per il file, senza estensione.
 export-file-name = risultati
+
+## Cache dei documenti (menu Strumenti)
+
+menu-cache = Cache dei documenti
+menu-cache-enabled = Usa la cache
+menu-cache-enabled-hint = Conserva il testo letto da PDF, documenti e archivi, così la ricerca successiva negli stessi file è più veloce. Il testo resta nella cartella dell'app finché non svuoti la cache.
+menu-cache-size = Dimensione massima
+# $mib (numero): dimensione in megabyte.
+menu-cache-size-choice = { $mib } MB
+menu-cache-clear = Svuota la cache
+reason-no-cache = Il sistema non indica una cartella per la cache.
+reason-cache-clearing = La cache si sta svuotando.
+# $mib (numero): megabyte liberati.
+notice-cache-cleared = Cache svuotata: { $mib } MB liberati.
+notice-cache-clear-failed = Errore: la cache non si è svuotata del tutto. Chiudi le altre finestre di Lynkeus Searcher e riprova.

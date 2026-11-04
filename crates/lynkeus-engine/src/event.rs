@@ -58,9 +58,28 @@ pub enum WarningKind {
     ContentMismatch,
     /// Nessun testo estraibile (probabile scansione).
     NoText,
+    /// Il processo estrattore non si è potuto avviare: i documenti non si leggono.
+    ExtractorUnavailable,
 }
 
 impl WarningKind {
+    /// Il motivo di un avviso del processo estrattore.
+    pub fn from_extract(kind: lynkeus_extract::WarningKind) -> WarningKind {
+        use lynkeus_extract::WarningKind as K;
+        match kind {
+            K::NotFound => WarningKind::NotFound,
+            K::AccessDenied => WarningKind::AccessDenied,
+            K::InUse => WarningKind::InUse,
+            K::Io => WarningKind::Io,
+            K::Encrypted => WarningKind::Encrypted,
+            K::Corrupt => WarningKind::Corrupt,
+            K::Timeout => WarningKind::Timeout,
+            K::LimitExceeded(limit) => WarningKind::LimitExceeded(limit),
+            K::ContentMismatch => WarningKind::ContentMismatch,
+            K::NoText => WarningKind::NoText,
+        }
+    }
+
     /// Motivo dell'avviso per un errore di estrazione; `None` per gli errori che non sono
     /// avvisi ma file saltati ([`ExtractError::Binary`], [`ExtractError::TooLarge`]).
     pub fn from_extract_error(error: &ExtractError) -> Option<WarningKind> {

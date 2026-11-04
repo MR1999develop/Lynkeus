@@ -8,10 +8,11 @@
 //!   rilegge il file con [`lynkeus_extract::open_text`] e si tengono le righe da
 //!   `riga − PREVIEW_RADIUS` a `riga + PREVIEW_RADIUS`, ognuna al massimo
 //!   [`MAX_UNIT_BYTES`] byte. La lettura è a blocchi e si ferma dopo l'ultima riga utile.
-//! - **Documenti e voci d'archivio**: le unità vicine le fornisce un [`DocumentUnits`]. Oggi
-//!   c'è solo [`NoDocumentUnits`], che non ne ha: l'anteprima mostra allora il contesto già
-//!   presente nel risultato ([`Loaded::ContextOnly`]). La fase 4B collega qui la cache del
-//!   processo estrattore.
+//! - **Documenti e voci d'archivio**: le unità vicine le fornisce un [`DocumentUnits`]: con
+//!   il processo estrattore collegato è
+//!   [`PoolDocumentUnits`](crate::extraction::PoolDocumentUnits) (cache, altrimenti
+//!   rilettura nel pool); senza, [`NoDocumentUnits`], e l'anteprima mostra il contesto già
+//!   presente nel risultato ([`Loaded::ContextOnly`]).
 //!
 //! [`load`] fa I/O: l'app la chiama in un thread suo, mai in quello dell'interfaccia, con
 //! un flag d'annullamento controllato tra un blocco e l'altro.
@@ -60,8 +61,8 @@ pub fn preview_kind(doc: &DocPath, location: &Location) -> PreviewKind {
     }
 }
 
-/// Punto d'aggancio per la fase 4B: la fonte delle unità di testo dei documenti (cache del
-/// processo estrattore).
+/// La fonte delle unità di testo dei documenti (cache e processo estrattore:
+/// [`PoolDocumentUnits`](crate::extraction::PoolDocumentUnits)).
 pub trait DocumentUnits: Send + Sync {
     /// Le unità di `doc` vicine a `location`: al più `radius` prima e `radius` dopo, più
     /// quella in `location`, nell'ordine del documento.
@@ -78,7 +79,7 @@ pub trait DocumentUnits: Send + Sync {
     ) -> Result<Option<Vec<TextUnit>>, ExtractError>;
 }
 
-/// Nessuna fonte per i documenti (fino alla fase 4B): sempre `Ok(None)`.
+/// Nessuna fonte per i documenti (processo estrattore non collegato): sempre `Ok(None)`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NoDocumentUnits;
 

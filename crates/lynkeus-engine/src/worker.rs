@@ -8,6 +8,11 @@
 //! alla volta ciascuno. `filter_entry` pota le cartelle da saltare e le radici annidate;
 //! il visitatore filtra i file (contandoli) e li cerca.
 //!
+//! I documenti (formato riconosciuto da [`Format::for_path`]) non si leggono nei thread
+//! della scansione: vanno in una coda limitata letta da tanti thread quanti sono i processi
+//! del pool, che li mandano al [`DocumentSource`] (cache o processo estrattore) e cercano
+//! negli eventi ([`DocSearch`]). Senza una fonte dei documenti si contano tra i saltati.
+//!
 //! Arresto: l'annullamento si controlla prima di ogni voce della scansione e a ogni passo
 //! dentro un file; il primo thread che raggiunge il limite dei risultati o trova il canale
 //! chiuso ferma tutti gli altri. [`SearchEvent::Finished`] parte per ultimo, quando tutti i
@@ -17,16 +22,20 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::thread;
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{SendTimeoutError, Sender};
+use crossbeam_channel::{Receiver, SendTimeoutError, Sender};
 use ignore::{DirEntry, WalkBuilder, WalkState};
-use lynkeus_extract::{ExtractError, open_text};
+use lynkeus_extract::{ExtractError, ExtractOptions, Format, open_text};
 
 use crate::doc::DocPath;
+use crate::docsearch::DocSearch;
+use crate::documents::DocumentSource;
 use crate::event::{Hit, Outcome, SearchEvent, Summary, Warning, WarningKind};
 use crate::filter::{self, EntryFacts};
 use crate::handle::Notify;
+use crate::pool::ExtractEnd;
 use crate::progress::{Counter, Progress};
 use crate::request::{Filters, SearchRequest};
 use crate::roots::{self, PlannedRoot, RootIndex};
@@ -35,12 +44,22 @@ use crate::textfile::{FileError, FileSearch, HitSink, search_text};
 /// Attesa massima su una coda piena prima di ricontrollare l'annullamento.
 const SEND_RECHECK: Duration = Duration::from_millis(50);
 
+/// Documenti in attesa di un processo estrattore, al massimo.
+const DOCUMENT_QUEUE: usize = 64;
+
 /// Ciò che il worker condivide con la [`SearchHandle`](crate::SearchHandle).
 pub(crate) struct WorkerContext {
     pub(crate) sender: Sender<SearchEvent>,
     pub(crate) notify: Notify,
     pub(crate) progress: Arc<Progress>,
     pub(crate) cancel: Arc<AtomicBool>,
+    pub(crate) documents: Option<Arc<DocumentSource>>,
+}
+
+/// Un documento da leggere: radice di provenienza e file.
+struct QueuedDocument {
+    root: usize,
+    path: PathBuf,
 }
 
 /// Perché la ricerca si ferma prima della fine.
@@ -118,7 +137,7 @@ pub(crate) fn run(request: &SearchRequest, context: &WorkerContext) {
 }
 
 /// Stato di una ricerca, condiviso (per riferimento) dai thread della scansione.
-struct Search<'a> {
+pub(crate) struct Search<'a> {
     request: &'a SearchRequest,
     context: &'a WorkerContext,
     halt: Halt,
@@ -126,6 +145,16 @@ struct Search<'a> {
 }
 
 impl Search<'_> {
+    /// La richiesta.
+    pub(crate) fn request(&self) -> &SearchRequest {
+        self.request
+    }
+
+    /// Il contesto condiviso con la maniglia.
+    pub(crate) fn context(&self) -> &WorkerContext {
+        self.context
+    }
+
     fn all_roots(&self) {
         if let Err(stop) = self.check() {
             self.halt.record(stop);
@@ -140,6 +169,33 @@ impl Search<'_> {
             }
         }
         let index = Arc::new(plan.index);
+        let Some(documents) = &self.context.documents else {
+            self.walk(&index, None);
+            return;
+        };
+        let (queue, pending) = crossbeam_channel::bounded(DOCUMENT_QUEUE);
+        thread::scope(|scope| {
+            let mut readers = 0;
+            for _ in 0..documents.pool().size() {
+                let pending = pending.clone();
+                let spawned = thread::Builder::new()
+                    .name("lynkeus-documenti".to_owned())
+                    .spawn_scoped(scope, move || self.read_documents(documents, &pending));
+                if spawned.is_ok() {
+                    readers += 1;
+                }
+            }
+            drop(pending);
+            // Senza lettori i documenti diventerebbero avvisi uno per uno: meglio la scansione
+            // dei soli file di testo, con i documenti contati tra i saltati.
+            self.walk(&index, (readers > 0).then_some(&queue));
+            // La coda chiusa dice ai lettori che non arriva altro.
+            drop(queue);
+        });
+    }
+
+    /// Scansione parallela delle radici; i documenti vanno in `documents`, se c'è.
+    fn walk(&self, index: &Arc<RootIndex>, documents: Option<&Sender<QueuedDocument>>) {
         let Some((first, others)) = index.roots().split_first() else {
             return;
         };
@@ -149,7 +205,7 @@ impl Search<'_> {
         }
         let dir_filter = DirFilter {
             filters: self.request.filters.clone(),
-            roots: Arc::clone(&index),
+            roots: Arc::clone(index),
         };
         builder
             .standard_filters(false)
@@ -157,15 +213,20 @@ impl Search<'_> {
             .filter_entry(move |entry| dir_filter.accepts(entry))
             .build_parallel()
             .run(|| {
-                let index = Arc::clone(&index);
-                Box::new(move |result| self.visit(&index, result))
+                let index = Arc::clone(index);
+                Box::new(move |result| self.visit(&index, documents, result))
             });
     }
 
     /// Una voce della scansione, su uno dei suoi thread.
-    fn visit(&self, index: &RootIndex, result: Result<DirEntry, ignore::Error>) -> WalkState {
+    fn visit(
+        &self,
+        index: &RootIndex,
+        documents: Option<&Sender<QueuedDocument>>,
+        result: Result<DirEntry, ignore::Error>,
+    ) -> WalkState {
         let outcome = self.check().and_then(|()| match result {
-            Ok(entry) => self.entry(index, &entry),
+            Ok(entry) => self.entry(index, documents, &entry),
             Err(error) => self.walk_error(&error),
         });
         match outcome {
@@ -177,7 +238,12 @@ impl Search<'_> {
         }
     }
 
-    fn entry(&self, index: &RootIndex, entry: &DirEntry) -> Result<(), Stop> {
+    fn entry(
+        &self,
+        index: &RootIndex,
+        documents: Option<&Sender<QueuedDocument>>,
+        entry: &DirEntry,
+    ) -> Result<(), Stop> {
         // Cartelle: le visita la scansione. Link e junction: non si seguono.
         if !entry.file_type().is_some_and(|t| t.is_file()) {
             return Ok(());
@@ -194,7 +260,93 @@ impl Search<'_> {
             progress.add(Counter::FilesSkipped, 1);
             return Ok(());
         }
-        self.text_file(root, entry.path())
+        if Format::for_path(entry.path()).is_none() {
+            return self.text_file(root, entry.path());
+        }
+        match documents {
+            Some(queue) => self.queue_document(
+                queue,
+                QueuedDocument {
+                    root: root.index,
+                    path: entry.path().to_owned(),
+                },
+            ),
+            None => {
+                progress.add(Counter::FilesSkipped, 1);
+                Ok(())
+            }
+        }
+    }
+
+    /// Mette un documento in coda; con la coda piena aspetta, ricontrollando l'arresto.
+    fn queue_document(
+        &self,
+        queue: &Sender<QueuedDocument>,
+        document: QueuedDocument,
+    ) -> Result<(), Stop> {
+        let mut document = document;
+        loop {
+            match queue.send_timeout(document, SEND_RECHECK) {
+                Ok(()) => return Ok(()),
+                Err(SendTimeoutError::Timeout(back)) => {
+                    self.check()?;
+                    document = back;
+                }
+                // Nessun lettore: si sono fermati tutti, quindi la ricerca si sta fermando.
+                Err(SendTimeoutError::Disconnected(_)) => return self.check(),
+            }
+        }
+    }
+
+    /// Il ciclo di un lettore di documenti: uno alla volta, finché la coda si chiude o la
+    /// ricerca si ferma.
+    fn read_documents(&self, documents: &DocumentSource, pending: &Receiver<QueuedDocument>) {
+        for document in pending {
+            if let Err(stop) = self
+                .check()
+                .and_then(|()| self.document(documents, &document))
+            {
+                self.halt.record(stop);
+                return;
+            }
+        }
+    }
+
+    /// Legge e cerca un documento.
+    fn document(&self, documents: &DocumentSource, document: &QueuedDocument) -> Result<(), Stop> {
+        let progress = &self.context.progress;
+        progress.set_current(Some(Arc::new(DocPath::file(&document.path))));
+        let options = ExtractOptions {
+            limits: self.request.limits.archive,
+        };
+        let stop = || self.check().is_err();
+        let mut events = DocSearch::new(
+            self,
+            SharedSink { search: self },
+            &document.path,
+            document.root,
+        );
+        let (end, _) = documents.extract(
+            &document.path,
+            &options,
+            self.request.limits.extract_timeout,
+            &stop,
+            &mut events,
+        );
+        match end {
+            ExtractEnd::Completed => {
+                progress.add(Counter::FilesSearched, 1);
+                Ok(())
+            }
+            ExtractEnd::Stopped => match events.stopped() {
+                Some(stop) => Err(stop),
+                None => self.check(),
+            },
+            ExtractEnd::Failed(failure) => {
+                let doc = events.interrupted_doc();
+                self.warn_shared(doc, failure.warning_kind())
+            }
+        }
     }
 
     /// Legge e cerca un file di testo.
@@ -253,7 +405,7 @@ impl Search<'_> {
         self.warn_shared(Arc::new(doc), kind)
     }
 
-    fn warn_shared(&self, doc: Arc<DocPath>, kind: WarningKind) -> Result<(), Stop> {
+    pub(crate) fn warn_shared(&self, doc: Arc<DocPath>, kind: WarningKind) -> Result<(), Stop> {
         self.context.progress.add(Counter::Warnings, 1);
         self.send(SearchEvent::Warning(Warning { doc, kind }))
     }

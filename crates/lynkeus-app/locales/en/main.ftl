@@ -263,6 +263,7 @@ warning-limit-ratio = Suspicious compression, possibly a malicious archive
 warning-limit-memory = Out of memory while reading
 warning-content-mismatch = Content does not match the extension
 warning-no-text = No text, maybe a scan
+warning-extractor-unavailable = Document reader not started
 
 ## Preview
 
@@ -284,7 +285,7 @@ preview-no-thread = Preview not available: the system has no free resources. Clo
 ## Messages above the table
 
 notice-executable = For safety, programs and scripts are not opened from here: use "Show in folder" and open it from there if you trust it.
-notice-archive-entry = Files inside archives cannot be opened from here yet: use "Show in folder" to open the archive.
+notice-archive-entry = Documents inside archives (PDF, Office) cannot be opened from here yet: use "Show in folder" to open the archive.
 # $file (text): file path.
 notice-open-failed = Error: { $file } did not open. Check that it still exists and that there is a program to open it.
 # $file (text): file path.
@@ -319,3 +320,18 @@ export-scope-selected = Selected rows only ({ $count })
 export-dialog-confirm = Export…
 # Suggested file name, without extension.
 export-file-name = results
+
+## Document cache (Tools menu)
+
+menu-cache = Document cache
+menu-cache-enabled = Use the cache
+menu-cache-enabled-hint = Keeps the text read from PDFs, documents and archives, so the next search in the same files is faster. The text stays in the app folder until you clear the cache.
+menu-cache-size = Maximum size
+# $mib (number): size in megabytes.
+menu-cache-size-choice = { $mib } MB
+menu-cache-clear = Clear the cache
+reason-no-cache = The system does not provide a folder for the cache.
+reason-cache-clearing = The cache is being cleared.
+# $mib (number): megabytes freed.
+notice-cache-cleared = Cache cleared: { $mib } MB freed.
+notice-cache-clear-failed = Error: the cache was not fully cleared. Close the other Lynkeus Searcher windows and try again.
