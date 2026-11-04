@@ -11,13 +11,190 @@
 //! - Flush della cartella dopo una rinomina durevole.
 //! - Apertura di un file con il programma predefinito e "Mostra nella cartella".
 //! - Ordine dei bottoni nei dialoghi.
+//! - Ricerca delle DLL ristretta alla cartella di sistema (Windows).
+//! - Avvio del processo estrattore: su Windows nel Job Object con `CreateProcessW`
+//!   (`windows_ffi`), altrove con il lanciatore portabile dell'engine.
+//! - Cartelle della cache e dei file temporanei aperti dagli archivi.
 
+#[cfg(windows)]
+mod windows_ffi;
+
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use egui::{FontData, FontDefinitions, FontFamily};
+use lynkeus_core::ByteSize;
+use lynkeus_engine::WorkerLauncher;
 
 use crate::theme::SEMIBOLD;
+
+/// Limita la ricerca delle DLL alla cartella di sistema (Windows,
+/// `SetDefaultDllDirectories`): va chiamata come prima istruzione di `main`, prima che una
+/// libreria ne carichi. Altrove non fa nulla.
+#[cfg(windows)]
+pub fn restrict_dll_search() -> io::Result<()> {
+    windows_ffi::restrict_dll_search()
+}
+
+/// Vedi la versione per Windows.
+#[cfg(not(windows))]
+pub fn restrict_dll_search() -> io::Result<()> {
+    Ok(())
+}
+
+/// Il lanciatore del processo estrattore `exe` (percorso assoluto) con limite di memoria
+/// `memory_limit`.
+///
+/// Windows: `CreateProcessW` dentro un Job Object per processo, con il limite imposto dal
+/// sistema, `KILL_ON_JOB_CLOSE` e solo stdin e stdout ereditati. Linux: lanciatore portabile;
+/// il limite lo impone il figlio a sé stesso (`RLIMIT_AS`).
+#[cfg(windows)]
+pub fn worker_launcher(
+    exe: PathBuf,
+    memory_limit: ByteSize,
+) -> io::Result<Arc<dyn WorkerLauncher>> {
+    Ok(Arc::new(job_launcher::JobLauncher::new(exe, memory_limit)?))
+}
+
+/// Vedi la versione per Windows.
+#[cfg(not(windows))]
+pub fn worker_launcher(
+    exe: PathBuf,
+    memory_limit: ByteSize,
+) -> io::Result<Arc<dyn WorkerLauncher>> {
+    Ok(Arc::new(lynkeus_engine::CommandLauncher::new(
+        exe,
+        Some(memory_limit),
+    )?))
+}
+
+/// La cartella della cache dei documenti: `%LOCALAPPDATA%\Lynkeus Searcher\cache` su
+/// Windows, `~/.cache/lynkeus-searcher` su Linux. `None` se il sistema non ne indica una.
+pub fn cache_dir() -> Option<PathBuf> {
+    directories::ProjectDirs::from("", "", APP_DIR_NAME).map(|dirs| dirs.cache_dir().to_owned())
+}
+
+/// La cartella privata dei file estratti dagli archivi per aprirli:
+/// `%LOCALAPPDATA%\Lynkeus Searcher\data\temp` su Windows,
+/// `~/.local/share/lynkeus-searcher/temp` su Linux.
+pub fn opened_entries_dir() -> Option<PathBuf> {
+    directories::ProjectDirs::from("", "", APP_DIR_NAME)
+        .map(|dirs| dirs.data_local_dir().join("temp"))
+}
+
+#[cfg(windows)]
+mod job_launcher {
+    use std::ffi::OsString;
+    use std::io;
+    use std::path::PathBuf;
+    use std::time::Duration;
+
+    use lynkeus_core::ByteSize;
+    use lynkeus_engine::{LaunchedWorker, WorkerExit, WorkerLauncher, WorkerProcess, worker_args};
+
+    use super::windows_ffi::{ChildProcess, Job, spawn_in_job};
+
+    /// Avvia ogni processo estrattore nel suo Job Object.
+    pub struct JobLauncher {
+        exe: PathBuf,
+        args: Vec<OsString>,
+        memory_limit: usize,
+    }
+
+    impl JobLauncher {
+        pub fn new(exe: PathBuf, memory_limit: ByteSize) -> io::Result<JobLauncher> {
+            if !exe.is_absolute() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "eseguibile del processo estrattore senza percorso assoluto",
+                ));
+            }
+            Ok(JobLauncher {
+                exe,
+                // Il figlio riceve il limite anche qui, dove lo impone il job: lo stesso
+                // comando su ogni sistema.
+                args: worker_args(Some(memory_limit)),
+                memory_limit: usize::try_from(memory_limit.bytes()).unwrap_or(usize::MAX),
+            })
+        }
+    }
+
+    impl WorkerLauncher for JobLauncher {
+        fn launch(&self) -> io::Result<LaunchedWorker> {
+            let job = Job::new(self.memory_limit)?;
+            let child = spawn_in_job(&self.exe, &self.args, &job)?;
+            // Verifica che fallisce chiusa: un estrattore fuori dal job non si usa.
+            if !child.process.is_in(&job).unwrap_or(false) {
+                let _killed = child.process.terminate();
+                return Err(io::Error::other("processo estrattore fuori dal Job Object"));
+            }
+            Ok(LaunchedWorker {
+                stdin: Box::new(child.stdin),
+                stdout: Box::new(child.stdout),
+                process: Box::new(JobWorker {
+                    job,
+                    process: child.process,
+                    memory_limit: self.memory_limit,
+                    exited: None,
+                }),
+            })
+        }
+    }
+
+    /// Un processo estrattore con il suo job: chiuderlo termina il processo.
+    struct JobWorker {
+        job: Job,
+        process: ChildProcess,
+        memory_limit: usize,
+        exited: Option<WorkerExit>,
+    }
+
+    impl JobWorker {
+        /// Vero se il processo è uscito per il limite di memoria: il messaggio del job, o un
+        /// picco arrivato quasi al limite (entro 1/16) se il messaggio non c'è.
+        fn hit_memory_limit(&mut self) -> bool {
+            if self.job.memory_limit_hit() {
+                return true;
+            }
+            let margin = self.memory_limit / 16;
+            self.job
+                .peak_process_memory()
+                .is_ok_and(|peak| peak >= self.memory_limit.saturating_sub(margin))
+        }
+    }
+
+    impl WorkerProcess for JobWorker {
+        fn wait_timeout(&mut self, timeout: Duration) -> io::Result<Option<WorkerExit>> {
+            if let Some(exit) = self.exited {
+                return Ok(Some(exit));
+            }
+            let Some(code) = self.process.wait(timeout)? else {
+                return Ok(None);
+            };
+            let exit = if code == 0 {
+                WorkerExit::Success
+            } else if self.hit_memory_limit() {
+                WorkerExit::MemoryExceeded
+            } else {
+                WorkerExit::Failed {
+                    code: Some(i64::from(code)),
+                }
+            };
+            self.exited = Some(exit);
+            Ok(Some(exit))
+        }
+
+        fn kill(&mut self) -> io::Result<()> {
+            if self.exited.is_some() {
+                return Ok(());
+            }
+            // Il job termina anche eventuali figli del processo; il processo da solo è il
+            // ripiego.
+            self.job.terminate().or_else(|_| self.process.terminate())
+        }
+    }
+}
 
 /// Nome della cartella dell'app sotto la cartella di configurazione dell'utente.
 #[cfg(windows)]

@@ -55,6 +55,9 @@ pub(crate) enum Action {
     MoveCursor(isize, bool),
     SetTheme(ThemeChoice),
     SetLanguage(Option<Language>),
+    SetCacheEnabled(bool),
+    SetCacheSize(u64),
+    ClearCache,
     ResetFilters,
     DismissNotice,
     Reveal(Arc<DocPath>),
@@ -137,6 +140,8 @@ impl eframe::App for Application {
         if let Err(error) = self.save_settings() {
             eprintln!("lynkeus-searcher: impostazioni non salvate: {error}");
         }
+        self.cancel_search();
+        self.shutdown_extraction();
     }
 
     fn persist_egui_memory(&self) -> bool {
@@ -349,6 +354,9 @@ fn apply(app: &mut Application, ctx: &egui::Context, frame: &eframe::Frame, acti
             theme::set_choice(ctx, choice);
         }
         Action::SetLanguage(language) => app.set_language(language),
+        Action::SetCacheEnabled(enabled) => app.set_cache_enabled(enabled),
+        Action::SetCacheSize(mib) => app.set_cache_size_mib(mib),
+        Action::ClearCache => app.clear_cache(&repaint(ctx)),
         Action::ResetFilters => app.form.filters.reset(),
         Action::DismissNotice => app.dismiss_notice(),
         Action::Reveal(doc) => {

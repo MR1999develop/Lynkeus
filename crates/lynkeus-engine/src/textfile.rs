@@ -34,7 +34,7 @@ pub(crate) const STEP_MAX_LINES: usize = 10_000;
 pub(crate) const STEP_MAX_BYTES: usize = 1024 * 1024;
 
 /// Risultati già sicuri trattenuti al massimo prima di consegnarne un lotto.
-const BATCH_HITS: usize = 1024;
+pub(crate) const BATCH_HITS: usize = 1024;
 
 /// Dove vanno i risultati di un file.
 pub(crate) trait HitSink {

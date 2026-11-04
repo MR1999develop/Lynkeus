@@ -14,6 +14,7 @@
 //! [filters]                  # estensioni, cartelle da saltare, nascosti, solo online, dimensione
 //! [layout]                   # pannelli, anteprima, colonne, ordinamento
 //! [export]                   # formato, righe, ultima cartella di salvataggio
+//! [cache]                    # cache del testo dei documenti: accesa, dimensione massima
 //! ```
 //!
 //! Lettura tollerante: ogni campo si legge da solo, un valore mancante o non valido prende
@@ -50,6 +51,31 @@ const MAX_LIST_ITEMS: usize = 256;
 const MAX_STRING_BYTES: usize = 4096;
 /// Limiti della dimensione massima dei file, in MiB.
 pub const MAX_FILE_SIZE_MIB_RANGE: std::ops::RangeInclusive<u64> = 1..=1_048_576;
+/// Limiti della dimensione della cache dei documenti, in MiB.
+pub const CACHE_SIZE_MIB_RANGE: std::ops::RangeInclusive<u64> = 16..=65_536;
+
+/// La cache del testo estratto dai documenti.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheSettings {
+    /// Accesa (predefinito): la seconda ricerca negli stessi documenti non li rilegge.
+    pub enabled: bool,
+    /// Dimensione massima, in MiB, in [`CACHE_SIZE_MIB_RANGE`].
+    pub max_size_mib: u64,
+}
+
+impl CacheSettings {
+    /// Dimensioni proposte nel menu, in MiB.
+    pub const SIZE_CHOICES_MIB: [u64; 5] = [100, 250, 500, 1000, 2000];
+}
+
+impl Default for CacheSettings {
+    fn default() -> Self {
+        CacheSettings {
+            enabled: true,
+            max_size_mib: 500,
+        }
+    }
+}
 
 /// Quali estensioni si filtrano.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -188,6 +214,8 @@ pub struct Settings {
     pub layout: LayoutSettings,
     /// Ultime scelte di esportazione.
     pub export: ExportSettings,
+    /// Cache dei documenti.
+    pub cache: CacheSettings,
 }
 
 /// Inserisce `item` in testa a un elenco di recenti, senza doppioni, al massimo
@@ -504,6 +532,12 @@ fn to_table(s: &Settings) -> Table {
         export.insert("last_dir".into(), dir.into());
     }
     root.insert("export".into(), Value::Table(export));
+
+    let mut cache = Table::new();
+    cache.insert("enabled".into(), s.cache.enabled.into());
+    let max_size = i64::try_from(s.cache.max_size_mib).unwrap_or(i64::MAX);
+    cache.insert("max_size_mib".into(), max_size.into());
+    root.insert("cache".into(), Value::Table(cache));
     root
 }
 
@@ -531,6 +565,7 @@ fn from_table(root: &Table) -> Settings {
     let filters = table(root, "filters").unwrap_or(&empty);
     let layout = table(root, "layout").unwrap_or(&empty);
     let export = table(root, "export").unwrap_or(&empty);
+    let cache = table(root, "cache").unwrap_or(&empty);
 
     let language = match string(root, "language") {
         Some("it") => Some(Language::Italian),
@@ -673,8 +708,19 @@ fn from_table(root: &Table) -> Settings {
             .map(PathBuf::from),
     };
 
+    let cache_defaults = CacheSettings::default();
+    let cache = CacheSettings {
+        enabled: boolean(cache, "enabled").unwrap_or(cache_defaults.enabled),
+        max_size_mib: integer(cache, "max_size_mib")
+            .and_then(|v| u64::try_from(v).ok())
+            .map_or(cache_defaults.max_size_mib, |v| {
+                v.clamp(*CACHE_SIZE_MIB_RANGE.start(), *CACHE_SIZE_MIB_RANGE.end())
+            }),
+    };
+
     Settings {
         export,
+        cache,
         language,
         theme,
         options,
@@ -797,6 +843,10 @@ mod tests {
                 scope: ExportScope::Selected,
                 last_dir: Some(PathBuf::from("esportazioni")),
             },
+            cache: CacheSettings {
+                enabled: false,
+                max_size_mib: 250,
+            },
         }
     }
 
@@ -873,7 +923,10 @@ mod tests {
              [layout]\n\
              column_word = 1e300\n\
              search_panel_width = \"largo\"\n\
-             sort_column = \"colore\"\n"
+             sort_column = \"colore\"\n\
+             [cache]\n\
+             enabled = \"si\"\n\
+             max_size_mib = 99999999\n"
             .parse()
             .expect("TOML valido");
         let settings = from_table(&document);
@@ -899,6 +952,8 @@ mod tests {
             defaults.layout.search_panel_width
         );
         assert_eq!(settings.layout.sort, None);
+        assert_eq!(settings.cache.enabled, defaults.cache.enabled);
+        assert_eq!(settings.cache.max_size_mib, *CACHE_SIZE_MIB_RANGE.end());
     }
 
     #[test]

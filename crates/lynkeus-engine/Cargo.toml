@@ -8,11 +8,24 @@ license.workspace = true
 authors.workspace = true
 publish.workspace = true
 
+# Processo estrattore dei test d'integrazione (`CARGO_BIN_EXE_lynkeus-test-worker`): il ciclo
+# del processo estrattore più alcuni comportamenti scorretti scelti dal nome del file. Non fa
+# parte del pacchetto distribuito (`cargo xtask dist` compila solo `lynkeus-searcher`).
+[[bin]]
+name = "lynkeus-test-worker"
+path = "tests/support/test_worker.rs"
+test = false
+doc = false
+bench = false
+
 [dependencies]
+blake3.workspace = true
+crc32fast.workspace = true
 crossbeam-channel.workspace = true
 ignore.workspace = true
 lynkeus-core.workspace = true
 lynkeus-extract.workspace = true
+lz4_flex.workspace = true
 memchr.workspace = true
 serde.workspace = true
 thiserror.workspace = true

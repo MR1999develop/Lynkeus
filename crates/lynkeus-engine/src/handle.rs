@@ -10,6 +10,7 @@ use std::thread;
 
 use crossbeam_channel::{Receiver, TryRecvError};
 
+use crate::documents::DocumentSource;
 use crate::event::SearchEvent;
 use crate::progress::Progress;
 use crate::request::SearchRequest;
@@ -97,9 +98,14 @@ impl std::fmt::Debug for SearchHandle {
 
 /// Avvia la ricerca su un thread con nome e restituisce subito.
 ///
-/// `notify` è chiamata dopo ogni evento messo in coda. Errore solo se il sistema non
-/// riesce a creare il thread.
-pub fn start_search(request: SearchRequest, notify: Notify) -> io::Result<SearchHandle> {
+/// I documenti (PDF, Office, archivi) si leggono con `documents` (cache e processi
+/// estrattori); con `None` si contano tra i file saltati. `notify` è chiamata dopo ogni
+/// evento messo in coda. Errore solo se il sistema non riesce a creare il thread.
+pub fn start_search(
+    request: SearchRequest,
+    documents: Option<Arc<DocumentSource>>,
+    notify: Notify,
+) -> io::Result<SearchHandle> {
     let (sender, events) = crossbeam_channel::bounded(EVENT_QUEUE_CAPACITY);
     let progress = Arc::new(Progress::default());
     let cancel = Arc::new(AtomicBool::new(false));
@@ -108,6 +114,7 @@ pub fn start_search(request: SearchRequest, notify: Notify) -> io::Result<Search
         notify,
         progress: Arc::clone(&progress),
         cancel: Arc::clone(&cancel),
+        documents,
     };
     thread::Builder::new()
         .name("lynkeus-search".to_owned())

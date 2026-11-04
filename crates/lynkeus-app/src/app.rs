@@ -16,13 +16,14 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use lynkeus_core::CompiledQuery;
+use lynkeus_core::{ByteSize, CompiledQuery};
 use lynkeus_engine::{
-    DocPath, Hit, Limits, Notify, Outcome, ProgressSnapshot, Received, SearchEvent, SearchHandle,
-    SearchRequest, Summary, Warning, start_search,
+    DocPath, DocumentSource, Hit, Limits, Notify, Outcome, ProgressSnapshot, Received, SearchEvent,
+    SearchHandle, SearchRequest, Summary, Warning, start_search,
 };
 
 use crate::export::{self, ExportScope, ExportSettings};
+use crate::extraction::{self, ExtractionSetup, OpenedEntries, PoolDocumentUnits};
 use crate::form::{
     FormErrors, PathInputError, PathInputStatus, RootKind, SearchForm, TermRowError,
 };
@@ -33,7 +34,10 @@ use crate::launch::{
 use crate::preview::{self, DocumentUnits, Loaded, NoDocumentUnits, PreviewError, PreviewRequest};
 use crate::results::{ResultsView, SortColumn, SortSpec, Step};
 use crate::root_check::{RootCheck, RootChecks};
-use crate::settings::{LayoutSettings, Settings, SettingsError, SettingsFile, push_recent};
+use crate::settings::{
+    CACHE_SIZE_MIB_RANGE, CacheSettings, LayoutSettings, Settings, SettingsError, SettingsFile,
+    push_recent,
+};
 use crate::theme::ThemeChoice;
 
 /// Righe di risultato inserite al massimo in una chiamata di
@@ -204,6 +208,13 @@ pub enum Notice {
     },
     /// Il sistema non ha avviato il thread di lavoro.
     NoThread,
+    /// Cache dei documenti svuotata.
+    CacheCleared {
+        /// MiB liberati (arrotondati per eccesso).
+        freed_mib: u64,
+    },
+    /// La cache non si è svuotata del tutto (file in uso o permessi).
+    CacheClearFailed,
 }
 
 /// Un'esportazione in corso.
@@ -286,6 +297,12 @@ pub struct Application {
     launch_job: Option<LaunchJob>,
     export_job: Option<ExportJob>,
     notice: Option<Notice>,
+    /// Pool dei processi estrattori e cache; `None` finché non si collega (test senza
+    /// documenti).
+    document_source: Option<Arc<DocumentSource>>,
+    /// Cartella privata dei file estratti dagli archivi per aprirli.
+    opened_entries_dir: Option<PathBuf>,
+    cache_job: Option<Receiver<io::Result<ByteSize>>>,
 }
 
 impl Application {
@@ -328,6 +345,9 @@ impl Application {
             launch_job: None,
             export_job: None,
             notice: None,
+            document_source: None,
+            opened_entries_dir: None,
+            cache_job: None,
             settings,
             settings_file,
             saved,
@@ -520,7 +540,7 @@ impl Application {
         };
         // Una sola ricerca alla volta sul disco.
         self.cancel_search();
-        let handle = match start_search(request, notify) {
+        let handle = match start_search(request, self.document_source.clone(), notify) {
             Ok(handle) => handle,
             Err(error) => return Err(self.start_error.insert(StartError::Spawn(error))),
         };
@@ -650,8 +670,8 @@ impl Application {
 
     // --- Anteprima -------------------------------------------------------------------
 
-    /// Collega la fonte delle unità di testo dei documenti per l'anteprima (fase 4B: la
-    /// cache del processo estrattore). Senza, i documenti mostrano il solo contesto.
+    /// Collega la fonte delle unità di testo dei documenti per l'anteprima (di solito la fa
+    /// [`Application::connect_extraction`]). Senza, i documenti mostrano il solo contesto.
     pub fn set_document_units(&mut self, source: Arc<dyn DocumentUnits>) {
         self.documents = source;
     }
@@ -768,8 +788,9 @@ impl Application {
 
     // --- Apri e mostra nella cartella -------------------------------------------------
 
-    /// Collega l'estrazione delle voci d'archivio in una cartella temporanea privata (fasi
-    /// 4B e 7). Senza, "Apri" su una voce d'archivio mostra un messaggio.
+    /// Collega l'estrazione delle voci d'archivio in una cartella temporanea privata (di
+    /// solito la fa [`Application::connect_extraction`]). Senza, "Apri" su una voce
+    /// d'archivio mostra un messaggio.
     pub fn set_archive_extractor(&mut self, extractor: Arc<dyn ArchiveEntryExtractor>) {
         self.archive_extractor = extractor;
     }
@@ -948,6 +969,136 @@ impl Application {
         self.export_job = None;
     }
 
+    // --- Processi estrattori e cache ---------------------------------------------------
+
+    /// Collega i documenti: pool dei processi estrattori (`setup.worker_exe` con
+    /// `--extract-worker`), cache e apertura delle voci d'archivio. Le ricerche successive
+    /// leggono anche PDF, Office e archivi; l'anteprima e "Apri" li usano. La cartella dei
+    /// file aperti si svuota subito (avanzi di un'uscita anomala), in un thread.
+    ///
+    /// Errore se il lanciatore non si può creare (eseguibile senza percorso assoluto): l'app
+    /// resta senza documenti.
+    pub fn connect_extraction(&mut self, setup: &ExtractionSetup) -> io::Result<()> {
+        let source = extraction::document_source(setup, self.settings.cache)?;
+        self.documents = Arc::new(PoolDocumentUnits::new(Arc::clone(&source), self.limits));
+        if let Some(dir) = &setup.opened_entries_dir {
+            self.archive_extractor = Arc::new(OpenedEntries::new(
+                Arc::clone(&source),
+                dir.clone(),
+                self.limits,
+            ));
+            let dir = dir.clone();
+            // Se il thread non parte, si ripulirà all'uscita.
+            let _cleaning = thread::Builder::new()
+                .name("pulizia".to_owned())
+                .spawn(move || extraction::clean_opened_entries(&dir));
+        }
+        self.opened_entries_dir = setup.opened_entries_dir.clone();
+        self.document_source = Some(source);
+        Ok(())
+    }
+
+    /// La fonte dei documenti collegata, se c'è.
+    pub fn document_source(&self) -> Option<&Arc<DocumentSource>> {
+        self.document_source.as_ref()
+    }
+
+    /// Chiude i processi estrattori liberi e svuota la cartella dei file aperti (all'uscita).
+    pub fn shutdown_extraction(&mut self) {
+        if let Some(source) = &self.document_source {
+            source.pool().shutdown();
+        }
+        if let Some(dir) = &self.opened_entries_dir {
+            extraction::clean_opened_entries(dir);
+        }
+    }
+
+    /// Le impostazioni della cache.
+    pub fn cache_settings(&self) -> CacheSettings {
+        self.settings.cache
+    }
+
+    /// Vero se c'è una cartella per la cache (si può accendere e svuotare).
+    pub fn has_cache(&self) -> bool {
+        self.document_source
+            .as_ref()
+            .is_some_and(|source| source.cache().is_some())
+    }
+
+    /// Accende o spegne la cache (le voci restano: si svuota a parte).
+    pub fn set_cache_enabled(&mut self, enabled: bool) {
+        self.settings.cache.enabled = enabled;
+        if let Some(source) = &self.document_source {
+            source.set_cache_enabled(enabled);
+        }
+    }
+
+    /// Cambia la dimensione massima della cache (riportata all'intervallo ammesso); le voci
+    /// in più si tolgono subito, in un thread.
+    pub fn set_cache_size_mib(&mut self, mib: u64) {
+        let mib = mib.clamp(*CACHE_SIZE_MIB_RANGE.start(), *CACHE_SIZE_MIB_RANGE.end());
+        self.settings.cache.max_size_mib = mib;
+        if let Some(source) = self.document_source.clone() {
+            let _resizing = thread::Builder::new()
+                .name("cache".to_owned())
+                .spawn(move || {
+                    if let Some(cache) = source.cache() {
+                        cache.set_max_size(ByteSize::from_mib(mib));
+                    }
+                });
+        }
+    }
+
+    /// Vero se la cache si sta svuotando.
+    pub fn is_clearing_cache(&self) -> bool {
+        self.cache_job.is_some()
+    }
+
+    /// Svuota la cache in un thread; l'esito arriva come messaggio.
+    pub fn clear_cache(&mut self, notify: &Notify) {
+        let Some(source) = self.document_source.clone() else {
+            return;
+        };
+        if source.cache().is_none() || self.cache_job.is_some() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        let notify = Arc::clone(notify);
+        let spawned = thread::Builder::new()
+            .name("cache".to_owned())
+            .spawn(move || {
+                let cleared = source.cache().map_or(
+                    Ok(ByteSize::from_bytes(0)),
+                    lynkeus_engine::TextCache::clear,
+                );
+                if tx.send(cleared).is_ok() {
+                    notify();
+                }
+            });
+        match spawned {
+            Ok(_) => self.cache_job = Some(rx),
+            Err(_) => self.notice = Some(Notice::NoThread),
+        }
+    }
+
+    fn poll_cache(&mut self) {
+        let Some(job) = &self.cache_job else {
+            return;
+        };
+        let cleared = match job.try_recv() {
+            Ok(cleared) => cleared,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => Err(io::Error::other("thread interrotto")),
+        };
+        self.notice = Some(match cleared {
+            Ok(freed) => Notice::CacheCleared {
+                freed_mib: freed.bytes().div_ceil(1024 * 1024),
+            },
+            Err(_) => Notice::CacheClearFailed,
+        });
+        self.cache_job = None;
+    }
+
     // --- Messaggi -----------------------------------------------------------------------
 
     /// Il messaggio da mostrare, se c'è.
@@ -969,6 +1120,7 @@ impl Application {
     pub fn pump_actions(&mut self) {
         self.poll_launch();
         self.poll_export();
+        self.poll_cache();
     }
 
     /// Salva le impostazioni se sono cambiate dall'ultimo salvataggio. Senza file (test)
@@ -1158,6 +1310,41 @@ mod tests {
             kinds(&app),
             [RootKind::Folder, RootKind::Missing, RootKind::File]
         );
+    }
+
+    #[test]
+    fn cache_settings_without_a_document_source() {
+        let mut app = Application::build(Settings::default()).expect("app");
+        assert!(!app.has_cache(), "nessuna cartella senza collegamento");
+        app.set_cache_enabled(false);
+        app.set_cache_size_mib(1);
+        assert_eq!(
+            app.cache_settings(),
+            CacheSettings {
+                enabled: false,
+                max_size_mib: *CACHE_SIZE_MIB_RANGE.start(),
+            }
+        );
+        app.set_cache_size_mib(u64::MAX);
+        assert_eq!(
+            app.settings().cache.max_size_mib,
+            *CACHE_SIZE_MIB_RANGE.end()
+        );
+        // Svuotare senza cache non fa nulla.
+        app.clear_cache(&(Arc::new(|| {}) as Notify));
+        assert!(!app.is_clearing_cache());
+    }
+
+    #[test]
+    fn a_relative_worker_is_refused() {
+        let mut app = Application::build(Settings::default()).expect("app");
+        let setup = ExtractionSetup {
+            worker_exe: PathBuf::from("lynkeus-searcher"),
+            cache_dir: None,
+            opened_entries_dir: None,
+        };
+        assert!(app.connect_extraction(&setup).is_err());
+        assert!(app.document_source().is_none());
     }
 
     #[test]

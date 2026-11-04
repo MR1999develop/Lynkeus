@@ -10,6 +10,7 @@ use super::{Action, Command};
 use crate::app::{Application, Tab};
 use crate::i18n::Language;
 use crate::results::Step;
+use crate::settings::CacheSettings;
 use crate::theme::ThemeChoice;
 
 pub(super) fn bar(app: &Application, ui: &mut Ui, actions: &mut Vec<Action>) {
@@ -115,10 +116,54 @@ pub(super) fn bar(app: &Application, ui: &mut Ui, actions: &mut Vec<Action>) {
                     }
                 }
             });
+            cache_menu(app, ui, actions);
         });
         ui.menu_button(i18n.tr("menu-help"), |ui| {
             item(app, ui, Command::About, actions);
         });
+    });
+}
+
+/// Il sottomenu della cache dei documenti: accesa o spenta, dimensione, svuota. Disabilitato,
+/// con il motivo, se l'app non ha una cartella per la cache.
+fn cache_menu(app: &Application, ui: &mut Ui, actions: &mut Vec<Action>) {
+    let i18n = app.i18n();
+    let settings = app.cache_settings();
+    ui.add_enabled_ui(app.has_cache(), |ui| {
+        ui.menu_button(i18n.tr("menu-cache"), |ui| {
+            if ui
+                .add(Button::selectable(
+                    settings.enabled,
+                    i18n.tr("menu-cache-enabled"),
+                ))
+                .on_hover_text(i18n.tr("menu-cache-enabled-hint"))
+                .clicked()
+            {
+                actions.push(Action::SetCacheEnabled(!settings.enabled));
+                ui.close();
+            }
+            ui.menu_button(i18n.tr("menu-cache-size"), |ui| {
+                for mib in CacheSettings::SIZE_CHOICES_MIB {
+                    let label = i18n.tr_args("menu-cache-size-choice", &[("mib", mib.into())]);
+                    if ui.radio(settings.max_size_mib == mib, label).clicked() {
+                        actions.push(Action::SetCacheSize(mib));
+                        ui.close();
+                    }
+                }
+            });
+            ui.separator();
+            let clear = ui.add_enabled(
+                !app.is_clearing_cache(),
+                Button::new(i18n.tr("menu-cache-clear")),
+            );
+            let clear = clear.on_disabled_hover_text(i18n.tr("reason-cache-clearing"));
+            if clear.clicked() {
+                actions.push(Action::ClearCache);
+                ui.close();
+            }
+        })
+        .response
+        .on_disabled_hover_text(i18n.tr("reason-no-cache"));
     });
 }
 

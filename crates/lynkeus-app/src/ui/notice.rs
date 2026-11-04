@@ -44,6 +44,11 @@ pub(super) fn bar(app: &Application, ui: &mut Ui, actions: &mut Vec<Action>) {
             true,
         ),
         Notice::NoThread => (i18n.tr("notice-no-thread"), true),
+        Notice::CacheCleared { freed_mib } => (
+            i18n.tr_args("notice-cache-cleared", &[("mib", (*freed_mib).into())]),
+            false,
+        ),
+        Notice::CacheClearFailed => (i18n.tr("notice-cache-clear-failed"), true),
     };
     ui.add_space(SPACE[0]);
     // Da destra: Chiudi, l'eventuale azione, poi il testo nello spazio che resta.

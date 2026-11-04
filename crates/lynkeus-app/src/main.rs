@@ -3,15 +3,24 @@
 
 //! Punto d'ingresso di `lynkeus-searcher`: legge le impostazioni, costruisce l'app e apre
 //! la finestra.
+//!
+//! Con l'opzione nascosta `--extract-worker` (seguita da `--memory-limit-bytes N`) lo stesso
+//! eseguibile è il processo estrattore: legge le richieste da stdin e risponde su stdout
+//! (`lynkeus_extract::worker::run`), senza finestre e senza leggere le impostazioni.
 
 // In release nessuna console accanto alla finestra su Windows.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 #![deny(unsafe_code)]
 
+use std::ffi::OsString;
+use std::io;
 use std::process::ExitCode;
 
+use lynkeus_app::extraction::ExtractionSetup;
 use lynkeus_app::settings::{FILE_NAME, LoadOutcome};
 use lynkeus_app::{Application, Settings, SettingsFile, platform, setup_context};
+use lynkeus_engine::EXTRACT_WORKER_FLAG;
+use lynkeus_extract::worker::{self, WorkerConfig};
 
 /// Dimensione iniziale e minima della finestra, in punti: il layout regge 1024×600 meno
 /// barre e dock.
@@ -21,6 +30,16 @@ const MIN_SIZE: [f32; 2] = [800.0, 480.0];
 const APP_NAME: &str = "Lynkeus Searcher";
 
 fn main() -> ExitCode {
+    // Prima di ogni altra cosa: nessuna DLL dalla cartella dell'eseguibile o dal PATH. Se
+    // non riesce (sistema troppo vecchio) si continua con la ricerca predefinita.
+    let dll_search = platform::restrict_dll_search();
+    let mut args = std::env::args_os().skip(1);
+    if args.next().as_deref() == Some(EXTRACT_WORKER_FLAG.as_ref()) {
+        return extract_worker(args);
+    }
+    if let Err(error) = dll_search {
+        eprintln!("lynkeus-searcher: ricerca delle DLL non ristretta: {error}");
+    }
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -30,9 +49,21 @@ fn main() -> ExitCode {
     }
 }
 
+/// Il processo estrattore: nessuna finestra, nessun file scritto; esce quando il processo
+/// principale chiude lo stdin.
+fn extract_worker(args: impl Iterator<Item = OsString>) -> ExitCode {
+    let Ok(config) = WorkerConfig::from_args(args) else {
+        return ExitCode::from(2);
+    };
+    match worker::run(io::stdin().lock(), io::stdout().lock(), &config) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(_) => ExitCode::FAILURE,
+    }
+}
+
 fn run() -> anyhow::Result<()> {
     let config_dir = platform::config_dir();
-    let app = match &config_dir {
+    let mut app = match &config_dir {
         Some(dir) => {
             let (file, settings, outcome) = SettingsFile::load(dir.join(FILE_NAME));
             report(&outcome);
@@ -40,6 +71,12 @@ fn run() -> anyhow::Result<()> {
         }
         None => Application::build(Settings::default())?,
     };
+    // Senza processo estrattore l'app cerca comunque nei file di testo.
+    let connected =
+        ExtractionSetup::for_this_program().and_then(|setup| app.connect_extraction(&setup));
+    if let Err(error) = connected {
+        eprintln!("lynkeus-searcher: documenti non disponibili: {error}");
+    }
     let title = app.i18n().tr("app-title");
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

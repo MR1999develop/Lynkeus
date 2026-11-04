@@ -43,9 +43,14 @@ lynkeus-engine = { path = "crates/lynkeus-engine" }
 
 # Esterne.
 anyhow = "1.0.104"
+# Chiave della cache del testo estratto. `pure`: niente C né assembly da compilare (anche il
+# controllo per Linux da Windows funziona senza compilatore C del target).
+blake3 = { version = "1.8.7", default-features = false, features = ["std", "pure"] }
 # Fogli di calcolo xlsx e ods (processo estrattore).
 calamine = { version = "0.38.0", default-features = false }
 chardetng = "1.0.0"
+# CRC dell'intestazione delle voci della cache (già nell'albero tramite zip).
+crc32fast = "1.5.4"
 crossbeam-channel = "0.5.17"
 # Cartella di configurazione della piattaforma (settings.toml).
 directories = "6.0.0"
@@ -71,6 +76,8 @@ egui_extras = { version = "0.37.0", default-features = false }
 egui_kittest = { version = "0.37.0", default-features = false, features = ["eframe"] }
 fluent-templates = "0.15.1"
 ignore = "0.4.34"
+# Compressione delle voci della cache: solo il formato a blocchi, senza `unsafe`.
+lz4_flex = { version = "0.14.0", default-features = false, features = ["std", "safe-encode", "safe-decode", "checked-decode"] }
 memchr = "2.8.3"
 # Apre un file con il programma predefinito (ShellExecuteW) e lo mostra nella cartella
 # (SHOpenFolderAndSelectItems). Solo su Windows: su Linux opener cercherebbe `xdg-open`
@@ -96,6 +103,19 @@ thiserror = "2.0.21"
 toml = { version = "1.1.8", default-features = false, features = ["parse", "display", "serde"] }
 # NFC/NFD dei termini e tabella delle varianti accentate (lynkeus-core).
 unicode-normalization = "0.1.26"
+# API Win32 senza involucri, solo in `lynkeus-app/src/platform/windows_ffi.rs`: processo
+# estrattore con CreateProcessW nel Job Object (limite di memoria per processo, che `win32job`
+# non offre: experiments/jobobject/ESITI.md) e SetDefaultDllDirectories.
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_IO",
+    "Win32_System_JobObjects",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Pipes",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+] }
 # Portale XDG OpenURI (OpenFile, OpenDirectory) su Linux: apre e mostra i file senza
 # avviare programmi cercati per nome. Già nell'albero tramite AccessKit.
 zbus = { version = "5.19.0", default-features = false, features = ["async-io", "blocking-api"] }

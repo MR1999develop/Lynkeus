@@ -1,15 +1,35 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Copyright (C) 2026 MR
 
-//! Differenze tra sistemi operativi nella scansione; nessun altro modulo usa `cfg`.
+//! Differenze tra sistemi operativi nella scansione, nell'avvio del processo estrattore e
+//! nei file della cache; nessun altro modulo usa `cfg`.
 //!
 //! Gli attributi si leggono dai metadati della scansione: su Windows vengono dall'elenco
 //! della cartella (`FindNextFileW`), senza aprire il file, quindi senza scaricare i file
 //! solo online.
 
 use std::ffi::OsStr;
-use std::fs::Metadata;
+use std::fs::{File, Metadata};
+use std::io;
 use std::path::{Component, Path, PathBuf};
+
+/// Variabili d'ambiente che il processo estrattore riceve (tutte le altre si tolgono): su
+/// Windows `SystemRoot`, senza la quale alcune DLL di sistema non si inizializzano; su Linux
+/// nessuna.
+pub const KEPT_ENV_VARS: &[&str] = imp::KEPT_ENV_VARS;
+
+/// Crea `dir` (e le cartelle sopra) come cartella privata: su Linux con permessi 0700. Su
+/// Windows eredita i permessi della cartella dell'utente; il descrittore esplicito arriva con
+/// la fase 7.
+pub fn create_private_dir(dir: &Path) -> io::Result<()> {
+    imp::create_private_dir(dir)
+}
+
+/// Crea un file nuovo in scrittura; errore se esiste già (anche come collegamento). Su Linux
+/// con permessi 0600.
+pub fn create_new_private_file(path: &Path) -> io::Result<File> {
+    imp::create_new_private_file(path)
+}
 
 /// Vero se il file o la cartella è nascosto o di sistema: su Windows attributi `HIDDEN` o
 /// `SYSTEM`; altrove nome che inizia con un punto.
@@ -72,10 +92,22 @@ fn lexical_normalize(path: &Path) -> PathBuf {
 #[cfg(windows)]
 mod imp {
     use std::ffi::OsStr;
-    use std::fs::Metadata;
+    use std::fs::{File, Metadata, OpenOptions};
+    use std::io;
     use std::os::windows::fs::MetadataExt;
+    use std::path::Path;
 
     pub const CASE_INSENSITIVE: bool = true;
+
+    pub const KEPT_ENV_VARS: &[&str] = &["SystemRoot"];
+
+    pub fn create_private_dir(dir: &Path) -> io::Result<()> {
+        std::fs::create_dir_all(dir)
+    }
+
+    pub fn create_new_private_file(path: &Path) -> io::Result<File> {
+        OpenOptions::new().write(true).create_new(true).open(path)
+    }
 
     const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
     const FILE_ATTRIBUTE_SYSTEM: u32 = 0x4;
@@ -101,9 +133,26 @@ mod imp {
 #[cfg(not(windows))]
 mod imp {
     use std::ffi::OsStr;
-    use std::fs::Metadata;
+    use std::fs::{DirBuilder, File, Metadata, OpenOptions};
+    use std::io;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    use std::path::Path;
 
     pub const CASE_INSENSITIVE: bool = false;
+
+    pub const KEPT_ENV_VARS: &[&str] = &[];
+
+    pub fn create_private_dir(dir: &Path) -> io::Result<()> {
+        DirBuilder::new().recursive(true).mode(0o700).create(dir)
+    }
+
+    pub fn create_new_private_file(path: &Path) -> io::Result<File> {
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+    }
 
     pub fn is_hidden(name: &OsStr, _metadata: Option<&Metadata>) -> bool {
         name.as_encoded_bytes().first() == Some(&b'.')

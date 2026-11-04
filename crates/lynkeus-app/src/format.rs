@@ -82,6 +82,7 @@ pub fn warning_id(kind: WarningKind) -> &'static str {
         },
         WarningKind::ContentMismatch => "warning-content-mismatch",
         WarningKind::NoText => "warning-no-text",
+        WarningKind::ExtractorUnavailable => "warning-extractor-unavailable",
     }
 }
 
@@ -298,6 +299,7 @@ mod tests {
             WarningKind::LimitExceeded(LimitKind::Memory),
             WarningKind::ContentMismatch,
             WarningKind::NoText,
+            WarningKind::ExtractorUnavailable,
         ];
         for language in Language::ALL {
             let i18n = I18n::new(language);

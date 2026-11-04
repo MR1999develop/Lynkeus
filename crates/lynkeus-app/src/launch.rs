@@ -12,8 +12,8 @@
 //!   [`is_executable_name`]) non si apre: i risultati vengono da cartelle qualsiasi, e un
 //!   doppio clic su "pulisci.bat" non deve eseguirlo; resta "Mostra nella cartella";
 //! - una voce dentro un archivio va prima estratta in una cartella temporanea privata
-//!   ([`ArchiveEntryExtractor`], fasi 4B e 7); finché non c'è l'estrattore, l'utente riceve
-//!   un messaggio chiaro;
+//!   ([`ArchiveEntryExtractor`]: [`OpenedEntries`](crate::extraction::OpenedEntries) per le
+//!   voci di testo); quando non si può, l'utente riceve un messaggio chiaro;
 //! - "Mostra nella cartella" di una voce d'archivio mostra l'archivio.
 
 use std::io;
@@ -110,8 +110,8 @@ pub fn is_executable_name(path: &Path) -> bool {
     EXECUTABLE_EXTENSIONS.contains(&extension.as_str())
 }
 
-/// Punto d'aggancio per le fasi 4B e 7: estrae una voce d'archivio in un file nuovo della
-/// cartella temporanea privata dell'app (cancellata all'uscita), per aprirla.
+/// Estrae una voce d'archivio in un file nuovo della cartella temporanea privata dell'app
+/// (cancellata all'uscita), per aprirla.
 pub trait ArchiveEntryExtractor: Send + Sync {
     /// Estrae la voce `doc` e restituisce il percorso del file estratto.
     ///
@@ -121,7 +121,7 @@ pub trait ArchiveEntryExtractor: Send + Sync {
     fn extract_to_private_temp(&self, doc: &DocPath) -> Result<Option<PathBuf>, ExtractError>;
 }
 
-/// Nessuna estrazione (fino alle fasi 4B e 7): sempre `Ok(None)`.
+/// Nessuna estrazione (processo estrattore non collegato): sempre `Ok(None)`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NoArchiveExtraction;
 
