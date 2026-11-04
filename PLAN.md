@@ -107,14 +107,14 @@ Regole trasversali:
   - Protocollo: messaggi `postcard` con lunghezza in testa e dimensione massima, su stdin e stdout.
   - Limiti:
     - timeout di 60 s per file: oltre, il processo viene terminato e ne parte un altro;
-    - su Windows il processo sta in un Job Object (`win32job`) con limite di memoria e `KILL_ON_JOB_CLOSE`;
+    - su Windows il processo nasce dentro un Job Object con limite di memoria per processo e `KILL_ON_JOB_CLOSE`, creato con `CreateProcessW` (`PROC_THREAD_ATTRIBUTE_JOB_LIST` e `HANDLE_LIST`: eredita solo stdin e stdout) in `platform/windows_ffi.rs` dell'app e passato all'engine tramite un trait (`win32job` non ha il limite per processo, vedi experiments/jobobject/ESITI.md);
     - su Linux il processo imposta da sÃƒÂ© `RLIMIT_AS` (`rlimit`) ed esce quando il suo stdin si chiude.
   - Annulla manda prima una richiesta di stop, chiudendo lo stdin, e forza la chiusura dopo 500 ms. Un processo bloccato oltre il timeout viene terminato subito.
   - Il processo si avvia dal percorso assoluto di `current_exe()`, con l'ambiente svuotato (`env_clear`) tranne le poche variabili di sistema necessarie, e senza handle ereditati oltre a stdin e stdout.
 - **Estrattori:**
   - `zip` + `quick-xml` (DTD rifiutati) per docx, pptx, odt, odp ed EPUB;
   - `calamine` per xlsx, xls e ods;
-  - `pdf_oxide` per i PDF, con un prototipo iniziale in `experiments/` su PDF italiani e `pdf-extract` come ripiego;
+  - `pdf_oxide` per i PDF con `extract_text_lines` pagina per pagina, senza ripiego (ADR 0002);
   - `cfb` piÃƒÂ¹ un parser proprio per .doc (piece table) e .ppt (atomi di testo per diapositiva);
   - un tokenizer RTF proprio (gruppi, `\'hh` con code page, `\uN`);
   - `mail-parser` per gli EML, con gli allegati estratti a loro volta;
@@ -270,7 +270,7 @@ Ogni fase finisce con `cargo xtask check` verde e un commit. Il lavoro si orches
 
 ### Fase 4 Ã¢â‚¬â€ Processo isolato e documenti moderni
 - [x] Threat model del processo estrattore e degli archivi; ADR isolamento
-- [ ] Prototipi in `experiments/` (`pdf_oxide`, Job Object) e ADR libreria PDF
+- [x] Prototipi in `experiments/` (`pdf_oxide`, Job Object) e ADR libreria PDF
 - [ ] Processo estrattore, protocollo, pool, Job Object / `RLIMIT_AS`, timeout, stop
 - [ ] Estrattori docx, xlsx, pptx, ODF, PDF
 - [ ] Archivi zip annidati con limiti
