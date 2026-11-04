@@ -1,0 +1,53 @@
+# Fuzzing dei parser propri con cargo-fuzz (libFuzzer, toolchain nightly):
+#   cargo +nightly fuzz run <target>
+# Fuori dal workspace principale (ha il suo [workspace]): `cargo xtask check` non lo compila.
+
+[package]
+name = "lynkeus-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "GPL-3.0-only"
+authors = ["MR"]
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4.13"
+lynkeus-extract = { path = "../crates/lynkeus-extract", features = ["fuzzing"] }
+
+# Un workspace a sé: niente eredità dal workspace del progetto.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "doc_piece_table"
+path = "fuzz_targets/doc_piece_table.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ppt_records"
+path = "fuzz_targets/ppt_records.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rtf"
+path = "fuzz_targets/rtf.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "protocol_frame"
+path = "fuzz_targets/protocol_frame.rs"
+test = false
+doc = false
+bench = false

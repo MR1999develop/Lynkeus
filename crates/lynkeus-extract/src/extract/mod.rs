@@ -23,11 +23,20 @@
 
 pub(crate) mod archive;
 pub(crate) mod budget;
+pub(crate) mod cfbfile;
+pub(crate) mod eml;
+pub(crate) mod epub;
+pub(crate) mod html;
 pub(crate) mod ooxml;
 pub(crate) mod opendoc;
 pub(crate) mod pdf;
 pub(crate) mod plain;
+pub(crate) mod ppt;
+pub(crate) mod rtf;
+pub(crate) mod sevenz;
 pub(crate) mod sheet;
+pub(crate) mod tarball;
+pub(crate) mod word97;
 pub(crate) mod xml;
 
 use std::fs::File;
@@ -69,7 +78,11 @@ pub fn extract_path<S: EventSink + ?Sized>(
     sink: &mut S,
 ) -> Result<(), Stopped> {
     let mut sink = sink;
-    let mut ctx = Ctx::new(&mut sink, options.limits);
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut ctx = Ctx::new(&mut sink, options.limits, name);
     let declared = Format::for_path(path).unwrap_or(Format::Text);
     match platform::open_for_reading(path) {
         Ok(file) => read_document(&mut ctx, declared, Input::File(file)),
@@ -86,7 +99,7 @@ pub fn extract_bytes<S: EventSink + ?Sized>(
     sink: &mut S,
 ) -> Result<(), Stopped> {
     let mut sink = sink;
-    let mut ctx = Ctx::new(&mut sink, options.limits);
+    let mut ctx = Ctx::new(&mut sink, options.limits, name.to_owned());
     let declared = Format::for_name(name).unwrap_or(Format::Text);
     read_document(&mut ctx, declared, Input::Bytes(bytes))
 }
@@ -227,18 +240,29 @@ enum DocState {
 pub(crate) struct Ctx<'s> {
     sink: &'s mut dyn EventSink,
     budget: Rc<Budget>,
+    /// Nome del file radice (ultimo componente), per i formati che ne ricavano il nome del
+    /// contenuto (`appunti.txt.gz` contiene `appunti.txt`).
+    root_name: String,
     inner: Vec<String>,
     doc: DocState,
 }
 
 impl<'s> Ctx<'s> {
-    fn new(sink: &'s mut dyn EventSink, limits: ArchiveLimits) -> Ctx<'s> {
+    fn new(sink: &'s mut dyn EventSink, limits: ArchiveLimits, root_name: String) -> Ctx<'s> {
         Ctx {
             sink,
             budget: Rc::new(Budget::new(limits)),
+            root_name,
             inner: Vec::new(),
             doc: DocState::Idle,
         }
+    }
+
+    /// Il nome del documento corrente: l'etichetta della voce, o il nome del file radice.
+    pub fn current_name(&self) -> &str {
+        self.inner
+            .last()
+            .map_or(self.root_name.as_str(), String::as_str)
     }
 
     /// I contatori del file radice.
@@ -458,7 +482,7 @@ mod tests {
                 kind: WarningKind::ContentMismatch
             }]
         );
-        // Un .docx che in realtà è RTF: caso innocuo solo quando ci sarà l'estrattore RTF.
+        // Un .docx che in realtà è RTF: il caso innocuo vale solo per i .doc.
         let events = run("lettera.docx", b"{\\rtf1\\ansi aragosta}");
         assert_eq!(
             events,
@@ -502,7 +526,7 @@ mod tests {
     fn long_units_are_split_with_line_numbers() {
         let mut events: Vec<ExtractEvent> = Vec::new();
         let mut sink: &mut dyn EventSink = &mut events;
-        let mut ctx = Ctx::new(&mut sink, ArchiveLimits::default());
+        let mut ctx = Ctx::new(&mut sink, ArchiveLimits::default(), String::new());
         ctx.begin(Format::Text);
         let line = "a".repeat(MAX_UNIT_TEXT_BYTES - 1);
         let text = format!("{line}\n{line}\nfine");
@@ -531,7 +555,7 @@ mod tests {
         }
         let mut events: Vec<ExtractEvent> = Vec::new();
         let mut sink: &mut dyn EventSink = &mut events;
-        let mut ctx = Ctx::new(&mut sink, ArchiveLimits::default());
+        let mut ctx = Ctx::new(&mut sink, ArchiveLimits::default(), String::new());
         ctx.begin(Format::Docx);
         let caught = catch_unwind(AssertUnwindSafe(|| {
             boom(&mut ctx, Input::Bytes(Vec::new()))

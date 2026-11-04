@@ -8,16 +8,26 @@ license.workspace = true
 authors.workspace = true
 publish.workspace = true
 
+[features]
+# Punti d'ingresso per i target di `fuzz/` (parser propri senza il contenitore CFB); fuori
+# dall'API normale del crate.
+fuzzing = []
+
 [dependencies]
 calamine.workspace = true
+cfb.workspace = true
 chardetng.workspace = true
 encoding_rs.workspace = true
+flate2.workspace = true
 lynkeus-core.workspace = true
+mail-parser.workspace = true
 memchr.workspace = true
 pdf_oxide.workspace = true
 postcard.workspace = true
 quick-xml.workspace = true
 serde.workspace = true
+sevenz-rust2.workspace = true
+tar.workspace = true
 thiserror.workspace = true
 zip.workspace = true
 

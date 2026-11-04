@@ -46,6 +46,14 @@ pub(crate) enum Ns {
     OdfPresentation,
     /// ODF `manifest:`.
     OdfManifest,
+    /// `META-INF/container.xml` di EPUB (lo stesso di ODF).
+    OdfContainer,
+    /// Pacchetto OPF di EPUB.
+    Opf,
+    /// XHTML.
+    Xhtml,
+    /// XML Encryption (`META-INF/encryption.xml` di EPUB).
+    XmlEnc,
     /// Nessun namespace o uno che non interessa.
     Other,
 }
@@ -106,7 +114,25 @@ const NAMESPACES: &[(&str, Ns)] = &[
         "urn:oasis:names:tc:opendocument:xmlns:manifest:1.0",
         Ns::OdfManifest,
     ),
+    (
+        "urn:oasis:names:tc:opendocument:xmlns:container",
+        Ns::OdfContainer,
+    ),
+    ("http://www.idpf.org/2007/opf", Ns::Opf),
+    ("http://www.w3.org/1999/xhtml", Ns::Xhtml),
+    ("http://www.w3.org/2001/04/xmlenc#", Ns::XmlEnc),
 ];
+
+/// Regole del lettore.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Dialect {
+    /// XML dei pacchetti: `<!DOCTYPE>` rifiutato, solo le entità predefinite.
+    Strict,
+    /// XHTML dei libri: `<!DOCTYPE>` senza sottoinsieme interno ignorato (dichiara solo il
+    /// DTD standard), con sottoinsieme interno rifiutato; entità HTML comuni risolte, le
+    /// altre lasciate come testo.
+    Xhtml,
+}
 
 fn namespace(result: &ResolveResult<'_>) -> Ns {
     match result {
@@ -161,6 +187,7 @@ pub(crate) enum XmlEvent {
 pub(crate) struct XmlReader<R: BufRead> {
     reader: NsReader<R>,
     buf: Vec<u8>,
+    dialect: Dialect,
 }
 
 impl<R: BufRead> XmlReader<R> {
@@ -169,6 +196,18 @@ impl<R: BufRead> XmlReader<R> {
         XmlReader {
             reader: NsReader::from_reader(source),
             buf: Vec::new(),
+            dialect: Dialect::Strict,
+        }
+    }
+
+    /// Un lettore per i capitoli XHTML dei libri: un `<!DOCTYPE>` senza sottoinsieme interno
+    /// (`<!DOCTYPE html>`, il DTD di XHTML 1.1) si ignora, uno con sottoinsieme interno
+    /// (`[ … ]`, dove si definiscono entità) è un errore; le entità HTML comuni (`&nbsp;`,
+    /// `&egrave;` …) si risolvono, le altre restano come testo.
+    pub fn xhtml(source: R) -> XmlReader<R> {
+        XmlReader {
+            dialect: Dialect::Xhtml,
+            ..XmlReader::new(source)
         }
     }
 
@@ -218,13 +257,30 @@ impl<R: BufRead> XmlReader<R> {
                             }
                         }
                     } else {
-                        match quick_xml::escape::resolve_predefined_entity(&reference) {
-                            Some(text) => XmlEvent::Text(text.to_owned()),
-                            None => return Err(corrupt("entità XML non definita")),
+                        let predefined = quick_xml::escape::resolve_predefined_entity(&reference);
+                        match (predefined, self.dialect) {
+                            (Some(text), _) => XmlEvent::Text(text.to_owned()),
+                            (None, Dialect::Strict) => {
+                                return Err(corrupt("entità XML non definita"));
+                            }
+                            (None, Dialect::Xhtml) => {
+                                let name: &str = reference.as_ref();
+                                XmlEvent::Text(match html_entity(name) {
+                                    Some(c) => c.to_string(),
+                                    None => format!("&{name};"),
+                                })
+                            }
                         }
                     }
                 }
-                Event::DocType(_) => return Err(corrupt("DTD nel documento XML")),
+                Event::DocType(doctype) => {
+                    let declaration: &str = doctype.as_ref();
+                    let internal_subset = declaration.contains('[');
+                    if self.dialect == Dialect::Strict || internal_subset {
+                        return Err(corrupt("DTD nel documento XML"));
+                    }
+                    continue;
+                }
                 Event::Decl(_) | Event::PI(_) | Event::Comment(_) => continue,
                 Event::Eof => XmlEvent::Eof,
             };
@@ -252,6 +308,119 @@ impl<R: BufRead> XmlReader<R> {
         while self.next()? != XmlEvent::Eof {}
         Ok(())
     }
+}
+
+/// Entità HTML comuni nei libri (XHTML 1.1 con il DTD standard): spazi e trattini,
+/// virgolette, simboli, lettere accentate delle lingue europee occidentali.
+const HTML_ENTITIES: &[(&str, char)] = &[
+    ("nbsp", '\u{A0}'),
+    ("shy", '\u{AD}'),
+    ("ensp", '\u{2002}'),
+    ("emsp", '\u{2003}'),
+    ("thinsp", '\u{2009}'),
+    ("ndash", '–'),
+    ("mdash", '—'),
+    ("hellip", '…'),
+    ("lsquo", '‘'),
+    ("rsquo", '’'),
+    ("sbquo", '‚'),
+    ("ldquo", '“'),
+    ("rdquo", '”'),
+    ("bdquo", '„'),
+    ("laquo", '«'),
+    ("raquo", '»'),
+    ("lsaquo", '‹'),
+    ("rsaquo", '›'),
+    ("bull", '•'),
+    ("middot", '·'),
+    ("copy", '©'),
+    ("reg", '®'),
+    ("trade", '™'),
+    ("deg", '°'),
+    ("euro", '€'),
+    ("pound", '£'),
+    ("cent", '¢'),
+    ("yen", '¥'),
+    ("sect", '§'),
+    ("para", '¶'),
+    ("times", '×'),
+    ("divide", '÷'),
+    ("plusmn", '±'),
+    ("frac12", '½'),
+    ("frac14", '¼'),
+    ("frac34", '¾'),
+    ("iexcl", '¡'),
+    ("iquest", '¿'),
+    ("ordf", 'ª'),
+    ("ordm", 'º'),
+    ("agrave", 'à'),
+    ("aacute", 'á'),
+    ("acirc", 'â'),
+    ("atilde", 'ã'),
+    ("auml", 'ä'),
+    ("aring", 'å'),
+    ("aelig", 'æ'),
+    ("ccedil", 'ç'),
+    ("egrave", 'è'),
+    ("eacute", 'é'),
+    ("ecirc", 'ê'),
+    ("euml", 'ë'),
+    ("igrave", 'ì'),
+    ("iacute", 'í'),
+    ("icirc", 'î'),
+    ("iuml", 'ï'),
+    ("ntilde", 'ñ'),
+    ("ograve", 'ò'),
+    ("oacute", 'ó'),
+    ("ocirc", 'ô'),
+    ("otilde", 'õ'),
+    ("ouml", 'ö'),
+    ("oslash", 'ø'),
+    ("oelig", 'œ'),
+    ("ugrave", 'ù'),
+    ("uacute", 'ú'),
+    ("ucirc", 'û'),
+    ("uuml", 'ü'),
+    ("yacute", 'ý'),
+    ("yuml", 'ÿ'),
+    ("szlig", 'ß'),
+    ("Agrave", 'À'),
+    ("Aacute", 'Á'),
+    ("Acirc", 'Â'),
+    ("Atilde", 'Ã'),
+    ("Auml", 'Ä'),
+    ("Aring", 'Å'),
+    ("AElig", 'Æ'),
+    ("Ccedil", 'Ç'),
+    ("Egrave", 'È'),
+    ("Eacute", 'É'),
+    ("Ecirc", 'Ê'),
+    ("Euml", 'Ë'),
+    ("Igrave", 'Ì'),
+    ("Iacute", 'Í'),
+    ("Icirc", 'Î'),
+    ("Iuml", 'Ï'),
+    ("Ntilde", 'Ñ'),
+    ("Ograve", 'Ò'),
+    ("Oacute", 'Ó'),
+    ("Ocirc", 'Ô'),
+    ("Otilde", 'Õ'),
+    ("Ouml", 'Ö'),
+    ("Oslash", 'Ø'),
+    ("OElig", 'Œ'),
+    ("Ugrave", 'Ù'),
+    ("Uacute", 'Ú'),
+    ("Ucirc", 'Û'),
+    ("Uuml", 'Ü'),
+    ("Yacute", 'Ý'),
+];
+
+/// Il carattere di un'entità HTML comune, o `None`.
+fn html_entity(name: &str) -> Option<char> {
+    HTML_ENTITIES
+        .iter()
+        .find(|(entity, _)| *entity == name)
+        .map(|(_, c)| *c)
 }
 
 fn corrupt(reason: &str) -> ExtractError {
@@ -299,6 +468,40 @@ mod tests {
     fn doctype_is_rejected() {
         let xml = r#"<?xml version="1.0"?><!DOCTYPE a [<!ENTITY x "aragosta">]><a>&x;</a>"#;
         assert!(matches!(events(xml), Err(ExtractError::Corrupt { .. })));
+    }
+
+    fn xhtml_text(xml: &str) -> Result<String, ExtractError> {
+        let mut reader = XmlReader::xhtml(xml.as_bytes());
+        let mut out = String::new();
+        loop {
+            match reader.next()? {
+                XmlEvent::Text(t) => out.push_str(&t),
+                XmlEvent::Eof => return Ok(out),
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn xhtml_doctype_and_entity_partitions() {
+        // DOCTYPE senza sottoinsieme interno: ignorato; entità HTML comuni risolte.
+        let xml = r#"<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" "x.dtd"><p>citt&agrave;&nbsp;&amp;</p>"#;
+        assert_eq!(xhtml_text(xml).ok(), Some("città\u{A0}&".to_owned()));
+        assert_eq!(
+            xhtml_text("<!DOCTYPE html><p>&Egrave; &ignota;</p>").ok(),
+            Some("È &ignota;".to_owned())
+        );
+        // Sottoinsieme interno: rifiutato.
+        let bomb = r#"<!DOCTYPE p [<!ENTITY a "x">]><p>&a;</p>"#;
+        assert!(matches!(
+            xhtml_text(bomb),
+            Err(ExtractError::Corrupt { .. })
+        ));
+        // Nei file dei pacchetti ogni DOCTYPE resta un errore.
+        assert!(matches!(
+            events("<!DOCTYPE html><p/>"),
+            Err(ExtractError::Corrupt { .. })
+        ));
     }
 
     #[test]

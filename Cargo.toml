@@ -45,6 +45,8 @@ lynkeus-engine = { path = "crates/lynkeus-engine" }
 anyhow = "1.0.104"
 # Fogli di calcolo xlsx e ods (processo estrattore).
 calamine = { version = "0.38.0", default-features = false }
+# File composti OLE (CFB) dei formati Office 97-2003: .doc e .ppt (parser propri sopra).
+cfb = "0.16.0"
 chardetng = "1.0.0"
 crossbeam-channel = "0.5.17"
 # Cartella di configurazione della piattaforma (settings.toml).
@@ -72,6 +74,10 @@ egui_kittest = { version = "0.37.0", default-features = false, features = ["efra
 fluent-templates = "0.15.1"
 ignore = "0.4.34"
 memchr = "2.8.3"
+# Archivi .gz e .tar.gz (processo estrattore); già nell'albero tramite zip.
+flate2 = "1.1.10"
+# E-mail (.eml) con allegati; `full_encoding` usa encoding_rs (già nell'albero) per i charset rari.
+mail-parser = { version = "1.0.1", default-features = false, features = ["full_encoding"] }
 # Apre un file con il programma predefinito (ShellExecuteW) e lo mostra nella cartella
 # (SHOpenFolderAndSelectItems). Solo su Windows: su Linux opener cercherebbe `xdg-open`
 # per nome, quindi lì si usa il portale XDG con `zbus`.
@@ -89,8 +95,13 @@ regex = "1.13.1"
 rlimit = "0.11.0"
 # Dialoghi nativi per scegliere cartelle e file; su Linux tramite il portale XDG (nessuna libreria GTK).
 rfd = { version = "0.17.2", default-features = false, features = ["xdg-portal", "wayland"] }
+# Archivi 7z: solo lettura (niente `compress`), niente AES (le voci cifrate danno un avviso),
+# niente bzip2 e PPMd; `deflate` usa flate2, già nell'albero.
+sevenz-rust2 = { version = "0.24.2", default-features = false, features = ["deflate"] }
 serde = { version = "1.0.229", features = ["derive"] }
 sys-locale = "0.3.2"
+# Archivi tar, solo lettura: senza `xattr` (nulla si scrive su disco).
+tar = { version = "0.4.46", default-features = false }
 tempfile = "3.27.0"
 thiserror = "2.0.21"
 toml = { version = "1.1.8", default-features = false, features = ["parse", "display", "serde"] }
