@@ -12,6 +12,15 @@ publish.workspace = true
 regex.workspace = true
 serde.workspace = true
 thiserror.workspace = true
+unicode-normalization.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+proptest.workspace = true
+
+[[bench]]
+name = "find_words"
+harness = false
 
 [lints]
 workspace = true

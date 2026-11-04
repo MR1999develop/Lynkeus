@@ -19,8 +19,10 @@
 pub mod accumulate;
 pub mod location;
 pub mod matcher;
+mod pattern;
 pub mod query;
 pub mod size;
+mod unicode;
 pub mod unit;
 
 pub use accumulate::FileAccumulator;

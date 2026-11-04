@@ -11,6 +11,8 @@
 use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
 
+use crate::pattern::{GUARD_GROUP, LEAD_GROUP, TRAIL_GROUP, TermPattern, term_pattern};
+
 /// Maiuscole e minuscole.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub enum CaseMode {
@@ -84,7 +86,8 @@ pub enum TermError {
     LineBreak,
 }
 
-/// Un termine di ricerca valido, così come l'ha scritto l'utente (spazi compresi).
+/// Un termine di ricerca valido, come l'ha scritto l'utente ma senza gli spazi iniziali e
+/// finali (quelli interni restano e contano).
 ///
 /// Ricorda la [`WildcardMode`] con cui è stato validato, perché con i jolly letterali
 /// "*" è un termine valido e con i jolly attivi no.
@@ -100,10 +103,12 @@ impl Term {
 
     /// Valida un termine scritto dall'utente.
     ///
-    /// Controlli, nell'ordine: lunghezza, a capo, vuoto (solo spazi compresi), solo jolly.
-    /// Il testo resta com'è: niente `trim`, niente normalizzazione (la compilazione porta
-    /// il termine in NFC).
+    /// Prima toglie gli spazi (White_Space Unicode) iniziali e finali: con `" car"` la
+    /// corrispondenza inizierebbe con uno spazio e la parola si estenderebbe oltre lo
+    /// spazio. Poi controlla, nell'ordine: lunghezza (senza quegli spazi), a capo, vuoto,
+    /// solo jolly. Nessuna normalizzazione: la compilazione porta il termine in NFC.
     pub fn parse(raw: &str, wildcards: WildcardMode) -> Result<Term, TermError> {
+        let raw = raw.trim();
         // Un carattere UTF-8 occupa al massimo 4 byte: oltre, è troppo lungo senza contare.
         let too_long = TermError::TooLong {
             max_chars: Self::MAX_CHARS,
@@ -114,7 +119,7 @@ impl Term {
         if raw.contains(['\n', '\r']) {
             return Err(TermError::LineBreak);
         }
-        if raw.chars().all(char::is_whitespace) {
+        if raw.is_empty() {
             return Err(TermError::Empty);
         }
         if wildcards == WildcardMode::Enabled
@@ -130,7 +135,7 @@ impl Term {
         })
     }
 
-    /// Il testo del termine, identico a quello passato a [`Term::parse`].
+    /// Il testo del termine: quello passato a [`Term::parse`] senza spazi iniziali e finali.
     pub fn as_str(&self) -> &str {
         &self.raw
     }
@@ -225,27 +230,53 @@ impl Query {
 
     /// Compila ogni termine in un automa pronto per [`find_words`](crate::find_words).
     ///
-    /// Regole (specifica, sezione 4): letterali escapati; `*` → zero o più non-spazi,
-    /// `?` → un non-spazio; ogni sequenza di spazi del termine → uno o più spazi
-    /// orizzontali (mai un a capo); maiuscole ignorate con `(?i)`.
+    /// Regole (specifica, sezione 4):
     ///
-    /// Implementazione provvisoria (fase 0): `AccentMode::Ignored` si comporta come
-    /// `Distinct`, il termine non è portato in NFC e la forma NFD non è riconosciuta.
+    /// - il termine è portato in NFC e i letterali sono escapati;
+    /// - jolly attivi: `*` → zero o più caratteri non spazio (greedy), `?` → un carattere
+    ///   non spazio con i suoi eventuali segni combinanti; jolly spenti: `*` e `?` letterali;
+    /// - ogni sequenza di spazi del termine → uno o più spazi orizzontali (mai un a capo);
+    /// - maiuscole ignorate con `(?i)`;
+    /// - accenti distinti: una lettera accentata del termine trova la forma precomposta e
+    ///   quella decomposta (NFD) del testo; il testo non si normalizza, quindi le posizioni
+    ///   restano quelle originali;
+    /// - accenti ignorati: ogni lettera trova le sue varianti accentate (tabella costruita
+    ///   una volta dalla decomposizione canonica Unicode) e gli eventuali segni combinanti
+    ///   `Mn` che la seguono. Le lettere senza decomposizione canonica (`ø`, `ł`, `æ`)
+    ///   restano distinte.
     ///
     /// Errore: [`QueryError::TooComplex`] se un automa supera i limiti di dimensione.
     pub fn compile(&self) -> Result<CompiledQuery, QueryError> {
-        let mut regexes = Vec::with_capacity(self.terms.len());
+        let mut matchers = Vec::with_capacity(self.terms.len());
         for (term_index, term) in self.terms.iter().enumerate() {
-            let pattern = term_pattern(term.as_str(), self.options.wildcards);
+            let TermPattern {
+                pattern,
+                lead_star,
+                trail_star,
+                guard,
+            } = term_pattern(term.as_str(), self.options);
             let regex = RegexBuilder::new(&pattern)
                 .case_insensitive(self.options.case == CaseMode::Insensitive)
                 .size_limit(REGEX_SIZE_LIMIT_BYTES)
                 .build()
                 .map_err(|_| QueryError::TooComplex { term_index })?;
-            regexes.push(regex);
+            let group = |present: bool, name: &str| {
+                present
+                    .then(|| regex.capture_names().position(|n| n == Some(name)))
+                    .flatten()
+            };
+            let lead_group = group(lead_star, LEAD_GROUP);
+            let trail_group = group(trail_star, TRAIL_GROUP);
+            let guard_group = group(guard, GUARD_GROUP);
+            matchers.push(TermMatcher {
+                regex,
+                lead_group,
+                trail_group,
+                guard_group,
+            });
         }
         Ok(CompiledQuery {
-            regexes,
+            matchers,
             options: self.options,
             combine: self.combine,
         })
@@ -256,32 +287,18 @@ impl Query {
 /// le classi degli accenti, ma finito.
 const REGEX_SIZE_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 
-/// Spazi orizzontali: uno spazio Unicode che non è un a capo.
-const HORIZONTAL_SPACES: &str = r"[^\S\r\n]+";
-
-/// Traduce un termine nella sintassi del crate `regex`.
-fn term_pattern(raw: &str, wildcards: WildcardMode) -> String {
-    let mut pattern = String::with_capacity(raw.len() * 2);
-    let mut in_spaces = false;
-    for c in raw.chars() {
-        if c.is_whitespace() {
-            if !in_spaces {
-                pattern.push_str(HORIZONTAL_SPACES);
-            }
-            in_spaces = true;
-            continue;
-        }
-        in_spaces = false;
-        match (wildcards, c) {
-            (WildcardMode::Enabled, '*') => pattern.push_str(r"\S*"),
-            (WildcardMode::Enabled, '?') => pattern.push_str(r"\S"),
-            _ => {
-                let mut buf = [0u8; 4];
-                pattern.push_str(&regex::escape(c.encode_utf8(&mut buf)));
-            }
-        }
-    }
-    pattern
+/// L'automa di un termine, con gli indici dei gruppi da trattare dopo la corrispondenza
+/// (vedi `pattern.rs`).
+#[derive(Debug, Clone)]
+pub(crate) struct TermMatcher {
+    /// L'automa.
+    pub(crate) regex: Regex,
+    /// Gruppo del `*` iniziale, se il termine inizia con `*`.
+    pub(crate) lead_group: Option<usize>,
+    /// Gruppo del `*` finale, se il termine finisce con `*`.
+    pub(crate) trail_group: Option<usize>,
+    /// Gruppo della guardia finale, con gli accenti distinti.
+    pub(crate) guard_group: Option<usize>,
 }
 
 /// Query pronta per la ricerca: un automa per termine, nell'ordine della [`Query`].
@@ -289,7 +306,7 @@ fn term_pattern(raw: &str, wildcards: WildcardMode) -> String {
 /// È `Send + Sync`: si condivide tra i thread di ricerca con un `Arc`.
 #[derive(Debug, Clone)]
 pub struct CompiledQuery {
-    regexes: Vec<Regex>,
+    matchers: Vec<TermMatcher>,
     options: MatchOptions,
     combine: Combine,
 }
@@ -297,7 +314,7 @@ pub struct CompiledQuery {
 impl CompiledQuery {
     /// Numero di termini (da 1 a [`Query::MAX_TERMS`]).
     pub fn term_count(&self) -> usize {
-        self.regexes.len()
+        self.matchers.len()
     }
 
     /// Le opzioni con cui è stata compilata.
@@ -311,8 +328,8 @@ impl CompiledQuery {
     }
 
     /// Gli automi, uno per termine (uso interno del crate).
-    pub(crate) fn regexes(&self) -> &[Regex] {
-        &self.regexes
+    pub(crate) fn matchers(&self) -> &[TermMatcher] {
+        &self.matchers
     }
 }
 
@@ -333,7 +350,14 @@ mod tests {
         assert_eq!(Term::parse("* ?", on), Err(TermError::OnlyWildcards));
         assert_eq!(Term::parse("a\nb", on), Err(TermError::LineBreak));
         assert!(Term::parse("*", WildcardMode::Literal).is_ok());
-        assert_eq!(term(" la car ").as_str(), " la car ");
+        assert_eq!(term(" la car ").as_str(), "la car");
+        assert_eq!(term("\u{3000}car\t").as_str(), "car");
+        assert_eq!(Term::parse(" * ", on), Err(TermError::OnlyWildcards));
+        assert_eq!(
+            term("arte\r\n").as_str(),
+            "arte",
+            "a capo finale tolto come spazio"
+        );
     }
 
     #[test]
@@ -370,6 +394,25 @@ mod tests {
             Query::new(vec![term("a"), literal], opts, Combine::Any),
             Err(QueryError::WildcardModeMismatch { term_index: 1 })
         );
+    }
+
+    /// I termini più lunghi e più costosi restano sotto il limite di dimensione degli automi.
+    #[test]
+    fn longest_terms_compile_in_every_mode() {
+        let accented = "àèìòù".repeat(Term::MAX_CHARS / 5);
+        let wild = "*a?".repeat(Term::MAX_CHARS / 3);
+        for accents in [AccentMode::Distinct, AccentMode::Ignored] {
+            for case in [CaseMode::Insensitive, CaseMode::Sensitive] {
+                let options = MatchOptions {
+                    case,
+                    accents,
+                    wildcards: WildcardMode::Enabled,
+                };
+                let terms = vec![term(&accented), term(&wild)];
+                let compiled = Query::new(terms, options, Combine::Any).and_then(|q| q.compile());
+                assert!(compiled.is_ok(), "{accents:?} {case:?}");
+            }
+        }
     }
 
     #[test]

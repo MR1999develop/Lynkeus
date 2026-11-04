@@ -41,12 +41,16 @@ const CHECK_STEPS: &[Step] = &[
     },
 ];
 
+/// Controllo di compilazione per Linux da Windows: solo librerie e binari. Test e
+/// benchmark compilerebbero anche le dev-dependency, e `criterion` → `alloca` richiede
+/// un compilatore C per Linux; la CI su Ubuntu compila tutto con `--all-targets`.
 const LINUX_STEP: Step = Step {
     name: "check-linux",
     args: &[
         "check",
         "--workspace",
-        "--all-targets",
+        "--lib",
+        "--bins",
         "--locked",
         "--target",
         "x86_64-unknown-linux-gnu",
