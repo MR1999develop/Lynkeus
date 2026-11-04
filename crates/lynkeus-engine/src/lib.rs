@@ -13,18 +13,20 @@
 //! 4. l'ultimo evento è sempre [`SearchEvent::Finished`], salvo panic del worker
 //!    ([`Received::WorkerLost`]).
 //!
-//! Implementazione provvisoria (fase 0): un solo thread, radici scandite in sequenza, solo
-//! file di testo letti per intero. La fase 2 porta parallelismo, lettura a blocchi e
-//! codifiche; la fase 4 i documenti nel processo estrattore e la cache.
+//! La scansione è parallela e legge i file di testo a blocchi (vedi `worker` e
+//! `textfile`); la fase 4 aggiunge i documenti nel processo estrattore e la cache.
 
 #![forbid(unsafe_code)]
 
 mod doc;
 mod event;
+mod filter;
 mod handle;
 mod platform;
 mod progress;
 mod request;
+mod roots;
+mod textfile;
 mod worker;
 
 pub use doc::DocPath;

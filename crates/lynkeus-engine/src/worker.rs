@@ -1,58 +1,90 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Copyright (C) 2026 MR
 
-//! Il lavoro di una ricerca, sul thread del worker.
+//! Il lavoro di una ricerca: scansione parallela delle radici e lettura dei file.
 //!
-//! Provvisorio (fase 0): radici in sequenza, un file alla volta, annulla controllato tra
-//! un file e l'altro. La fase 2 lo rende parallelo.
+//! Tutte le radici vanno in un'unica scansione parallela di `ignore` (filtri standard
+//! spenti, link e junction non seguiti); i thread della scansione leggono anche i file, uno
+//! alla volta ciascuno. `filter_entry` pota le cartelle da saltare e le radici annidate;
+//! il visitatore filtra i file (contandoli) e li cerca.
+//!
+//! Arresto: l'annullamento si controlla prima di ogni voce della scansione e a ogni passo
+//! dentro un file; il primo thread che raggiunge il limite dei risultati o trova il canale
+//! chiuso ferma tutti gli altri. [`SearchEvent::Finished`] parte per ultimo, quando tutti i
+//! thread sono finiti.
 
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::SyncSender;
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
-use ignore::{DirEntry, WalkBuilder};
-use lynkeus_core::{ByteSize, FileAccumulator, Location, find_words, snippet, word_text};
-use lynkeus_extract::{ExtractError, read_text};
+use crossbeam_channel::{SendTimeoutError, Sender};
+use ignore::{DirEntry, WalkBuilder, WalkState};
+use lynkeus_extract::{ExtractError, open_text};
 
 use crate::doc::DocPath;
 use crate::event::{Hit, Outcome, SearchEvent, Summary, Warning, WarningKind};
+use crate::filter::{self, EntryFacts};
 use crate::handle::Notify;
-use crate::platform;
 use crate::progress::{Counter, Progress};
-use crate::request::{Filters, HiddenPolicy, OnlineFilesPolicy, SearchRequest};
+use crate::request::{Filters, SearchRequest};
+use crate::roots::{self, PlannedRoot, RootIndex};
+use crate::textfile::{FileError, FileSearch, HitSink, search_text};
+
+/// Attesa massima su una coda piena prima di ricontrollare l'annullamento.
+const SEND_RECHECK: Duration = Duration::from_millis(50);
 
 /// Ciò che il worker condivide con la [`SearchHandle`](crate::SearchHandle).
 pub(crate) struct WorkerContext {
-    pub(crate) sender: SyncSender<SearchEvent>,
+    pub(crate) sender: Sender<SearchEvent>,
     pub(crate) notify: Notify,
     pub(crate) progress: Arc<Progress>,
     pub(crate) cancel: Arc<AtomicBool>,
 }
 
 /// Perché la ricerca si ferma prima della fine.
-enum Stop {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Stop {
     Cancelled,
     LimitReached,
     /// Il chiamante ha chiuso la maniglia: non c'è più nessuno a cui consegnare eventi.
     Disconnected,
 }
 
-impl WorkerContext {
-    /// Mette in coda un evento (aspettando se la coda è piena) e avvisa il chiamante.
-    fn send(&self, event: SearchEvent) -> Result<(), Stop> {
-        self.sender.send(event).map_err(|_| Stop::Disconnected)?;
-        (self.notify)();
-        Ok(())
+/// Il primo motivo d'arresto, condiviso tra i thread; il canale chiuso prevale su tutto.
+#[derive(Debug, Default)]
+struct Halt(AtomicU8);
+
+impl Halt {
+    const RUNNING: u8 = 0;
+    const CANCELLED: u8 = 1;
+    const LIMIT_REACHED: u8 = 2;
+    const DISCONNECTED: u8 = 3;
+
+    fn record(&self, stop: Stop) {
+        let code = match stop {
+            Stop::Cancelled => Self::CANCELLED,
+            Stop::LimitReached => Self::LIMIT_REACHED,
+            Stop::Disconnected => {
+                self.0.store(Self::DISCONNECTED, Ordering::Relaxed);
+                return;
+            }
+        };
+        // Vince il primo; se un altro thread ha già registrato un motivo, va bene così.
+        if self
+            .0
+            .compare_exchange(Self::RUNNING, code, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {}
     }
 
-    fn check_cancel(&self) -> Result<(), Stop> {
-        if self.cancel.load(Ordering::Relaxed) {
-            Err(Stop::Cancelled)
-        } else {
-            Ok(())
+    fn get(&self) -> Option<Stop> {
+        match self.0.load(Ordering::Relaxed) {
+            Self::CANCELLED => Some(Stop::Cancelled),
+            Self::LIMIT_REACHED => Some(Stop::LimitReached),
+            Self::DISCONNECTED => Some(Stop::Disconnected),
+            _ => None,
         }
     }
 }
@@ -60,16 +92,18 @@ impl WorkerContext {
 /// Esegue tutta la ricerca e manda [`SearchEvent::Finished`] per ultimo.
 pub(crate) fn run(request: &SearchRequest, context: &WorkerContext) {
     let started = Instant::now();
-    let mut search = Search {
+    let search = Search {
         request,
         context,
-        hits_sent: 0,
+        halt: Halt::default(),
+        budget: Budget::new(request.limits.max_results),
     };
-    let outcome = match search.all_roots() {
-        Ok(()) => Outcome::Completed,
-        Err(Stop::Cancelled) => Outcome::Cancelled,
-        Err(Stop::LimitReached) => Outcome::LimitReached,
-        Err(Stop::Disconnected) => return,
+    search.all_roots();
+    let outcome = match search.halt.get() {
+        None => Outcome::Completed,
+        Some(Stop::Cancelled) => Outcome::Cancelled,
+        Some(Stop::LimitReached) => Outcome::LimitReached,
+        Some(Stop::Disconnected) => return,
     };
     context.progress.set_current(None);
     let summary = Summary {
@@ -78,142 +112,141 @@ pub(crate) fn run(request: &SearchRequest, context: &WorkerContext) {
         counts: context.progress.snapshot(),
     };
     // Se il chiamante ha già chiuso la maniglia non c'è nessuno da avvisare: va bene così.
-    if context.send(SearchEvent::Finished(summary)).is_err() {}
+    if context.sender.send(SearchEvent::Finished(summary)).is_ok() {
+        (context.notify)();
+    }
 }
 
+/// Stato di una ricerca, condiviso (per riferimento) dai thread della scansione.
 struct Search<'a> {
     request: &'a SearchRequest,
     context: &'a WorkerContext,
-    hits_sent: usize,
+    halt: Halt,
+    budget: Budget,
 }
 
 impl Search<'_> {
-    fn all_roots(&mut self) -> Result<(), Stop> {
-        for (root_index, root) in self.request.roots.iter().enumerate() {
-            self.context.check_cancel()?;
-            self.one_root(root_index, root)?;
+    fn all_roots(&self) {
+        if let Err(stop) = self.check() {
+            self.halt.record(stop);
+            return;
         }
-        Ok(())
-    }
-
-    fn one_root(&mut self, root_index: usize, root: &Path) -> Result<(), Stop> {
-        if let Err(error) = std::fs::symlink_metadata(root) {
-            return self.warn(DocPath::file(root), warning_kind_for_io(&error));
-        }
-        let skip_dirs = self.request.filters.skip_dirs.clone();
-        let hidden = self.request.filters.hidden;
-        let walker = WalkBuilder::new(root)
-            .standard_filters(false)
-            .follow_links(false)
-            .filter_entry(move |entry| {
-                entry.depth() == 0 || !is_excluded_dir(entry, &skip_dirs, hidden)
-            })
-            .build();
-        for result in walker {
-            self.context.check_cancel()?;
-            match result {
-                Ok(entry) if entry.file_type().is_some_and(|t| t.is_file()) => {
-                    self.one_file(root_index, &entry)?;
-                }
-                Ok(_) => {}
-                Err(error) => {
-                    let path = error_path(&error).unwrap_or(root);
-                    let kind = error
-                        .io_error()
-                        .map_or(WarningKind::Io, warning_kind_for_io);
-                    self.warn(DocPath::file(path), kind)?;
-                }
+        let plan = roots::plan(&self.request.roots);
+        for missing in plan.missing {
+            let warning = self.warn(DocPath::file(missing.path), kind_for_io(&missing.error));
+            if let Err(stop) = warning {
+                self.halt.record(stop);
+                return;
             }
         }
-        Ok(())
+        let index = Arc::new(plan.index);
+        let Some((first, others)) = index.roots().split_first() else {
+            return;
+        };
+        let mut builder = WalkBuilder::new(&first.path);
+        for root in others {
+            builder.add(&root.path);
+        }
+        let dir_filter = DirFilter {
+            filters: self.request.filters.clone(),
+            roots: Arc::clone(&index),
+        };
+        builder
+            .standard_filters(false)
+            .follow_links(false)
+            .filter_entry(move |entry| dir_filter.accepts(entry))
+            .build_parallel()
+            .run(|| {
+                let index = Arc::clone(&index);
+                Box::new(move |result| self.visit(&index, result))
+            });
     }
 
-    fn one_file(&mut self, root_index: usize, entry: &DirEntry) -> Result<(), Stop> {
+    /// Una voce della scansione, su uno dei suoi thread.
+    fn visit(&self, index: &RootIndex, result: Result<DirEntry, ignore::Error>) -> WalkState {
+        let outcome = self.check().and_then(|()| match result {
+            Ok(entry) => self.entry(index, &entry),
+            Err(error) => self.walk_error(&error),
+        });
+        match outcome {
+            Ok(()) => WalkState::Continue,
+            Err(stop) => {
+                self.halt.record(stop);
+                WalkState::Quit
+            }
+        }
+    }
+
+    fn entry(&self, index: &RootIndex, entry: &DirEntry) -> Result<(), Stop> {
+        // Cartelle: le visita la scansione. Link e junction: non si seguono.
+        if !entry.file_type().is_some_and(|t| t.is_file()) {
+            return Ok(());
+        }
+        let Some(root) = index.owner(entry.path(), entry.depth()) else {
+            return Ok(());
+        };
         let progress = &self.context.progress;
         progress.add(Counter::FilesSeen, 1);
         let metadata = entry.metadata().ok();
-        let is_root = entry.depth() == 0;
-        if !is_root && !accepts_file(&self.request.filters, entry.path(), metadata.as_ref()) {
+        let facts = EntryFacts::read(entry.file_name(), metadata.as_ref());
+        let filters = &self.request.filters;
+        if filter::check_file(entry.path(), facts, entry.depth() == 0, filters).is_err() {
             progress.add(Counter::FilesSkipped, 1);
             return Ok(());
         }
-        let max_size = self
-            .request
-            .filters
-            .max_file_size
-            .unwrap_or(ByteSize::from_bytes(u64::MAX));
-        if metadata
-            .as_ref()
-            .is_some_and(|m| m.len() > max_size.bytes())
-        {
-            progress.add(Counter::FilesSkipped, 1);
-            return Ok(());
-        }
+        self.text_file(root, entry.path())
+    }
 
-        let doc = Arc::new(DocPath::file(entry.path()));
+    /// Legge e cerca un file di testo.
+    fn text_file(&self, root: &PlannedRoot, path: &Path) -> Result<(), Stop> {
+        let progress = &self.context.progress;
+        let doc = Arc::new(DocPath::file(path));
         progress.set_current(Some(Arc::clone(&doc)));
-        match read_text(entry.path(), max_size) {
-            Ok(decoded) => {
+        let max_size = filter::max_read_size(&self.request.filters);
+        let mut reader = match open_text(path, max_size) {
+            Ok(reader) => reader,
+            Err(error) => return self.unreadable(doc, &error),
+        };
+        let file = FileSearch {
+            query: &self.request.query,
+            limits: &self.request.limits,
+            root: root.index,
+            doc: Arc::clone(&doc),
+        };
+        match search_text(&mut reader, &file, &mut SharedSink { search: self }) {
+            Ok(()) => {
                 progress.add(Counter::FilesSearched, 1);
-                let hits = self.collect_hits(root_index, &doc, &decoded.text);
-                self.send_hits(hits)
+                Ok(())
             }
-            Err(ExtractError::Binary) => {
+            Err(FileError::Stop(stop)) => Err(stop),
+            Err(FileError::Read(error)) => self.unreadable(doc, &error),
+        }
+    }
+
+    /// Un file che non si è potuto leggere: saltato e contato, oppure un avviso.
+    fn unreadable(&self, doc: Arc<DocPath>, error: &ExtractError) -> Result<(), Stop> {
+        let progress = &self.context.progress;
+        match error {
+            ExtractError::Binary => {
                 progress.add(Counter::BinarySkipped, 1);
                 Ok(())
             }
-            Err(ExtractError::TooLarge { .. }) => {
+            ExtractError::TooLarge { .. } => {
                 progress.add(Counter::FilesSkipped, 1);
                 Ok(())
             }
-            Err(error) => {
-                let kind = WarningKind::from_extract_error(&error).unwrap_or(WarningKind::Io);
+            other => {
+                let kind = WarningKind::from_extract_error(other).unwrap_or(WarningKind::Io);
                 self.warn_shared(doc, kind)
             }
         }
     }
 
-    /// Righe di un file di testo, già filtrate da OR/AND.
-    fn collect_hits(&self, root_index: usize, doc: &Arc<DocPath>, text: &str) -> Vec<Hit> {
-        let query = &self.request.query;
-        let limits = &self.request.limits;
-        let mut accumulator = FileAccumulator::new(query.term_count(), query.combine());
-        for found in find_words(query, text) {
-            let word = word_text(text, &found, limits.word_max_chars);
-            let hit = Hit {
-                doc: Arc::clone(doc),
-                root: root_index,
-                location: Location::Line(found.line.saturating_add(1)),
-                word: word.text,
-                word_truncated: word.truncated,
-                snippet: snippet(text, &found, limits.context_chars),
-                terms: found.terms,
-            };
-            accumulator.push(found.terms, hit);
-        }
-        accumulator.finish()
-    }
-
-    /// Manda i risultati rispettando il limite; lo raggiunge → [`Stop::LimitReached`].
-    fn send_hits(&mut self, mut hits: Vec<Hit>) -> Result<(), Stop> {
-        let remaining = self
-            .request
-            .limits
-            .max_results
-            .saturating_sub(self.hits_sent);
-        let reached = hits.len() >= remaining;
-        hits.truncate(remaining);
-        if !hits.is_empty() {
-            self.hits_sent += hits.len();
-            let count = u64::try_from(hits.len()).unwrap_or(u64::MAX);
-            self.context.progress.add(Counter::Hits, count);
-            self.context.send(SearchEvent::Hits(hits))?;
-        }
-        if reached {
-            Err(Stop::LimitReached)
-        } else {
-            Ok(())
-        }
+    /// Un errore della scansione (cartella illeggibile, sparita): un avviso.
+    fn walk_error(&self, error: &ignore::Error) -> Result<(), Stop> {
+        let path = error_path(error).map_or_else(PathBuf::new, Path::to_path_buf);
+        let kind = error.io_error().map_or(WarningKind::Io, kind_for_io);
+        self.warn(DocPath::file(path), kind)
     }
 
     fn warn(&self, doc: DocPath, kind: WarningKind) -> Result<(), Stop> {
@@ -222,40 +255,124 @@ impl Search<'_> {
 
     fn warn_shared(&self, doc: Arc<DocPath>, kind: WarningKind) -> Result<(), Stop> {
         self.context.progress.add(Counter::Warnings, 1);
-        self.context
-            .send(SearchEvent::Warning(Warning { doc, kind }))
+        self.send(SearchEvent::Warning(Warning { doc, kind }))
+    }
+
+    /// Errore se la ricerca deve fermarsi.
+    fn check(&self) -> Result<(), Stop> {
+        if let Some(stop) = self.halt.get() {
+            return Err(stop);
+        }
+        if self.context.cancel.load(Ordering::Relaxed) {
+            return Err(Stop::Cancelled);
+        }
+        Ok(())
+    }
+
+    /// Mette in coda un evento e avvisa il chiamante. Con la coda piena aspetta, ma
+    /// ricontrolla l'annullamento ogni [`SEND_RECHECK`].
+    fn send(&self, event: SearchEvent) -> Result<(), Stop> {
+        let mut event = event;
+        loop {
+            match self.context.sender.send_timeout(event, SEND_RECHECK) {
+                Ok(()) => {
+                    (self.context.notify)();
+                    return Ok(());
+                }
+                Err(SendTimeoutError::Timeout(back)) => {
+                    self.check()?;
+                    event = back;
+                }
+                Err(SendTimeoutError::Disconnected(_)) => return Err(Stop::Disconnected),
+            }
+        }
     }
 }
 
-/// Vero se `entry` è una cartella da non visitare (nome in `skip_dirs` o nascosta).
-fn is_excluded_dir(entry: &DirEntry, skip_dirs: &[String], hidden: HiddenPolicy) -> bool {
-    if !entry.file_type().is_some_and(|t| t.is_dir()) {
-        return false;
+/// Risultati che si possono ancora consegnare, condivisi tra i thread.
+#[derive(Debug)]
+struct Budget(AtomicUsize);
+
+impl Budget {
+    fn new(max_results: usize) -> Budget {
+        Budget(AtomicUsize::new(max_results))
     }
-    let name = entry.file_name();
-    if skip_dirs
-        .iter()
-        .any(|skip| platform::dir_name_matches(name, skip))
-    {
-        return true;
+
+    fn remaining(&self) -> usize {
+        self.0.load(Ordering::Relaxed)
     }
-    hidden == HiddenPolicy::Skip && platform::is_hidden(name, entry.metadata().ok().as_ref())
+
+    /// Prenota fino a `wanted` risultati: quanti se ne possono consegnare e se il limite
+    /// è ora pieno (anche se è stato riempito proprio da questa prenotazione).
+    fn reserve(&self, wanted: usize) -> (usize, bool) {
+        let before = self
+            .0
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+                Some(left - left.min(wanted))
+            })
+            .unwrap_or_else(|left| left);
+        (before.min(wanted), before <= wanted)
+    }
 }
 
-/// Filtri sui file sotto una radice: nascosti, estensione, solo online.
-fn accepts_file(filters: &Filters, path: &Path, metadata: Option<&std::fs::Metadata>) -> bool {
-    let name = path.file_name().unwrap_or_default();
-    if filters.hidden == HiddenPolicy::Skip && platform::is_hidden(name, metadata) {
-        return false;
-    }
-    if !filters.extensions.accepts(path) {
-        return false;
-    }
-    !(filters.online_only == OnlineFilesPolicy::Skip
-        && metadata.is_some_and(platform::is_online_only))
+/// I risultati di un file verso il canale, nel rispetto del limite.
+struct SharedSink<'a, 'b> {
+    search: &'a Search<'b>,
 }
 
-fn warning_kind_for_io(error: &io::Error) -> WarningKind {
+impl HitSink for SharedSink<'_, '_> {
+    fn check(&self) -> Result<(), Stop> {
+        self.search.check()
+    }
+
+    fn remaining(&self) -> usize {
+        self.search.budget.remaining()
+    }
+
+    fn deliver(&mut self, mut hits: Vec<Hit>) -> Result<(), Stop> {
+        let (granted, full) = self.search.budget.reserve(hits.len());
+        hits.truncate(granted);
+        if !hits.is_empty() {
+            let count = u64::try_from(hits.len()).unwrap_or(u64::MAX);
+            self.search.context.progress.add(Counter::Hits, count);
+            self.search.send(SearchEvent::Hits(hits))?;
+        }
+        if full {
+            Err(Stop::LimitReached)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// Il filtro delle voci della scansione: pota cartelle e radici annidate.
+struct DirFilter {
+    filters: Filters,
+    roots: Arc<RootIndex>,
+}
+
+impl DirFilter {
+    /// Vero se la voce va visitata. Le radici passano sempre; una voce che è a sua volta una
+    /// radice si lascia alla sua scansione; i file si filtrano (e si contano) nel visitatore.
+    fn accepts(&self, entry: &DirEntry) -> bool {
+        let depth = entry.depth();
+        if depth == 0 {
+            return true;
+        }
+        if let Some(owner) = self.roots.owner(entry.path(), depth)
+            && self.roots.is_other_root(entry.path(), owner)
+        {
+            return false;
+        }
+        if !entry.file_type().is_some_and(|t| t.is_dir()) {
+            return true;
+        }
+        let facts = EntryFacts::read(entry.file_name(), entry.metadata().ok().as_ref());
+        filter::enter_dir(entry.file_name(), facts, &self.filters)
+    }
+}
+
+fn kind_for_io(error: &io::Error) -> WarningKind {
     match error.kind() {
         io::ErrorKind::NotFound => WarningKind::NotFound,
         io::ErrorKind::PermissionDenied => WarningKind::AccessDenied,
@@ -271,5 +388,34 @@ fn error_path(error: &ignore::Error) -> Option<&Path> {
             error_path(err)
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn halt_keeps_the_first_reason_but_disconnection_wins() {
+        let halt = Halt::default();
+        assert_eq!(halt.get(), None);
+        halt.record(Stop::LimitReached);
+        halt.record(Stop::Cancelled);
+        assert_eq!(halt.get(), Some(Stop::LimitReached));
+        halt.record(Stop::Disconnected);
+        assert_eq!(halt.get(), Some(Stop::Disconnected));
+    }
+
+    #[test]
+    fn budget_reservations() {
+        let budget = Budget::new(5);
+        assert_eq!(budget.reserve(2), (2, false));
+        assert_eq!(budget.reserve(3), (3, true));
+        assert_eq!(budget.reserve(1), (0, true));
+        assert_eq!(budget.remaining(), 0);
+        let budget = Budget::new(5);
+        assert_eq!(budget.reserve(9), (5, true));
+        let empty = Budget::new(0);
+        assert_eq!(empty.reserve(0), (0, true));
     }
 }

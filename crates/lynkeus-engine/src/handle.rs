@@ -6,8 +6,9 @@
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
+
+use crossbeam_channel::{Receiver, TryRecvError};
 
 use crate::event::SearchEvent;
 use crate::progress::Progress;
@@ -99,7 +100,7 @@ impl std::fmt::Debug for SearchHandle {
 /// `notify` è chiamata dopo ogni evento messo in coda. Errore solo se il sistema non
 /// riesce a creare il thread.
 pub fn start_search(request: SearchRequest, notify: Notify) -> io::Result<SearchHandle> {
-    let (sender, events) = mpsc::sync_channel(EVENT_QUEUE_CAPACITY);
+    let (sender, events) = crossbeam_channel::bounded(EVENT_QUEUE_CAPACITY);
     let progress = Arc::new(Progress::default());
     let cancel = Arc::new(AtomicBool::new(false));
     let context = WorkerContext {
