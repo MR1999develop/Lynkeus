@@ -1,0 +1,24 @@
+# Artefatti di build e di rilascio
+/target
+/dist
+
+# File locali, non versionati
+CLAUDE.local.md
+.claude/settings.local.json
+.claude/worktrees/
+
+# File temporanei degli editor e del sistema
+*~
+*.swp
+*.swo
+*.bak
+*.orig
+*.tmp
+.#*
+\#*\#
+.vscode/
+.idea/
+*.code-workspace
+.DS_Store
+Thumbs.db
+desktop.ini

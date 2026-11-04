@@ -1,0 +1,83 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "xtask"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "GPL-3.0-only"
+authors = ["MR"]
+publish = false
+
+# Ogni crate li eredita con `[lints] workspace = true`.
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+# Un piccolo insieme di `pedantic`, scelto per i bug che evita più che per lo stile.
+cast_lossless = "warn"
+cast_possible_truncation = "warn"
+cast_possible_wrap = "warn"
+cast_sign_loss = "warn"
+checked_conversions = "warn"
+explicit_iter_loop = "warn"
+implicit_clone = "warn"
+inefficient_to_string = "warn"
+manual_let_else = "warn"
+match_same_arms = "warn"
+needless_pass_by_value = "warn"
+redundant_closure_for_method_calls = "warn"
+semicolon_if_nothing_returned = "warn"
+uninlined_format_args = "warn"
+unnecessary_wraps = "warn"
+unused_self = "warn"
+
+# Le dipendenze condivise dei crate si dichiarano qui e si ereditano con `workspace = true`.
+[workspace.dependencies]
+# Crate del workspace.
+lynkeus-core = { path = "crates/lynkeus-core" }
+lynkeus-extract = { path = "crates/lynkeus-extract" }
+lynkeus-engine = { path = "crates/lynkeus-engine" }
+
+# Esterne.
+anyhow = "1.0.104"
+# Senza `default_fonts`: i font di egui includono Ubuntu-Light (licenza Ubuntu Font),
+# fuori dall'allowlist. I font si caricano dal sistema (`platform`).
+eframe = { version = "0.37.0", default-features = false, features = [
+    "accesskit",
+    "clipboard",
+    "system_fonts",
+    "wayland",
+    "wgpu",
+    "x11",
+] }
+egui = { version = "0.37.0", default-features = false }
+fluent-templates = "0.15.1"
+ignore = "0.4.34"
+regex = "1.13.1"
+serde = { version = "1.0.229", features = ["derive"] }
+sys-locale = "0.3.2"
+thiserror = "2.0.21"
+# Solo per le feature Linux che eframe attiverebbe con `winit/default`: Wayland caricato a
+# runtime e decorazioni client su GNOME. `-notitle` evita `ab_glyph` → `ttf-parser`
+# (RUSTSEC-2026-0192, non mantenuto): la barra c'è, senza il titolo scritto.
+winit = { version = "0.30.13", default-features = false, features = [
+    "rwh_06",
+    "wayland-dlopen",
+    "wayland-csd-adwaita-notitle",
+] }
+
+# `trim-paths` non è stabile in cargo 1.99.1: i percorsi locali li toglie
+# `cargo xtask dist` con `--remap-path-prefix` calcolati al momento.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "unwind"
+
+# Crate di dominio: un overflow aritmetico è un bug da fermare anche in release.
+[profile.release.package.lynkeus-core]
+overflow-checks = true
+[profile.release.package.lynkeus-extract]
+overflow-checks = true

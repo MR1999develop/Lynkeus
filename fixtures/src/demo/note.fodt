@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<office:document xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0" office:version="1.3" office:mimetype="application/vnd.oasis.opendocument.text">
+ <office:meta/>
+ <office:body>
+  <office:text>
+   <text:p>Note dell'ufficio</text:p>
+   <text:p>Rispondere alla posta in ingresso.</text:p>
+   <text:p>Comprare la carta per la stampante.</text:p>
+   <text:p>Pulire la scrivania.</text:p>
+  </office:text>
+ </office:body>
+</office:document>

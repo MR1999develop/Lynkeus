@@ -1,0 +1,27 @@
+# Limiti e valori predefiniti
+
+| Cosa | Valore |
+|---|---|
+| Risultati massimi | 200.000 (modificabile); al limite la ricerca si ferma e un banner lo segnala |
+| Parola nei risultati | oltre 200 caratteri: troncata con "…" |
+| Contesto | circa 120 caratteri intorno alla parola |
+| Anteprima | unità di testo con ±20 unità vicine |
+| Rilevamento binari | NUL nei primi 8 KB (senza schema UTF-16) o firma nota |
+| Lettura dei file di testo | blocchi di circa 8 MB tagliati a fine riga |
+| Processi estrattori | `min(core/2, 4)`, avviati al primo documento |
+| Timeout per file | 60 s, poi processo terminato e sostituito |
+| Annulla | richiesta di stop (chiusura stdin), chiusura forzata dopo 500 ms; risposta attesa entro 1 s |
+| Archivi: profondità | 5 |
+| Archivi: voci | 100.000 |
+| Archivi: byte per voce | 512 MB |
+| Archivi: byte per archivio | 4 GB |
+| Archivi: rapporto di compressione | 200:1 |
+| Cache | LRU, 500 MB |
+| Barra di avanzamento | compare dopo 1 s |
+| Token dell'istanza unica | 128 bit casuali |
+
+I limiti sugli archivi sono contati sui byte decompressi con `Read::take` (anche per docx e odt) e modificabili in "Avanzate".
+
+Cartelle saltate per impostazione predefinita: `.git`, `node_modules`, `target`, `$RECYCLE.BIN`, `System Volume Information`.
+
+Opzioni predefinite: maiuscole ignorate, accenti distinti, jolly accesi, file solo online saltati, OR.

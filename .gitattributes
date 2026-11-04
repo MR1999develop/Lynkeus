@@ -1,0 +1,23 @@
+# Testo normalizzato a LF nel repository e nella copia di lavoro.
+* text=auto eol=lf
+
+*.rs     text eol=lf
+*.toml   text eol=lf
+*.md     text eol=lf
+*.yml    text eol=lf
+*.yaml   text eol=lf
+*.json   text eol=lf
+*.ftl    text eol=lf
+*.txt    text eol=lf
+*.lock   text eol=lf
+LICENSE  text eol=lf
+
+# Binari
+*.png    binary
+*.ico    binary
+*.ttf    binary
+*.otf    binary
+*.zip    binary
+
+# File di prova: i byte contano (codifiche, BOM, fine riga), nessuna conversione.
+fixtures/** binary

@@ -1,0 +1,6 @@
+[alias]
+xtask = "run --package xtask --"
+
+# Mitigazioni di Windows: Control Flow Guard e compatibilità con CET (shadow stack).
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "control-flow-guard", "-C", "link-arg=/CETCOMPAT"]

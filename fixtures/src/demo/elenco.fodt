@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<office:document xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0" office:version="1.3" office:mimetype="application/vnd.oasis.opendocument.text">
+ <office:meta/>
+ <office:body>
+  <office:text>
+   <text:p>Elenco dei brani in programma</text:p>
+   <text:p>Suonare la chitarra classica.</text:p>
+   <text:p>Cantiamo insieme al coro.</text:p>
+  </office:text>
+ </office:body>
+</office:document>

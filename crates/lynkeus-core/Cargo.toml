@@ -1,0 +1,17 @@
+[package]
+name = "lynkeus-core"
+description = "Ricerca pura di Lynkeus Searcher: termini, corrispondenze, parole, posizioni, OR/AND."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+regex.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

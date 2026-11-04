@@ -1,0 +1,64 @@
+# Configurazione di cargo-deny: advisory, licenze, dipendenze vietate e sorgenti.
+# Si esegue con `cargo deny check` (dentro `cargo xtask check` e ogni giorno in CI).
+
+[graph]
+# Solo le piattaforme per cui si distribuisce: le dipendenze di altri target non contano.
+targets = ["x86_64-pc-windows-msvc", "x86_64-unknown-linux-gnu"]
+all-features = true
+
+[advisories]
+# Ogni eccezione va in `ignore` con l'ID dell'advisory e il motivo:
+# ignore = [{ id = "RUSTSEC-AAAA-NNNN", reason = "..." }]
+ignore = [
+    # Accessibilità su Linux: eframe 0.37 → accesskit_unix 0.24.1 (ultima versione) → zbus 5.
+    # Solo "unmaintained", nessuna vulnerabilità nota. Da rivedere quando accesskit passa a zbus 6
+    # o a ogni aggiornamento di eframe.
+    { id = "RUSTSEC-2026-0370", reason = "zvariant non mantenuto, arriva da AccessKit su Linux senza alternative" },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names non mantenuto, arriva da AccessKit su Linux senza alternative" },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive non mantenuto, arriva da AccessKit su Linux senza alternative" },
+]
+unmaintained = "all"
+unsound = "all"
+yanked = "deny"
+
+[licenses]
+# Solo licenze compatibili con GPL-3.0-only, elencate una per una.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "0BSD",
+    "Zlib",
+    "Unicode-3.0",
+    "MPL-2.0",
+    "OFL-1.1",
+    "CC0-1.0",
+    "BSL-1.0",
+    "Unlicense",
+]
+confidence-threshold = 0.93
+# L'allowlist è decisa per tutto il progetto: le voci non ancora usate non sono un avviso.
+unused-allowed-license = "allow"
+# Le eccezioni per un singolo crate vanno in `exceptions`, con il motivo in un commento.
+exceptions = []
+
+[licenses.private]
+# I crate del workspace hanno `publish = false`: la loro licenza (GPL-3.0-only) non si controlla.
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+deny = []
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

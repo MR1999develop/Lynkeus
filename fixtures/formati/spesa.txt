@@ -1,0 +1,7 @@
+Elenco della spesa
+Pane
+Latte
+Uova
+Mele
+Oggi compriamo l'aragosta in città.
+Riso
