@@ -43,13 +43,14 @@ cargo xtask check
 
 Testo e codice (con rilevamento della codifica), docx, xlsx, pptx, odt, ods, odp, PDF, doc, xls, ppt, RTF, EML, EPUB, e gli archivi zip, 7z, tar e gz, anche annidati.
 
-In questa versione di sviluppo sono già letti testo e codice, docx, xlsx, pptx, odt, ods, odp, PDF e zip; gli altri formati dell'elenco (doc, xls, ppt, RTF, EML, EPUB, 7z, tar, gz) sono in arrivo.
+Sono letti anche i file `.tgz`/`.tar.gz`. Le e-mail (EML) sono lette con i loro allegati, che sono cercati come documenti a sé. Un `.doc` che è in realtà RTF e un `.xls` che è una pagina HTML o un CSV si leggono lo stesso.
 
 ## Limiti noti
 
 - Una frase spezzata da un a capo (frequente nei PDF) non viene trovata.
 - I PDF scansionati non hanno testo: servirebbe l'OCR, che non c'è. Il file finisce negli avvisi.
-- Dei file .doc e .ppt si estrae il testo principale; commenti, note e caselle di testo potrebbero mancare.
+- Dei file .doc si estrae il testo principale: note, intestazioni e piè di pagina, commenti e caselle di testo non si leggono; Word 6 e 95 non sono supportati (avviso "danneggiato").
+- Dei file .ppt si estrae il testo delle diapositive: note del relatore, schemi, commenti e oggetti incorporati (grafici, tabelle) non si leggono.
 - I file .rar non sono supportati.
 - Una voce di archivio che è un documento (per esempio un PDF dentro uno zip) si trova e si vede nell'anteprima, ma per ora non si può aprire dal programma; le voci di testo sì.
 - I file protetti da password o danneggiati, e quelli che superano i limiti di tempo o di dimensione (anche degli archivi), non vengono letti: compaiono nella scheda Avvisi con il loro motivo.

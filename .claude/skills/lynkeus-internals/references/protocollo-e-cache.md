@@ -55,17 +55,17 @@ Fonti: `crates/lynkeus-extract` (`protocol.rs`, `event.rs`, `worker.rs`, `format
 
 ## Registro dei formati e come aggiungerne uno
 
-`crates/lynkeus-extract/src/format.rs`. `REGISTRY` lega estensioni (minuscole, senza punto), firma attesa (`Signature`: `Zip`, `Pdf`, `Cfb`, `Rtf`, `Unknown`; `None` = qualsiasi contenuto), tipo (`Document` o `Archive`) e funzione d'estrazione. `Format::for_path`, `for_name` (separatori `/` e `\`, conta l'ultima estensione), `for_extension`; `None` = nessun formato (mai provato "per vedere"). `Signature::sniff` guarda i primi 1024 byte. `verify` decide: firma attesa = si legge; OOXML con firma CFB = candidato cifrato; altrimenti la tabella `HARMLESS` (ora vuota); altrimenti `ContentMismatch`.
+`crates/lynkeus-extract/src/format.rs`. `REGISTRY` lega estensioni (minuscole, senza punto), firma attesa (`Signature`: `Zip`, `Pdf`, `Cfb`, `Rtf`, `SevenZ`, `Gzip`, `Tar`, `Html`, `Unknown`; `None` = qualsiasi contenuto, come Text ed Eml), tipo (`Document` o `Archive`) e funzione d'estrazione. `Format::for_path`, `for_name` (separatori `/` e `\`, conta l'ultima estensione), `for_extension`; `None` = nessun formato (mai provato "per vedere"). `Signature::sniff` guarda i primi 1024 byte. `verify` decide: firma attesa = si legge; OOXML con firma CFB = candidato cifrato; altrimenti la tabella `HARMLESS`; altrimenti `ContentMismatch`.
 
 Per aggiungere un formato:
 
 1. variante in fondo a `Format` (le esistenti non si spostano; se cambia il significato di una, si alza `PROTOCOL_VERSION`);
 2. se serve, variante di `Signature` e riconoscimento in `Signature::sniff`;
 3. riga in `REGISTRY` con la funzione d'estrazione in un modulo nuovo di `extract/`;
-4. righe in `HARMLESS` per i casi innocui, per esempio `(Format::Doc, Signature::Rtf, Format::Rtf)` e `(Format::Xls, Signature::Html, Format::Html)`;
+4. righe in `HARMLESS` per i casi innocui (formato dell'estensione, firma trovata, formato da usare). Ora: `(Doc, Rtf, Rtf)`, `(Xls, Html, Html)`, `(Xls, Unknown, Text)`. `Html` non ha estensioni: si raggiunge solo da `HARMLESS`;
 5. test del registro (una sola riga per formato, estensioni uniche e minuscole) e fixture in `fixtures/formati/`.
 
-Registrati ora: Text (voci d'archivio), Docx, Xlsx, Pptx, Odt, Ods, Odp, Pdf, Zip. Mancano ancora (fase 5): doc, xls, ppt, RTF, EML, EPUB, 7z, tar, gz.
+Registrati (indice `postcard` in ordine): Text (voci d'archivio), Docx, Xlsx, Pptx, Odt, Ods, Odp, Pdf, Zip, Doc (`doc`, `dot`), Xls (`xls`, `xlt`), Ppt (`ppt`, `pot`, `pps`), Rtf, Eml (nessuna firma), Epub (archivio, firma Zip), SevenZ, Tar, Gz (`gz`, `tgz`; archivio), Html (solo caso innocuo). Archivi (`Kind::Archive`): Zip, Epub, SevenZ, Tar, Gz; gli altri sono documenti. Un `.gz` il cui nome interno termina in `.tar` (o `.tgz`), o il cui contenuto ha la firma tar, è un solo archivio con le voci del tar sotto il file. Gli allegati EML sono documenti a sé, dopo la fine del messaggio. Moduli in `extract/`: `word97`, `ppt`, `cfbfile` (file composto, condiviso), `sheet` (xlsx, xls, ods), `rtf`, `eml`, `html`, `epub`, `sevenz`, `tarball`.
 
 ## Cartelle private
 

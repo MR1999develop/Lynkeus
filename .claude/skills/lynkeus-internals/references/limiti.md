@@ -24,6 +24,11 @@
 | Archivi: byte per voce | 512 MB |
 | Archivi: byte per archivio | 4 GB |
 | Archivi: rapporto di compressione | 200:1 |
+| RTF: profondità dei gruppi | 256 (`MAX_GROUP_DEPTH`); oltre, documento "danneggiato" |
+| EML: allegati | contano come voci (100.000), un livello di profondità in più, 512 MB per allegato decodificato e totali; il messaggio si legge in memoria entro il massimo per voce |
+| 7z | voci contate sull'elenco; dimensione dichiarata controllata prima di leggere; in un blocco solido, superato un limite il resto del blocco ha lo stesso avviso; AES: "protetto da password" |
+| tar | voci contate man mano (non c'è elenco in testa); dimensione dichiarata controllata prima; link, dispositivi e file sparsi saltati |
+| gz / tgz | stessi limiti degli zip; rapporto di compressione sui byte del file compresso; più membri concatenati letti; contenuto = un documento, o le voci di un tar |
 | Cache | LRU, 500 MB predefiniti (`[cache] max_size_mib`, da 16 a 65.536 MiB; menu: 100, 250, 500, 1000, 2000) |
 | Voce di cache | al più 64 MiB di frame decompressi; oltre, il documento non si salva |
 | Temporanei di cache | più vecchi di 1 ora: cancellati |

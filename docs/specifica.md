@@ -58,7 +58,18 @@ Il formato si sceglie dall'estensione e si verifica dal contenuto; se non coinci
 
 **File di testo.** La codifica si decide sul primo blocco letto (almeno 8 KB): BOM, firme binarie, NUL (salvo schema UTF-16), UTF-8 valido, altrimenti codifica a 8 bit rilevata (ripiego Windows-1252). Se il file è ASCII o UTF-8 nel primo blocco (fino a 8 MB) e ha byte non validi più avanti, questi diventano U+FFFD. Le righe finiscono con `\n`; un file con soli `\r` (vecchio Mac) è una riga sola, tagliata dopo l'ultimo spazio a ogni blocco, per cui una frase o una parola a cavallo del taglio può non essere trovata.
 
-**Documenti cercati.** Ogni documento (il file stesso o una voce d'archivio) è cercato per conto suo: OR e AND valgono per documento, e il risultato porta il file più il percorso delle voci. Il testo arriva dalla cache, se c'è una voce valida per quel file (stesso percorso, dimensione, data di modifica, versione del programma e limiti), altrimenti da un processo estrattore. Un guasto dell'estrattore (tempo scaduto, memoria superata, uscita improvvisa) dà un avviso per quel documento e la ricerca continua. Formati ancora non letti: doc, xls, ppt, RTF, EML, EPUB, 7z, tar, gz (fase 5).
+**Documenti cercati.** Ogni documento (il file stesso o una voce d'archivio) è cercato per conto suo: OR e AND valgono per documento, e il risultato porta il file più il percorso delle voci. Il testo arriva dalla cache, se c'è una voce valida per quel file (stesso percorso, dimensione, data di modifica, versione del programma e limiti), altrimenti da un processo estrattore. Un guasto dell'estrattore (tempo scaduto, memoria superata, uscita improvvisa) dà un avviso per quel documento e la ricerca continua. Tutti i formati dell'elenco sono letti.
+
+**Formati della fase 5.**
+
+- **doc (Word 97-2003):** il testo principale, un paragrafo per unità. Non si estraggono note, intestazioni e piè di pagina, commenti, caselle di testo; Word 6 e 95 (FIB più vecchia) non sono letti e danno l'avviso "danneggiato".
+- **xls:** celle come per xlsx. Un `.xls` che è una pagina HTML o testo (CSV, tabulato) si legge lo stesso (casi innocui, vedi sopra).
+- **ppt (PowerPoint 97-2003):** il testo delle diapositive, nell'ordine della presentazione. Non si estraggono note del relatore, schemi (master), commenti e testo negli oggetti incorporati (grafici, tabelle OLE).
+- **RTF:** un'unità per paragrafo; intestazioni, piè di pagina, note e commenti, immagini e oggetti sono saltati. Gruppi annidati oltre 256: "danneggiato".
+- **EML:** oggetto, mittente, destinatari (To e Cc) e corpo (testo, o HTML ridotto a testo). Gli allegati vengono dopo come documenti a sé (un messaggio allegato si legge come EML), con i limiti degli archivi: gli allegati contano come un livello di profondità.
+- **EPUB:** ogni capitolo della spine è un documento, un'unità per blocco di testo. Capitoli cifrati: "protetto da password".
+- **7z:** come zip, con i limiti degli archivi; voci cifrate (AES): "protetto da password"; collegamenti saltati.
+- **tar, gz, tgz, tar.gz:** come zip. Un `.gz` contiene un documento (nome senza `.gz`); se contiene un tar, le voci stanno direttamente sotto il file. Collegamenti, dispositivi e file sparsi sono saltati.
 
 ## 8. Filtri
 
