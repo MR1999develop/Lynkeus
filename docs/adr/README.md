@@ -27,6 +27,6 @@ Test, controlli o comandi che falliscono se la decisione viene violata.
 
 ## ADR previsti
 
-- Isolamento in processo dei decoder (fase 4).
+- 0001: isolamento in processo dei decoder (fase 4), scritto: `0001-estrazione-in-processo-isolato.md`.
 - Libreria PDF: `pdf_oxide` o `pdf-extract`, dopo il prototipo (fase 4).
 - Formato delle impostazioni (`settings.toml` proprio, versionato).
