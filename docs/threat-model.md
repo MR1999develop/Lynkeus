@@ -1,6 +1,6 @@
 # Threat model (prima versione)
 
-Metodo: le Quattro Domande e STRIDE. Il processo estrattore e gli archivi sono approfonditi (fase 4, sezione 4.7); la pipe dell'istanza unica e il registro sono ancora provvisori e verranno approfonditi nella fase 7.
+Metodo: le Quattro Domande e STRIDE. Il processo estrattore e gli archivi sono approfonditi (fase 4, sezione 4.7); la pipe dell'istanza unica, il registro e le cartelle private sono approfonditi nella fase 7 (sezione 4.8).
 
 ## 1. Le Quattro Domande
 
@@ -43,18 +43,18 @@ Metodo: le Quattro Domande e STRIDE. Il processo estrattore e gli archivi sono a
 - **D**: processo bloccato o vorace. Mitigazione: timeout di 60 s, Job Object con limite di memoria e `KILL_ON_JOB_CLOSE` (Windows), `RLIMIT_AS` (Linux), uscita alla chiusura dello stdin, pool limitato a `min(core/2, 4)`.
 - **E**: compromissione del figlio. Mitigazione: risorse limitate e figlio senza scritture sui dati dell'utente; isolamento più forte da valutare nell'ADR.
 
-### 4.3 Pipe e socket dell'istanza unica (da approfondire nella fase 7)
+### 4.3 Pipe e socket dell'istanza unica (sintesi; dettaglio in 4.8)
 
 - **S**: processo ostile che si spaccia per la prima istanza o per un client. Mitigazione: pipe con nome casuale creata con `FILE_FLAG_FIRST_PIPE_INSTANCE`; client con `SECURITY_IDENTIFICATION`; token casuale da 128 bit in un file privato, confronto in tempo costante.
 - **T/E**: percorsi malevoli iniettati. Mitigazione: dimensione massima dei messaggi, solo percorsi esistenti, aggiunti all'elenco senza avviare la ricerca.
 - **I/D**: altri utenti sul computer. Mitigazione: DACL esplicita solo per l'utente corrente (Windows), socket 0600 in `$XDG_RUNTIME_DIR` (Linux); attivo solo con `--add`.
 
-### 4.4 Registro e script Nautilus
+### 4.4 Registro e script Nautilus (sintesi; dettaglio in 4.8)
 
 - **T/E**: voce del registro che punta a un eseguibile modificato. Mitigazione: scrittura solo in `HKCU` (nessun amministratore); percorso dell'eseguibile aggiornato all'avvio e voce rimossa quando l'opzione è spenta.
 - **T**: percorsi con caratteri speciali nella riga di comando. Mitigazione: argomento `"%1"` tra virgolette, trattato come dato.
 
-### 4.5 Cartella dati e cache
+### 4.5 Cartella dati e cache (sintesi; dettaglio in 4.8, parte C)
 
 - **I**: la cache contiene testo dei documenti. Mitigazione: cartelle private (descrittore esplicito solo utente e SYSTEM su Windows; 0700 e 0600 su Linux), cache spegnibile e svuotabile, avviso nel README.
 - **T**: voci di cache alterate o corrotte. Mitigazione: intestazione con versione e CRC; voce non valida ignorata e cancellata; creazione dei file che fallisce se esistono.
@@ -170,7 +170,147 @@ I byte si contano sul flusso decompresso (`Read::take`), mai sulle dimensioni di
 - **Voci d'archivio non di testo non ancora apribili.** Il protocollo porta solo testo: una voce PDF o Office dentro un archivio si trova e si mostra in anteprima, ma "Apri" dà il messaggio di non disponibilità (servono i byte originali della voce). Le voci di testo si ricompongono in un file della cartella privata (al più 64 MiB).
 - **Decoder di terzi con `unsafe`.** `lynkeus-extract` ha `forbid(unsafe_code)`, ma due dipendenze della fase 5 contengono `unsafe` nel proprio codice: `mail-parser` (EML, e HTML ridotto a testo) e, per il 7z, `lzma-rust2` (dipendenza di `sevenz-rust2`, che di suo non ha blocchi `unsafe`). Il processo estrattore resta l'unica difesa (sezione 5: rischio da rivalutare). Il conteggio è in `docs/dipendenze.md`.
 - **Controllo "nessun `Command` nei decoder" e test degli handle ereditati ancora da scrivere.**
-- **Windows: cartelle private con permessi ereditati** fino alla fase 7.
+- **Windows: cartelle private con permessi ereditati** fino alla fase 7 (vedi 4.8, parte C).
+
+### 4.8 Dettaglio: istanza unica, clic destro e cartelle private (fase 7)
+
+Approfondisce 4.3, 4.4 e 4.5 (confini 3, 4 e 5). Stato del codice alla stesura: esistono `create_private_dir` e `create_new_private_file` (`crates/lynkeus-engine/src/platform.rs`); su Linux impostano 0700 e 0600, su Windows non impostano alcun descrittore (si eredita quello del padre). Pipe, socket, lock, token, voci di registro e script Nautilus non sono ancora nel codice: ciò che segue è progetto, e ogni test indicato è "Previsto" salvo dove è scritto "Implementato". Una mitigazione senza test implementato non è verificata.
+
+**Attaccanti (comuni alle tre parti)**
+
+- **U1, altro utente locale** dello stesso computer.
+- **U2, processo dello stesso utente a privilegi diversi**: processo a integrità Low o con token ristretto che non dovrebbe poter comandare l'app. Un processo con integrità pari o superiore e lo stesso utente è fuori modello (potrebbe già leggere la cache e sostituire l'eseguibile; sezione 5).
+- **U3, file nella cartella cercata**: nomi di file e cartelle (spazi, virgolette, `-` iniziale, `&`, `%`, a capo, percorsi lunghi, collegamenti) che l'utente seleziona in Explorer o Nautilus e arrivano come argomento di `--add`.
+
+#### A. Istanza unica (pipe, socket, lock, token)
+
+**Asset**
+
+- Controllo dell'app in esecuzione: chi scrive sul canale decide quali luoghi compaiono in "dove cercare", quindi cosa verrà letto alla prossima ricerca.
+- Identità dell'utente: un server finto non deve ottenere un token di impersonazione del client.
+- Segretezza del token e del nome della pipe.
+- Disponibilità: né la prima istanza né i client devono bloccarsi.
+
+**Progetto**
+
+1. Il lock (`fs4`) è un file della cartella privata (parte C). Chi lo ottiene è la prima istanza, gli altri sono client. Il lock decide solo chi è il server; non protegge la segretezza.
+2. La prima istanza genera a ogni avvio un nome di pipe casuale (GUID) e un token da 128 bit dal generatore del sistema operativo. Nome e token stanno in un file della cartella privata, creato con `create_new` e riscritto a ogni avvio della prima istanza, cancellato allo spegnimento. Mai in riga di comando, log, registro o rapporti di crash.
+3. Windows, server: `CreateNamedPipeW` con `FILE_FLAG_FIRST_PIPE_INSTANCE` (se il nome esiste già, errore: si sceglie un altro nome, non si usa mai l'oggetto esistente), `PIPE_REJECT_REMOTE_CLIENTS`, una sola istanza, DACL esplicita e protetta con una sola ACE per il SID dell'utente (letto dal token, `TokenUser`; non il SID della logon session). Il server non impersona mai il client: non chiama `ImpersonateNamedPipeClient`.
+4. Windows, client: apre la pipe con `CreateFile` e `SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION` (senza il primo flag il secondo è ignorato; in Rust `security_qos_flags`). Prima di mandare il token verifica che il server sia un processo dell'utente corrente (`GetNamedPipeServerProcessId` e il SID del suo token).
+5. Linux: socket Unix in `$XDG_RUNTIME_DIR` con 0600 già alla creazione (`umask` 0177 attorno al `bind`); se la variabile manca o la cartella non è dell'utente con 0700, l'istanza unica si spegne e ogni avvio resta indipendente (fallire chiusi). Il server legge `SO_PEERCRED` e accetta solo lo stesso uid.
+6. Messaggio: versione, token (16 byte), numero di percorsi, percorsi come testo. Tetto alla dimensione totale (proposta 64 KiB) e al numero di percorsi (proposta 256), controllati prima di allocare; timeout di lettura (proposta 2 s); una connessione servita alla volta. Il token si confronta in tempo costante (`subtle`); a token errato la connessione si chiude senza risposta.
+7. Il server accetta un percorso solo se è assoluto, senza NUL, non UNC né dispositivo (`\\?\`, `\\.\`), e se esiste (`symlink_metadata` riuscito). Lo aggiunge all'elenco dei luoghi senza avviare la ricerca e senza aprirlo. Il percorso è un dato: mai a una shell o a un programma. Una sola funzione di validazione per riga di comando e canale (un solo guardiano per risorsa).
+8. Il client, consegnati i percorsi, chiama `AllowSetForegroundWindow(pid della prima istanza)`, chiede il primo piano ed esce. Se il server non risponde entro il timeout, il client apre una propria finestra: nessun blocco, nessun tentativo infinito.
+9. Il server esiste solo se l'opzione del clic destro è accesa (per piano, canale "solo con `--add`"); con l'opzione spenta non c'è canale né lock di istanza.
+
+**STRIDE**
+
+| STRIDE | Attaccante | Minaccia | Mitigazione | Test previsto |
+|---|---|---|---|---|
+| S | U1, U2 | Processo che crea per primo la pipe con il nome atteso e raccoglie token e percorsi | Nome casuale a ogni avvio, noto solo dal file privato; `FILE_FLAG_FIRST_PIPE_INSTANCE`; il client verifica che il server sia dell'utente prima di mandare il token | Creazione con nome già occupato: fallisce e si cambia nome; funzione che confronta il SID del server con quello dell'utente, con SID diverso: rifiuto |
+| S | U1, U2 | Processo che si spaccia per client | DACL solo utente (esclude U1); token da 128 bit nel file privato; `SO_PEERCRED` su Linux | Connessione senza token, con un byte sbagliato, con lunghezza diversa: rifiutate, nessun percorso aggiunto; confronto in tempo costante (revisione del codice: nessun `==` sul token) |
+| T | U3 | Percorso con NUL, UNC, `\\?\`, `..`, inesistente, collegamento verso altrove | Validazione unica; normalizzazione lessicale con `platform::normalize`; UNC rifiutato (evita l'autenticazione verso un host scelto da altri); nessuna apertura | Partizioni: relativo, assoluto, NUL, UNC, `\\?\`, `\\.\`, inesistente, 32.000 caratteri, collegamento circolare |
+| T | U2 | Messaggio troncato, con conteggi o lunghezze false | Tetti prima dell'allocazione, timeout di lettura | Ogni troncamento, lunghezza `u32::MAX`, proptest su byte casuali (nessun panic, nessuna allocazione oltre il tetto) |
+| R | tutti | Negare di aver mandato un percorso | Non rilevante: effetto limitato a una voce in più nell'elenco | |
+| I | U1, U2 | Lettura del token o del nome della pipe | File privato (parte C); mai in log, riga di comando, rapporti di crash | Ricerca del token nel log e nei rapporti dopo un ciclo completo |
+| I | U1 | Elencare le pipe per scoprire un'istanza attiva | Non evitabile su Windows; nome casuale e DACL limitano l'uso | Rischio accettato |
+| D | U1, U2 | Connessioni che non scrivono, riempimento della pipe, blocco dell'unica istanza | Una connessione alla volta con timeout; `PIPE_REJECT_REMOTE_CLIENTS`; tetto ai percorsi; client con ripiego su finestra propria | Client lento che non scrive: il server riprende dopo il timeout e serve il successivo |
+| D | U3 | Selezione di migliaia di elementi: Explorer lancia un processo per elemento | Processi brevi (connetti, manda, esci); percorsi aggiunti in blocco senza ricerca; elenco con tetto | 1.000 connessioni in sequenza: memoria e tempo entro limite |
+| D | U1 | Occupare il file di lock o il nome del socket | Lock nella cartella privata (inaccessibile a U1); `$XDG_RUNTIME_DIR` scrivibile solo dall'utente | Lock o socket preesistenti con altro proprietario: funzione spenta, nessun blocco dell'avvio |
+| E | U1 | Impersonazione del client da parte di un server ostile | SQoS Identification nel client; il server legittimo non impersona | Test sulla funzione che costruisce i flag di apertura: `SECURITY_SQOS_PRESENT` e `SECURITY_IDENTIFICATION` entrambi presenti |
+| E | U2 | Usare il canale come deputato confuso per far leggere file | Un percorso aggiunto non si legge finché l'utente non preme Cerca; il canale non porta diritti né comandi diversi da "aggiungi" | Nessuna ricerca avviata dopo un messaggio valido (test sull'engine) |
+
+**Rischi accettati (A)**
+
+- Un processo dello stesso utente con integrità Medium o superiore legge il file del token e aggiunge luoghi all'elenco: effetto che avrebbe già modificando `settings.toml`.
+- L'esistenza di un'istanza in esecuzione non è segreta.
+- Senza `$XDG_RUNTIME_DIR` (sessioni senza systemd) l'istanza unica è spenta e si aprono più finestre.
+
+#### B. Clic destro: registro di Windows e script Nautilus
+
+**Asset**
+
+- Integrità di ciò che Explorer o Nautilus eseguono a nome dell'utente: la voce deve portare al programma giusto.
+- Integrità del registro dell'utente: nessuna voce residua, nessuna voce di altri programmi toccata.
+- Il percorso selezionato (dato non fidato, U3).
+
+**Progetto**
+
+1. Scrittura solo in `HKCU\Software\Classes` (nessun amministratore; manifest `asInvoker`), con `winreg`. Chiavi: `Directory\shell\<nome>`, `Directory\Background\shell\<nome>`, `*\shell\<nome>`, ciascuna con sottochiave `command`; `<nome>` fisso e proprio del programma. Mai scrittura tramite `HKEY_CLASSES_ROOT` (fonde utente e macchina).
+2. Valore di `command`: `"<percorso assoluto dell'exe>" --add "%1"`, per `Directory\Background` `"%V"`. Il percorso viene da `current_exe()`, mai da `PATH` o dalla cartella corrente, ed è tra virgolette (niente tentativi `C:\Program.exe`). Se contiene `"` o NUL, o la riga supera 260 caratteri, l'opzione non si accende e l'utente ne vede il motivo.
+3. `--add` consuma il valore successivo come percorso, anche se inizia con `-`; il parser non interpreta quel valore come opzione.
+4. All'avvio, con l'opzione accesa, si legge il comando e se differisce dal percorso corrente si riscrive (exe spostato). Se la chiave esiste ma il comando punta a un programma che non è questo, non si sovrascrive: si avvisa.
+5. Allo spegnimento dell'opzione si rimuovono solo le tre chiavi del nome fisso (`delete_subkey_all`). Il README descrive come toglierle a mano.
+6. Se la cartella dell'exe è scrivibile da gruppi diversi da utente, Administrators e SYSTEM, la voce non si registra (la voce eseguirebbe il codice altrui con l'identità dell'utente); la DACL si legge con le API di sistema.
+7. Linux: script in `~/.local/share/nautilus/scripts/`, creato con `create_new` e 0700, contenuto fisso generato dal programma. Percorso dell'eseguibile quotato con apici singoli (ogni `'` interno diventa `'\''`); si rifiuta un percorso con NUL o a capo. Contenuto: `exec '<exe>' --add -- "$@"`. Mai `eval`, mai espansioni senza virgolette. La cartella degli script deve essere dell'utente e non scrivibile da altri, altrimenti non si installa; aggiornamento con temporaneo e rinomina.
+
+**STRIDE**
+
+| STRIDE | Attaccante | Minaccia | Mitigazione | Test previsto |
+|---|---|---|---|---|
+| S | U2 | Chiave esistente di un altro programma con lo stesso nome | Nome proprio; confronto del comando esistente prima di sovrascrivere | Chiave con comando estraneo: non sovrascritta, avviso |
+| T | U1 | Modifica del comando in `HKCU` | `HKCU` è protetto da ACL di sistema contro altri utenti | Nessun test (garanzia del sistema); un processo dello stesso utente può modificarlo: rischio accettato |
+| T/E | U3 | Nome di file che esce dalle virgolette o diventa un'opzione (`"`, `& calc`, `-x`, `--add`) | `"%1"` tra virgolette (un nome di file Windows non contiene `"`); il valore dopo `--add` è un dato; su Linux `--` e `"$@"` | Partizioni sul parser degli argomenti (inizia con `-`, spazi, `&`, `%`, `^`, `;`, Unicode, vuoto, 32.000 caratteri); su Linux script generato eseguito con file chiamati `a'b`, `$(x)`, `-r`, `a b`, con a capo: un eseguibile finto riceve esattamente il percorso |
+| T/E | U1, U2 | Exe in cartella scrivibile da altri | Controllo della DACL della cartella dell'exe prima di registrare | Exe in cartella con ACE di scrittura per `Users`: opzione rifiutata con motivo |
+| T | U2 | Percorso con spazi non quotato | Virgolette sempre | Lettura del valore scritto e confronto con il formato atteso, con spazi e Unicode nel percorso |
+| R | tutti | Voce residua dopo la rimozione del programma | Rimozione allo spegnimento dell'opzione; istruzioni nel README; una voce verso un exe assente produce solo un errore di Explorer | Ciclo accendi-spegni: registro identico all'originale (confronto delle esportazioni) |
+| I | U2 | Percorso selezionato visibile nella riga di comando | Non evitabile con la shell; i percorsi non sono segreti | Rischio accettato |
+| D | U3 | Selezione di migliaia di elementi | Come parte A | Come parte A |
+| E | U2 | Tentativo di scrivere in `HKLM` o di elevarsi | Nessuna scrittura in `HKLM`; manifest `asInvoker`; nessuna auto-elevazione | Controllo del manifest e dei percorsi di registro nel codice (ricerca di `HKEY_LOCAL_MACHINE` in `cargo xtask check`) |
+
+**Rischi accettati (B)**
+
+- Un processo dello stesso utente può cambiare la voce, come può cambiare l'eseguibile o le impostazioni.
+- Su Windows 11 la voce sta in "Mostra altre opzioni" (sezione 5).
+- Il percorso selezionato è visibile nella riga di comando ad altri processi dell'utente.
+
+#### C. Cartelle private (dati, cache, log, rapporti di crash, temporanei)
+
+**Asset**
+
+- Testo dei documenti nella cache e nei temporanei delle voci aperte (riservatezza).
+- Token e nome della pipe, impostazioni, log e rapporti di crash (nessun estratto di testo, 4.7 D).
+- Integrità dei file propri: un file scritto da altri non deve passare per valido.
+
+**Progetto**
+
+1. Cartelle: dati (impostazioni, lock, token), cache, log, rapporti di crash e temporanea (`data_local_dir()/temp`, vedi `crates/lynkeus-app/src/platform/mod.rs`), tutte create con `create_private_dir`.
+2. Windows: `CreateDirectoryW` con `SECURITY_ATTRIBUTES` e descrittore esplicito, protetto (nessuna ereditarietà dal padre), con ACE ereditabili per il SID dell'utente (da `TokenUser`, non per nome) e per SYSTEM. Mai la DACL di default (contiene il SID della logon session, effimero) né una DACL nulla. Se la cartella esiste già, non ci si fida: si controllano proprietario e DACL e, se concedono scrittura ad altri, si rifiuta (cache e log spenti per la sessione, avviso all'utente). I file creati ereditano la DACL della cartella; il file del token riceve un descrittore esplicito anche alla creazione.
+3. Linux: cartelle 0700 già alla creazione, file con `O_CREAT|O_EXCL|O_NOFOLLOW` e 0600; la `umask` può solo restringere. Se la cartella esiste, controllo su descrittore aperto (`O_DIRECTORY|O_NOFOLLOW`, `fstat`): stesso uid, nessun permesso per gruppo e altri; altrimenti rifiuto, senza `chmod` silenziosi.
+4. Ogni file nuovo è `create_new` (`CREATE_NEW` / `O_EXCL`): se esiste, anche come collegamento, la creazione fallisce. Si scrive sull'handle ottenuto, senza riaprire per nome. Nomi derivati da hash o generati dal programma, mai dal documento o dalla voce.
+5. La cartella temporanea si svuota all'avvio (resti di un crash) e all'uscita. Un file ci resta al massimo 64 MiB, con estensione scelta dal programma da un elenco fisso, non dal nome della voce (4.7 C); i tipi eseguibili non si aprono (4.6).
+6. Le cartelle stanno sotto il profilo dell'utente (`directories`), mai sotto la radice di un volume né in cartelle condivise, dove l'ereditarietà aprirebbe la scrittura ad altri. Manifest `longPathAware`.
+7. Log e rapporti di crash riportano motivo e percorso, mai estratti di testo, token o nome della pipe.
+
+**STRIDE**
+
+| STRIDE | Attaccante | Minaccia | Mitigazione | Test previsto |
+|---|---|---|---|---|
+| S | U1 | Cartella pre-creata da altri con lo stesso nome, per far scrivere lì i dati | Cartelle nel profilo; se esiste, controllo di proprietario e permessi; rifiuto | Cartella preesistente con ACE per `Users` o 0777: rifiutata, cache e log spenti |
+| T | U1, U2 | Voce di cache o impostazioni alterata | Intestazione con versione e CRC, chiave `blake3`; cartella inaccessibile a U1 (U2 con gli stessi diritti: rischio accettato) | Implementato (4.7 E): `corrupt_entries_are_ignored_and_removed` |
+| T | U2, U3 | File preesistente, collegamento simbolico o hard link al posto del nome atteso | `create_new` non segue né sovrascrive; nomi da hash | `create_new_private_file` usa `create_new`; da scrivere il test con un collegamento preesistente (Linux: symlink; Windows: symlink o junction se i privilegi lo permettono) |
+| T | U3 | Nome di voce d'archivio usato come nome di file | Nome generato dal programma | `malevoli/percorsi.zip` (4.7 C) |
+| R | tutti | Nessuna traccia di chi ha scritto | Non rilevante: file locali di un solo utente; il log non è un registro di audit | |
+| I | U1 | Lettura di cache, temporanei, impostazioni, log | Descrittore esplicito utente+SYSTEM (Windows), 0700 e 0600 (Linux) | Windows: dopo la creazione `icacls` o `Get-ACL` mostrano solo proprietario e SYSTEM, ereditarietà disattivata, nessun `Users`, `Everyone`, `Authenticated Users`. Linux: `stat` = 0700 e 0600, con `umask` 0 e 077. Non implementato su Windows |
+| I | U2 | Lettura da un processo a integrità Low o con token ristretto | La DACL nomina solo l'utente; se un processo Low con lo stesso SID legge ancora, la risposta è un'etichetta di integrità Medium (`NO_READ_UP`), da adottare solo se la prova la mostra utile | Prova con un processo avviato a integrità Low; esito registrato qui |
+| I | U1 | Contenuto dei documenti nei log o nei rapporti di crash | Solo motivo e percorso | File con testo riconoscibile, poi ricerca nel log e nei rapporti (4.7 D) |
+| D | U2, U3 | Crescita illimitata di log, rapporti, temporanei | LRU per la cache (500 MB); rotazione dei log; numero massimo di rapporti (proposta 10); temporanei puliti all'avvio | Cache implementato (4.7 E); log, rapporti e temporanei previsti |
+| D | U1 | Disco pieno o nomi occupati nella cartella | Cartella inaccessibile ad altri; errore di scrittura = cache spenta, la ricerca continua | Scrittura che fallisce: ricerca completata |
+| E | U1, U3 | Un file della cartella viene eseguito o caricato | Il programma non esegue né carica nulla dalle cartelle dati; i tipi eseguibili non si aprono | Implementato: `executable_name_partitions`, `plan_partitions` |
+
+**Rischi accettati (C)**
+
+- Chi esegue codice con i diritti dell'utente legge cache, token e temporanei (sezione 5).
+- Backup del profilo, copie shadow, indicizzatori e cartelle sincronizzate possono copiare la cache: l'avviso nel README lo dice.
+- Dopo un crash una voce di cache può essere incompleta: la legge il CRC, che la scarta.
+- Su file system senza ACL né permessi (FAT, exFAT) il descrittore non si applica: il programma lo rileva, avvisa e spegne la cache.
+
+#### Incongruenze tra codice e documenti (4.8)
+
+- Windows: `create_private_dir` e `create_new_private_file` non impostano alcun descrittore (il commento nel codice rimanda alla fase 7). La parte C non è verificata su Windows.
+- Linux: `create_private_dir` non controlla proprietario e permessi di una cartella già esistente, e `recursive(true)` applica 0700 anche alle cartelle intermedie create (ammesso, ma da sapere).
+- Pipe, socket, lock, token, registro e script Nautilus non sono nel codice: le parti A e B sono solo progetto.
+- Il piano dice "istanza unica solo con `--add`"; qui si precisa che il canale esiste solo se l'opzione del clic destro è accesa (parte A, punto 9). Da confermare.
 
 ## 5. Rischi accettati
 

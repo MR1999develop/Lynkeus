@@ -294,7 +294,7 @@ Ogni fase finisce con `cargo xtask check` verde e un commit. Il lavoro si orches
 - [ ] Controlli verdi e commit
 
 ### Fase 7 — Lingue, integrazione e rilascio
-- [ ] Threat model della pipe e del registro
+- [x] Threat model della pipe e del registro
 - [ ] Traduzione inglese completa
 - [ ] Clic destro su Windows e script Nautilus
 - [ ] Istanza unica con pipe autenticata
