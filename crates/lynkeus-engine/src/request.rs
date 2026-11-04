@@ -27,7 +27,9 @@ pub struct SearchRequest {
 /// Quali file e cartelle si leggono.
 ///
 /// Si applicano dentro le cartelle radice; una radice scelta dall'utente (cartella o file)
-/// non è mai esclusa per nome, estensione o attributi, solo per dimensione.
+/// non è mai esclusa per nome, estensione o attributi nascosto e di sistema; dimensione massima e
+/// stato solo online valgono anche per lei. Radici duplicate o annidate non leggono due volte
+/// lo stesso file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Filters {
     /// Estensioni ammesse o escluse.
@@ -78,7 +80,7 @@ pub enum HiddenPolicy {
     Include,
 }
 
-/// File solo online (attributo `RECALL_ON_DATA_ACCESS` su Windows).
+/// File solo online (attributi `RECALL_ON_DATA_ACCESS`, `RECALL_ON_OPEN` o `OFFLINE` su Windows).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub enum OnlineFilesPolicy {
     /// Saltati (predefinito): leggerli li scaricherebbe.

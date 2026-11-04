@@ -12,8 +12,9 @@
 
 pub mod error;
 pub mod limits;
+mod platform;
 pub mod text;
 
 pub use error::ExtractError;
 pub use limits::{ArchiveLimits, LimitKind};
-pub use text::{DecodedText, TextEncoding, read_text};
+pub use text::{DecodedText, TextChunk, TextEncoding, TextReader, open_text, read_text};
