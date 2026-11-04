@@ -15,7 +15,8 @@ use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
 use fluent_templates::fluent_bundle::FluentValue;
 use lynkeus_app::i18n::{I18n, Language};
-use lynkeus_app::{Application, Settings, Tab, setup_context};
+use lynkeus_app::preview::Loaded;
+use lynkeus_app::{Application, Notice, PreviewState, Settings, Tab, setup_context};
 
 /// Tempo massimo per una ricerca nei file di prova.
 const SEARCH_DEADLINE: Duration = Duration::from_secs(60);
@@ -64,6 +65,96 @@ fn number(n: usize) -> [(&'static str, FluentValue<'static>); 1] {
 #[test]
 fn ar_finds_aragosta_through_the_window() {
     let (mut harness, i18n) = harness(Language::Italian);
+    search_ar_in_demo(&mut harness, &i18n);
+
+    // La riga ha anche file e posizione.
+    let file = std::path::Path::new("ricette").join("mare.txt");
+    let file = file.display().to_string();
+    assert!(
+        harness
+            .query_all_by_role_and_label(Role::Label, &file)
+            .next()
+            .is_some(),
+        "percorso relativo alla radice"
+    );
+    let line_12 = i18n.tr_args("location-line", &[("line", 12.into())]);
+    assert!(
+        harness
+            .query_all_by_role_and_label(Role::Label, &line_12)
+            .next()
+            .is_some(),
+        "posizione della riga 12"
+    );
+    assert_eq!(harness.state().view_state.tab, Tab::Results);
+
+    // Clic sulla riga: selezionata.
+    harness
+        .get_by_role_and_label(Role::Label, "l'aragosta")
+        .click();
+    harness.run();
+    assert_eq!(harness.state().view().selected_count(), 1);
+}
+
+#[test]
+fn clicking_aragosta_opens_the_preview_and_ctrl_c_copies_the_row() {
+    let (mut harness, i18n) = harness(Language::Italian);
+    search_ar_in_demo(&mut harness, &i18n);
+    assert!(harness.state().layout.preview_visible, "anteprima visibile");
+    harness
+        .get_by_role_and_label(Role::Label, "l'aragosta")
+        .click();
+
+    // L'anteprima si legge in un thread: si aspetta che sia pronta.
+    let deadline = Instant::now() + SEARCH_DEADLINE;
+    loop {
+        harness.step();
+        if matches!(harness.state().preview(), PreviewState::Ready(..)) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "anteprima non pronta");
+        std::thread::sleep(FRAME_PAUSE);
+    }
+    harness.run();
+
+    let PreviewState::Ready(_, Loaded::Units(preview)) = harness.state().preview().clone() else {
+        panic!("attese le righe del file: {:?}", harness.state().preview());
+    };
+    let focus = &preview.units[preview.focus];
+    assert_eq!(focus.text, "Cuocere l'aragosta per 10 minuti.");
+    let marked: Vec<&str> = focus
+        .highlights
+        .iter()
+        .map(|range| &focus.text[range.clone()])
+        .collect();
+    assert_eq!(marked, ["ar"]);
+    // Righe vicine (±20): la prima e l'ultima del file, che non contengono "ar".
+    for line in ["Ricetta del pesce al forno", "Buon appetito a tutti!"] {
+        assert!(
+            harness.query_by_label(line).is_some(),
+            "{line:?} nell'anteprima"
+        );
+    }
+    let focus_label = format!(
+        "› {}",
+        i18n.tr_args("location-line", &[("line", 12.into())])
+    );
+    assert!(
+        harness.query_by_label(&focus_label).is_some(),
+        "la riga del risultato è segnata anche senza colore"
+    );
+
+    // Ctrl+C (per eframe un evento "copia"): la riga negli appunti come TSV.
+    harness.input_mut().events.push(egui::Event::Copy);
+    harness.run();
+    assert_eq!(
+        harness.state().notice(),
+        Some(&Notice::Copied { rows: 1 }),
+        "conferma della copia"
+    );
+}
+
+/// Trascina `fixtures/demo` nella finestra, scrive "ar", preme Cerca e aspetta la fine.
+fn search_ar_in_demo(harness: &mut Harness<'static, Application>, i18n: &I18n) {
     // Primo frame: ogni controllo ha un nome accessibile (controllato da `run`).
     harness.run();
 
@@ -101,33 +192,6 @@ fn ar_finds_aragosta_through_the_window() {
         std::thread::sleep(FRAME_PAUSE);
     }
     harness.run();
-
-    // La riga ha anche file e posizione.
-    let file = std::path::Path::new("ricette").join("mare.txt");
-    let file = file.display().to_string();
-    assert!(
-        harness
-            .query_all_by_role_and_label(Role::Label, &file)
-            .next()
-            .is_some(),
-        "percorso relativo alla radice"
-    );
-    let line_12 = i18n.tr_args("location-line", &[("line", 12.into())]);
-    assert!(
-        harness
-            .query_all_by_role_and_label(Role::Label, &line_12)
-            .next()
-            .is_some(),
-        "posizione della riga 12"
-    );
-    assert_eq!(harness.state().view_state.tab, Tab::Results);
-
-    // Clic sulla riga: selezionata.
-    harness
-        .get_by_role_and_label(Role::Label, "l'aragosta")
-        .click();
-    harness.run();
-    assert_eq!(harness.state().view().selected_count(), 1);
 }
 
 #[test]

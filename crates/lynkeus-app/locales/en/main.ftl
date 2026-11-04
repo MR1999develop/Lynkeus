@@ -31,6 +31,16 @@ menu-search-panel = Search panel
 menu-theme = Theme
 menu-language = Language
 menu-about = About Lynkeus Searcher
+menu-open = Open
+menu-reveal = Show in folder
+menu-export = Export…
+menu-export-settings = Export settings…
+menu-copy = Copy
+menu-preview = Preview
+menu-next-in-file = Next result in file
+menu-previous-in-file = Previous result in file
+menu-next-file = Next file
+menu-previous-file = Previous file
 theme-system = Same as system
 theme-light = Light
 theme-dark = Dark
@@ -49,6 +59,15 @@ reason-too-many-terms = You have reached the maximum number of terms.
 reason-no-recent = No recent items yet.
 reason-one-term = Add at least two terms to choose how to combine them.
 reason-filters-default = The filters are already the default ones.
+reason-no-selection = Select at least one row.
+reason-no-current-row = Click a row of the results.
+reason-last-in-file = This is the last result in this file.
+reason-first-in-file = This is the first result in this file.
+reason-last-file = This is the last file in the results.
+reason-first-file = This is the first file in the results.
+reason-nothing-to-export = There are no results to export.
+reason-export-running = An export is already running.
+reason-export-no-selection = No rows selected: select some, or choose "All rows" in Export settings.
 
 ## Search form
 
@@ -108,6 +127,7 @@ action-close = Close
 drop-hint = Drop to add to the list
 dialog-add-folder = Add folders to search in
 dialog-add-file = Add files to search in
+dialog-export = Export the results
 
 ## Form errors
 
@@ -243,3 +263,59 @@ warning-limit-ratio = Suspicious compression, possibly a malicious archive
 warning-limit-memory = Out of memory while reading
 warning-content-mismatch = Content does not match the extension
 warning-no-text = No text, maybe a scan
+
+## Preview
+
+preview-empty = Click a result to see its preview.
+preview-loading = Reading the file…
+preview-context-only = The full preview of this kind of document will come with the document extractor; meanwhile, here is the context found.
+preview-previous-file = « File
+preview-previous = ‹ Previous
+preview-next = Next ›
+preview-next-file = File »
+preview-open = Open
+# $file (text): file path; $location (text): position, e.g. "line 12".
+preview-title = { $file } — { $location }
+# $reason (text): reason, as in the Warnings tab.
+preview-unreadable = Preview not available: { $reason }.
+preview-changed = Preview not available: the file changed after the search. Search again to update the results.
+preview-no-thread = Preview not available: the system has no free resources. Close some programs and try again.
+
+## Messages above the table
+
+notice-executable = For safety, programs and scripts are not opened from here: use "Show in folder" and open it from there if you trust it.
+notice-archive-entry = Files inside archives cannot be opened from here yet: use "Show in folder" to open the archive.
+# $file (text): file path.
+notice-open-failed = Error: { $file } did not open. Check that it still exists and that there is a program to open it.
+# $file (text): file path.
+notice-reveal-failed = Error: { $file } could not be shown in its folder. Check that it still exists.
+# $count (number): rows copied.
+notice-copied = { $count ->
+        [one] 1 row copied to the clipboard.
+       *[other] { $count } rows copied to the clipboard.
+    }
+# $count (number): rows written; $file (text): exported file.
+notice-exported = { $count ->
+        [one] 1 row exported to { $file }.
+       *[other] { $count } rows exported to { $file }.
+    }
+# $file (text): file that was to be written.
+notice-export-failed = Error: export to { $file } failed; an existing file was left untouched. Choose another folder or check the free space.
+notice-no-thread = Error: the system has no free resources. Close some programs and try again.
+
+## Export
+
+export-dialog-title = Export settings
+export-format-title = Format
+# $separator (text): character between columns.
+export-format-csv-choice = CSV for spreadsheets (columns separated by { $separator })
+export-format-csv = CSV
+export-format-txt = Text with tab-separated columns
+export-scope-title = Rows
+# $count (number): rows in the table.
+export-scope-visible = All rows ({ $count })
+# $count (number): selected rows.
+export-scope-selected = Selected rows only ({ $count })
+export-dialog-confirm = Export…
+# Suggested file name, without extension.
+export-file-name = results

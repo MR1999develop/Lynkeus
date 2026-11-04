@@ -12,7 +12,10 @@
 //! dello stato durante la ricerca, input).
 
 mod commands;
+mod export_dialog;
 mod menu;
+mod notice;
+mod preview;
 mod search_panel;
 mod status;
 mod table;
@@ -22,8 +25,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use egui::{Align2, Id, RichText, Ui};
+use lynkeus_engine::{DocPath, Notify};
 
-use crate::app::{Application, MAX_HITS_PER_FRAME, Pump, Tab};
+use crate::app::{Application, MAX_HITS_PER_FRAME, Notice, Pump, Tab};
+use crate::export::ExportFormat;
 use crate::form::RootKind;
 use crate::i18n::Language;
 use crate::results::{ClickKind, SortColumn};
@@ -51,6 +56,17 @@ pub(crate) enum Action {
     SetTheme(ThemeChoice),
     SetLanguage(Option<Language>),
     ResetFilters,
+    DismissNotice,
+    Reveal(Arc<DocPath>),
+    /// Chiude il dialogo delle impostazioni di esportazione; con `true` le applica ed
+    /// esporta.
+    CloseExportDialog(bool),
+}
+
+/// Chi avvisare quando un lavoro in background finisce: un nuovo frame.
+fn repaint(ctx: &egui::Context) -> Notify {
+    let ctx = ctx.clone();
+    Arc::new(move || ctx.request_repaint())
 }
 
 /// Prepara il contesto: font, token del tema, preferenza Sistema/Chiaro/Scuro. Da chiamare
@@ -73,6 +89,8 @@ impl eframe::App for Application {
         if self.is_searching() {
             ctx.request_repaint_after(STATUS_REFRESH);
         }
+        self.pump_actions();
+        self.update_preview(&repaint(ctx));
     }
 
     fn ui(&mut self, ui: &mut Ui, frame: &mut eframe::Frame) {
@@ -84,6 +102,9 @@ impl eframe::App for Application {
         if self.limit_reached() {
             egui::Panel::top("limit_banner").show(ui, |ui| limit_banner(self, ui));
         }
+        if self.notice().is_some() {
+            egui::Panel::top("notice").show(ui, |ui| notice::bar(self, ui, &mut actions));
+        }
         egui::Panel::bottom("status").show(ui, |ui| status::bar(self, ui));
         if self.layout.search_panel_visible {
             let range = LayoutSettings::PANEL_RANGE;
@@ -94,10 +115,9 @@ impl eframe::App for Application {
                 .show(ui, |ui| search_panel::show(self, ui, &mut actions));
             self.layout.search_panel_width = shown.response.rect.width();
         }
-        // Fase 6: l'anteprima andrà in un pannello inferiore ridimensionabile dentro
-        // quest'area, sotto la tabella.
         egui::CentralPanel::default().show(ui, |ui| central(self, ui, &mut actions));
         about_window(self, ui.ctx());
+        export_dialog::show(self, ui.ctx(), &mut actions);
         drop_hint(self, ui.ctx());
 
         for action in actions {
@@ -125,8 +145,16 @@ impl eframe::App for Application {
 }
 
 /// Le scorciatoie, lette una volta per frame nell'ordine di [`Command::SHORTCUT_ORDER`].
+///
+/// Con un dialogo aperto nessuna: Invio ed Esc sono del dialogo. Invio apre il risultato
+/// solo se nessun controllo ha il focus (altrimenti attiva quel controllo). Ctrl+C arriva
+/// da eframe come evento "copia", non come tasto.
 fn read_shortcuts(app: &Application, ctx: &egui::Context, actions: &mut Vec<Action>) {
+    if app.view_state.export_dialog.is_some() || app.view_state.about_open {
+        return;
+    }
     let typing = ctx.egui_wants_keyboard_input();
+    let focused = ctx.memory(|m| m.focused().is_some());
     for command in Command::SHORTCUT_ORDER {
         let Some(shortcut) = command.shortcut() else {
             continue;
@@ -134,10 +162,17 @@ fn read_shortcuts(app: &Application, ctx: &egui::Context, actions: &mut Vec<Acti
         if typing && command.yields_to_text_fields() {
             continue;
         }
+        if focused && command == Command::Open {
+            continue;
+        }
         if command.availability(app).is_err() {
             continue;
         }
-        if ctx.input_mut(|i| i.consume_shortcut(&shortcut)) {
+        let pressed = ctx.input_mut(|i| {
+            let copy_event = command == Command::Copy && consume_copy_event(i);
+            copy_event || i.consume_shortcut(&shortcut)
+        });
+        if pressed {
             actions.push(Action::Command(command));
         }
     }
@@ -157,6 +192,15 @@ fn read_shortcuts(app: &Application, ctx: &egui::Context, actions: &mut Vec<Acti
             actions.push(Action::MoveCursor(-1, shift));
         }
     }
+}
+
+/// Toglie dagli eventi del frame la richiesta "copia" (Ctrl+C); vero se c'era.
+fn consume_copy_event(input: &mut egui::InputState) -> bool {
+    let before = input.events.len();
+    input
+        .events
+        .retain(|event| !matches!(event, egui::Event::Copy));
+    input.events.len() != before
 }
 
 /// Cartelle e file trascinati nella finestra.
@@ -233,7 +277,21 @@ fn central(app: &mut Application, ui: &mut Ui, actions: &mut Vec<Action>) {
     });
     ui.separator();
     match app.view_state.tab {
-        Tab::Results => table::results(app, ui, actions),
+        Tab::Results => {
+            if app.layout.preview_visible && !app.view().is_empty() {
+                let range = LayoutSettings::PREVIEW_RANGE;
+                let shown = egui::Panel::bottom("preview")
+                    .resizable(true)
+                    .size_range(*range.start()..=*range.end())
+                    .default_size(app.layout.preview_height)
+                    .show(ui, |ui| preview::show(app, ui, actions));
+                let height = shown.response.rect.height();
+                if height.is_finite() {
+                    app.layout.preview_height = height.clamp(*range.start(), *range.end());
+                }
+            }
+            table::results(app, ui, actions);
+        }
         Tab::Warnings => table::warnings(app, ui),
     }
 }
@@ -292,6 +350,42 @@ fn apply(app: &mut Application, ctx: &egui::Context, frame: &eframe::Frame, acti
         }
         Action::SetLanguage(language) => app.set_language(language),
         Action::ResetFilters => app.form.filters.reset(),
+        Action::DismissNotice => app.dismiss_notice(),
+        Action::Reveal(doc) => {
+            app.dismiss_notice();
+            app.reveal(&doc, &repaint(ctx));
+        }
+        Action::CloseExportDialog(confirmed) => {
+            let draft = app.view_state.export_dialog.take();
+            if let (true, Some(settings)) = (confirmed, draft) {
+                app.set_export_settings(settings);
+                if Command::Export.availability(app).is_ok() {
+                    export(app, ctx, frame);
+                }
+            }
+        }
+    }
+}
+
+/// Chiede dove salvare (dialogo di sistema, che conferma la sovrascrittura di un file
+/// esistente) ed esporta con le ultime scelte.
+fn export(app: &mut Application, ctx: &egui::Context, frame: &eframe::Frame) {
+    let i18n = app.i18n();
+    let settings = app.export_settings();
+    let extension = settings.format.extension();
+    let filter_id = match settings.format {
+        ExportFormat::Csv => "export-format-csv",
+        ExportFormat::Txt => "export-format-txt",
+    };
+    let mut dialog = rfd::FileDialog::new()
+        .set_title(i18n.tr("dialog-export"))
+        .set_file_name(format!("{}.{extension}", i18n.tr("export-file-name")))
+        .add_filter(i18n.tr(filter_id), &[extension]);
+    if let Some(dir) = &settings.last_dir {
+        dialog = dialog.set_directory(dir);
+    }
+    if let Some(path) = dialog.set_parent(frame).save_file() {
+        app.export_to(path, &repaint(ctx));
     }
 }
 
@@ -313,6 +407,24 @@ fn run_command(
             for path in picked.unwrap_or_default() {
                 app.add_root(path);
             }
+        }
+        Command::Open => app.open_current(&repaint(ctx)),
+        Command::Reveal => app.reveal_current(&repaint(ctx)),
+        Command::Export => export(app, ctx, frame),
+        Command::ExportSettings => {
+            app.view_state.export_dialog = Some(app.export_settings().clone());
+        }
+        Command::Copy => {
+            if let Some((tsv, rows)) = app.selection_tsv() {
+                ctx.copy_text(tsv);
+                app.set_notice(Notice::Copied { rows });
+            }
+        }
+        Command::Step(step) => {
+            app.step(step);
+        }
+        Command::TogglePreview => {
+            app.layout.preview_visible = !app.layout.preview_visible;
         }
         Command::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
         Command::SelectAll => app.view_mut().select_all(),

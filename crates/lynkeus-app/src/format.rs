@@ -162,6 +162,20 @@ pub fn word(hit: &Hit) -> String {
     text
 }
 
+/// Testo del contesto senza evidenziazione, con "…" dove la riga continua (per esportare e
+/// copiare).
+pub fn context_text(snippet: &lynkeus_core::Snippet) -> String {
+    let mut text = String::with_capacity(snippet.text.len() + 2 * ELLIPSIS.len());
+    if snippet.truncated_start {
+        text.push_str(ELLIPSIS);
+    }
+    text.push_str(&snippet.text);
+    if snippet.truncated_end {
+        text.push_str(ELLIPSIS);
+    }
+    text
+}
+
 /// Riga di stato.
 pub fn status(i18n: &I18n, status: &SearchStatus, max_results: usize) -> String {
     match status {

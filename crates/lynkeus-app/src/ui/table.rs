@@ -146,10 +146,36 @@ pub(super) fn results(app: &mut Application, ui: &mut Ui, actions: &mut Vec<Acti
                     let kind = ui_click_kind(&response);
                     actions.push(Action::ClickRow(position, kind));
                 }
+                if response.double_clicked() {
+                    // Il clic ha già portato il cursore su questa riga.
+                    actions.push(Action::Command(Command::Open));
+                }
+                if response.secondary_clicked() && !view.is_selected(hit_index) {
+                    actions.push(Action::ClickRow(position, ClickKind::Replace));
+                }
+                response.context_menu(|ui| row_menu(app_ref, ui, actions));
             });
         });
     if let Some(widths) = new_widths {
         store_widths(&mut app.layout.columns, &widths, with_terms);
+    }
+}
+
+/// Menu contestuale di una riga: gli stessi comandi dei menu File e Modifica.
+///
+/// Il clic destro su una riga non selezionata la seleziona e ci porta il cursore, come in
+/// Esplora file; su una riga già selezionata lascia la selezione com'è (per copiarla).
+fn row_menu(app: &Application, ui: &mut Ui, actions: &mut Vec<Action>) {
+    let i18n = app.i18n();
+    for command in [Command::Open, Command::Reveal, Command::Copy] {
+        let mut button = Button::new(i18n.tr(command.label_id()));
+        if let Some(shortcut) = command.shortcut() {
+            button = button.shortcut_text(ui.ctx().format_shortcut(&shortcut));
+        }
+        if ui.add(button).clicked() {
+            actions.push(Action::Command(command));
+            ui.close();
+        }
     }
 }
 
@@ -182,7 +208,7 @@ fn store_widths(columns: &mut ColumnWidths, widths: &[f32], with_terms: bool) {
 }
 
 /// Il contesto con le corrispondenze evidenziate, e "…" dove la riga continua.
-fn context_job(snippet: &Snippet, tokens: &Tokens) -> LayoutJob {
+pub(super) fn context_job(snippet: &Snippet, tokens: &Tokens) -> LayoutJob {
     let normal = TextFormat::simple(FontId::proportional(theme::BODY_SIZE), tokens.text_strong);
     let highlight = TextFormat {
         font_id: FontId::new(theme::BODY_SIZE, theme::semibold_family()),

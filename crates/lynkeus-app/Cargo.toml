@@ -25,6 +25,7 @@ egui_extras.workspace = true
 fluent-templates.workspace = true
 lynkeus-core.workspace = true
 lynkeus-engine.workspace = true
+lynkeus-extract.workspace = true
 rfd.workspace = true
 serde.workspace = true
 sys-locale.workspace = true
@@ -33,7 +34,14 @@ toml.workspace = true
 
 [dev-dependencies]
 egui_kittest.workspace = true
+proptest.workspace = true
 tempfile.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+opener.workspace = true
+
+[target.'cfg(not(windows))'.dependencies]
+zbus.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Non usato nel codice: attiva Wayland caricato a runtime e le decorazioni su GNOME.

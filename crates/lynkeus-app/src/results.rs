@@ -85,6 +85,25 @@ pub enum ClickKind {
     Range,
 }
 
+/// Un passo tra i risultati, dall'anteprima o dal menu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Step {
+    /// Risultato successivo nello stesso file.
+    NextInFile,
+    /// Risultato precedente nello stesso file.
+    PreviousInFile,
+    /// Primo risultato del file successivo.
+    NextFile,
+    /// Primo risultato del file precedente.
+    PreviousFile,
+}
+
+/// Vero se le due righe sono dello stesso documento (le righe di un file condividono lo
+/// stesso `Arc`: il confronto per puntatore basta quasi sempre).
+fn same_doc(a: &Arc<DocPath>, b: &Arc<DocPath>) -> bool {
+    Arc::ptr_eq(a, b) || a == b
+}
+
 /// Ordine mostrato e selezione delle righe.
 #[derive(Debug, Clone, Default)]
 pub struct ResultsView {
@@ -221,6 +240,55 @@ impl ResultsView {
         };
         self.click(target, kind);
         self.scroll_pending = true;
+    }
+
+    /// Il risultato con il cursore della tastiera (l'ultimo cliccato o raggiunto con le
+    /// frecce): è quello che "Apri" apre e l'anteprima mostra.
+    pub fn cursor_hit(&self) -> Option<usize> {
+        self.cursor
+    }
+
+    /// Porta cursore e selezione sulla riga in posizione `position` e la tabella in vista
+    /// (precedente/successiva dell'anteprima). Fuori dai limiti non fa nulla.
+    pub fn jump_to(&mut self, position: usize) {
+        if position < self.order.len() {
+            self.click(position, ClickKind::Replace);
+            self.scroll_pending = true;
+        }
+    }
+
+    /// La posizione a cui porta `step` partendo dal cursore, nell'ordine mostrato; `None`
+    /// se non c'è un cursore o se non c'è una riga in quella direzione.
+    ///
+    /// - [`Step::NextInFile`]/[`Step::PreviousInFile`]: la riga dopo/prima dello stesso
+    ///   documento;
+    /// - [`Step::NextFile`]: la prima riga dopo il cursore di un altro documento;
+    /// - [`Step::PreviousFile`]: l'inizio del gruppo di righe consecutive del documento che
+    ///   precede quello del cursore.
+    ///
+    /// Tempo lineare nel numero di righe.
+    pub fn step_target(&self, hits: &[Hit], step: Step) -> Option<usize> {
+        let current = self.cursor_position()?;
+        let doc_at = |position: usize| -> Option<&Arc<DocPath>> {
+            hits.get(self.hit_at(position)?).map(|hit| &hit.doc)
+        };
+        let here = doc_at(current)?;
+        let same = |position: usize| doc_at(position).is_some_and(|doc| same_doc(doc, here));
+        let mut after = current.saturating_add(1)..self.order.len();
+        match step {
+            Step::NextInFile => after.find(|&p| same(p)),
+            Step::PreviousInFile => (0..current).rev().find(|&p| same(p)),
+            Step::NextFile => after.find(|&p| !same(p)),
+            Step::PreviousFile => {
+                let end = (0..current).rev().find(|&p| !same(p))?;
+                let target = doc_at(end)?;
+                let mut start = end;
+                while start > 0 && doc_at(start - 1).is_some_and(|doc| same_doc(doc, target)) {
+                    start -= 1;
+                }
+                Some(start)
+            }
+        }
     }
 
     /// Posizione mostrata del cursore.
@@ -533,6 +601,51 @@ mod tests {
         let mut empty = ResultsView::new(None);
         empty.move_cursor(1, false);
         assert_eq!(empty.cursor_position(), None);
+    }
+
+    #[test]
+    fn steps_between_results_and_files() {
+        let hits = sample();
+        let mut view = ResultsView::new(None);
+        view.finish(&hits, &roots());
+        // Ordine mostrato: a.txt, a.txt, b.txt, b.txt (ogni riga con un suo `Arc`).
+        assert_eq!(
+            view.step_target(&hits, Step::NextInFile),
+            None,
+            "senza cursore"
+        );
+
+        view.jump_to(0);
+        assert_eq!(view.cursor_hit(), view.hit_at(0));
+        assert_eq!(view.selected_count(), 1);
+        assert_eq!(view.take_scroll_target(), Some(0));
+        assert_eq!(view.step_target(&hits, Step::NextInFile), Some(1));
+        assert_eq!(view.step_target(&hits, Step::PreviousInFile), None);
+        assert_eq!(view.step_target(&hits, Step::NextFile), Some(2));
+        assert_eq!(view.step_target(&hits, Step::PreviousFile), None);
+
+        view.jump_to(3);
+        assert_eq!(view.step_target(&hits, Step::PreviousInFile), Some(2));
+        assert_eq!(view.step_target(&hits, Step::NextInFile), None);
+        assert_eq!(view.step_target(&hits, Step::NextFile), None);
+        assert_eq!(view.step_target(&hits, Step::PreviousFile), Some(0));
+
+        // Fuori dai limiti: nulla cambia.
+        view.jump_to(9);
+        assert_eq!(view.cursor_position(), Some(3));
+    }
+
+    #[test]
+    fn steps_follow_the_displayed_order_when_files_are_mixed() {
+        let hits = sample();
+        let mut view = ResultsView::new(None);
+        // Per parola: Aragosta (a), carta (b), chitarra (b), mare (a).
+        view.set_sort(SortSpec::ascending(SortColumn::Word), &hits, &roots());
+        view.jump_to(0);
+        assert_eq!(view.step_target(&hits, Step::NextInFile), Some(3));
+        assert_eq!(view.step_target(&hits, Step::NextFile), Some(1));
+        view.jump_to(3);
+        assert_eq!(view.step_target(&hits, Step::PreviousFile), Some(1));
     }
 
     /// 200 000 righe da 2 000 file (100 righe per file, file condivisi come nel motore),

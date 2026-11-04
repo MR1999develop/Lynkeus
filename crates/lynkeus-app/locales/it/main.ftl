@@ -31,6 +31,16 @@ menu-search-panel = Pannello di ricerca
 menu-theme = Tema
 menu-language = Lingua
 menu-about = Informazioni su Lynkeus Searcher
+menu-open = Apri
+menu-reveal = Mostra nella cartella
+menu-export = Esporta…
+menu-export-settings = Impostazioni di esportazione…
+menu-copy = Copia
+menu-preview = Anteprima
+menu-next-in-file = Risultato successivo nel file
+menu-previous-in-file = Risultato precedente nel file
+menu-next-file = File successivo
+menu-previous-file = File precedente
 theme-system = Come il sistema
 theme-light = Chiaro
 theme-dark = Scuro
@@ -49,6 +59,15 @@ reason-too-many-terms = Hai raggiunto il numero massimo di termini.
 reason-no-recent = Ancora nessun elemento recente.
 reason-one-term = Aggiungi almeno due termini per scegliere come combinarli.
 reason-filters-default = I filtri sono già quelli predefiniti.
+reason-no-selection = Seleziona almeno una riga.
+reason-no-current-row = Fai clic su una riga dei risultati.
+reason-last-in-file = È l'ultimo risultato di questo file.
+reason-first-in-file = È il primo risultato di questo file.
+reason-last-file = È l'ultimo file dei risultati.
+reason-first-file = È il primo file dei risultati.
+reason-nothing-to-export = Non ci sono risultati da esportare.
+reason-export-running = Un'esportazione è già in corso.
+reason-export-no-selection = Nessuna riga selezionata: selezionane qualcuna, o scegli "Tutte le righe" in Impostazioni di esportazione.
 
 ## Modulo di ricerca
 
@@ -108,6 +127,7 @@ action-close = Chiudi
 drop-hint = Rilascia per aggiungere all'elenco
 dialog-add-folder = Aggiungi cartelle in cui cercare
 dialog-add-file = Aggiungi file in cui cercare
+dialog-export = Esporta i risultati
 
 ## Errori del modulo
 
@@ -243,3 +263,59 @@ warning-limit-ratio = Compressione sospetta, possibile archivio malevolo
 warning-limit-memory = Memoria esaurita durante la lettura
 warning-content-mismatch = Il contenuto non corrisponde all'estensione
 warning-no-text = Nessun testo, forse una scansione
+
+## Anteprima
+
+preview-empty = Fai clic su un risultato per vederne l'anteprima.
+preview-loading = Lettura del file…
+preview-context-only = L'anteprima completa di questo tipo di documento arriverà con l'estrattore dei documenti; intanto ecco il contesto trovato.
+preview-previous-file = « File
+preview-previous = ‹ Precedente
+preview-next = Successivo ›
+preview-next-file = File »
+preview-open = Apri
+# $file (testo): percorso del file; $location (testo): posizione, es. "riga 12".
+preview-title = { $file } — { $location }
+# $reason (testo): motivo, come nella scheda Avvisi.
+preview-unreadable = Anteprima non disponibile: { $reason }.
+preview-changed = Anteprima non disponibile: il file è cambiato dopo la ricerca. Ripeti la ricerca per aggiornare i risultati.
+preview-no-thread = Anteprima non disponibile: il sistema non ha risorse libere. Chiudi qualche programma e riprova.
+
+## Messaggi sopra la tabella
+
+notice-executable = Per sicurezza i programmi e gli script non si aprono da qui: usa "Mostra nella cartella" e aprilo da lì se ti fidi.
+notice-archive-entry = I file dentro gli archivi non si possono ancora aprire da qui: usa "Mostra nella cartella" per aprire l'archivio.
+# $file (testo): percorso del file.
+notice-open-failed = Errore: { $file } non si è aperto. Controlla che esista ancora e che ci sia un programma per aprirlo.
+# $file (testo): percorso del file.
+notice-reveal-failed = Errore: non è stato possibile mostrare { $file } nella cartella. Controlla che esista ancora.
+# $count (numero): righe copiate.
+notice-copied = { $count ->
+        [one] 1 riga copiata negli appunti.
+       *[other] { $count } righe copiate negli appunti.
+    }
+# $count (numero): righe scritte; $file (testo): file esportato.
+notice-exported = { $count ->
+        [one] 1 riga esportata in { $file }.
+       *[other] { $count } righe esportate in { $file }.
+    }
+# $file (testo): file che si voleva scrivere.
+notice-export-failed = Errore: esportazione in { $file } non riuscita; un file già presente non è stato toccato. Scegli un'altra cartella o controlla lo spazio libero.
+notice-no-thread = Errore: il sistema non ha risorse libere. Chiudi qualche programma e riprova.
+
+## Esportazione
+
+export-dialog-title = Impostazioni di esportazione
+export-format-title = Formato
+# $separator (testo): carattere che separa le colonne.
+export-format-csv-choice = CSV per i fogli di calcolo (colonne separate da { $separator })
+export-format-csv = CSV
+export-format-txt = Testo con colonne separate da tabulazioni
+export-scope-title = Righe
+# $count (numero): righe della tabella.
+export-scope-visible = Tutte le righe ({ $count })
+# $count (numero): righe selezionate.
+export-scope-selected = Solo le righe selezionate ({ $count })
+export-dialog-confirm = Esporta…
+# Nome proposto per il file, senza estensione.
+export-file-name = risultati
