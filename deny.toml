@@ -42,6 +42,8 @@ allow = [
     "CC0-1.0",
     "BSL-1.0",
     "Unlicense",
+    # Solo libfuzzer-sys nel crate fuzz/ (fuori dal workspace): licenza permissiva compatibile con GPLv3.
+    "NCSA",
 ]
 confidence-threshold = 0.93
 # L'allowlist è decisa per tutto il progetto: le voci non ancora usate non sono un avviso.
