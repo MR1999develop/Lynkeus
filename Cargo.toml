@@ -70,6 +70,10 @@ egui_kittest = { version = "0.37.0", default-features = false, features = ["efra
 fluent-templates = "0.15.1"
 ignore = "0.4.34"
 memchr = "2.8.3"
+# Apre un file con il programma predefinito (ShellExecuteW) e lo mostra nella cartella
+# (SHOpenFolderAndSelectItems). Solo su Windows: su Linux opener cercherebbe `xdg-open`
+# per nome, quindi lì si usa il portale XDG con `zbus`.
+opener = { version = "0.9.0", default-features = false, features = ["reveal"] }
 # Solo per i test di proprietà (dev-dependency).
 proptest = "1.12.0"
 regex = "1.13.1"
@@ -82,6 +86,9 @@ thiserror = "2.0.21"
 toml = { version = "1.1.8", default-features = false, features = ["parse", "display", "serde"] }
 # NFC/NFD dei termini e tabella delle varianti accentate (lynkeus-core).
 unicode-normalization = "0.1.26"
+# Portale XDG OpenURI (OpenFile, OpenDirectory) su Linux: apre e mostra i file senza
+# avviare programmi cercati per nome. Già nell'albero tramite AccessKit.
+zbus = { version = "5.19.0", default-features = false, features = ["async-io", "blocking-api"] }
 # Solo per le feature Linux che eframe attiverebbe con `winit/default`: Wayland caricato a
 # runtime e decorazioni client su GNOME. `-notitle` evita `ab_glyph` → `ttf-parser`
 # (RUSTSEC-2026-0192, non mantenuto): la barra c'è, senza il titolo scritto.

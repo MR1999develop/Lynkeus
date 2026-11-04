@@ -9,6 +9,7 @@ use egui::{Button, Ui};
 use super::{Action, Command};
 use crate::app::{Application, Tab};
 use crate::i18n::Language;
+use crate::results::Step;
 use crate::theme::ThemeChoice;
 
 pub(super) fn bar(app: &Application, ui: &mut Ui, actions: &mut Vec<Action>) {
@@ -19,9 +20,17 @@ pub(super) fn bar(app: &Application, ui: &mut Ui, actions: &mut Vec<Action>) {
             item(app, ui, Command::AddFile, actions);
             recent_roots(app, ui, actions);
             ui.separator();
+            item(app, ui, Command::Open, actions);
+            item(app, ui, Command::Reveal, actions);
+            ui.separator();
+            item(app, ui, Command::Export, actions);
+            item(app, ui, Command::ExportSettings, actions);
+            ui.separator();
             item(app, ui, Command::Quit, actions);
         });
         ui.menu_button(i18n.tr("menu-edit"), |ui| {
+            item(app, ui, Command::Copy, actions);
+            ui.separator();
             item(app, ui, Command::SelectAll, actions);
             item(app, ui, Command::SelectNone, actions);
         });
@@ -34,6 +43,15 @@ pub(super) fn bar(app: &Application, ui: &mut Ui, actions: &mut Vec<Action>) {
             recent_terms(app, ui, actions);
             ui.separator();
             item(app, ui, Command::ToggleFilters, actions);
+            ui.separator();
+            for step in [
+                Step::NextInFile,
+                Step::PreviousInFile,
+                Step::NextFile,
+                Step::PreviousFile,
+            ] {
+                item(app, ui, Command::Step(step), actions);
+            }
         });
         ui.menu_button(i18n.tr("menu-view"), |ui| {
             check_item(
@@ -56,6 +74,13 @@ pub(super) fn bar(app: &Application, ui: &mut Ui, actions: &mut Vec<Action>) {
                 ui,
                 Command::ToggleSearchPanel,
                 app.layout.search_panel_visible,
+                actions,
+            );
+            check_item(
+                app,
+                ui,
+                Command::TogglePreview,
+                app.layout.preview_visible,
                 actions,
             );
             ui.separator();

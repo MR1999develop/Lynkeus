@@ -9,6 +9,8 @@
 //!   copre i caratteri mancanti (CJK e altri alfabeti).
 //! - Cartella di configurazione (`settings.toml` e posizione della finestra).
 //! - Flush della cartella dopo una rinomina durevole.
+//! - Apertura di un file con il programma predefinito e "Mostra nella cartella".
+//! - Ordine dei bottoni nei dialoghi.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -43,6 +45,77 @@ pub fn sync_dir(dir: &Path) -> std::io::Result<()> {
 /// Vedi la versione per Linux.
 #[cfg(windows)]
 pub fn sync_dir(_dir: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Ordine dei bottoni nei dialoghi: su Windows l'azione prima di Annulla, su GNOME
+/// Annulla prima dell'azione.
+#[cfg(windows)]
+pub const ACTION_BUTTON_FIRST: bool = true;
+/// Vedi la versione per Windows.
+#[cfg(not(windows))]
+pub const ACTION_BUTTON_FIRST: bool = false;
+
+/// Apre `path` (assoluto) con il programma predefinito del sistema. Blocca per poco ma non
+/// garantisce un tempo: da chiamare fuori dal thread dell'interfaccia.
+///
+/// Windows: `ShellExecuteW` con il verbo "open" (crate `opener`), cioè l'associazione dei
+/// tipi di file; nessun programma cercato per nome.
+#[cfg(windows)]
+pub fn open_with_default_program(path: &Path) -> std::io::Result<()> {
+    opener::open(path).map_err(open_error)
+}
+
+/// Mostra `path` (assoluto) selezionato nella sua cartella.
+///
+/// Windows: `SHOpenFolderAndSelectItems` (crate `opener`).
+#[cfg(windows)]
+pub fn reveal_in_folder(path: &Path) -> std::io::Result<()> {
+    opener::reveal(path).map_err(open_error)
+}
+
+#[cfg(windows)]
+fn open_error(error: opener::OpenError) -> std::io::Error {
+    match error {
+        opener::OpenError::Io(error) => error,
+        other => std::io::Error::other(other.to_string()),
+    }
+}
+
+/// Linux: metodo `OpenFile` del portale XDG `org.freedesktop.portal.OpenURI`, con il file
+/// passato come descrittore aperto (nessun programma cercato per nome, nessun URI da
+/// comporre).
+#[cfg(not(windows))]
+pub fn open_with_default_program(path: &Path) -> std::io::Result<()> {
+    call_open_uri_portal("OpenFile", path)
+}
+
+/// Linux: metodo `OpenDirectory` del portale XDG, che apre la cartella del file.
+#[cfg(not(windows))]
+pub fn reveal_in_folder(path: &Path) -> std::io::Result<()> {
+    call_open_uri_portal("OpenDirectory", path)
+}
+
+/// Chiama `method(parent_window, fd, options)` del portale OpenURI sul bus di sessione.
+#[cfg(not(windows))]
+fn call_open_uri_portal(method: &str, path: &Path) -> std::io::Result<()> {
+    use std::collections::HashMap;
+    use std::os::fd::AsFd;
+
+    use zbus::zvariant::{Fd, Value};
+
+    let file = std::fs::File::open(path)?;
+    let connection = zbus::blocking::Connection::session().map_err(std::io::Error::other)?;
+    let options: HashMap<&str, Value<'_>> = HashMap::new();
+    connection
+        .call_method(
+            Some("org.freedesktop.portal.Desktop"),
+            "/org/freedesktop/portal/desktop",
+            Some("org.freedesktop.portal.OpenURI"),
+            method,
+            &("", Fd::from(file.as_fd()), options),
+        )
+        .map_err(std::io::Error::other)?;
     Ok(())
 }
 

@@ -12,7 +12,8 @@
 //!
 //! [search]                   # opzioni, radici e termini correnti e recenti
 //! [filters]                  # estensioni, cartelle da saltare, nascosti, solo online, dimensione
-//! [layout]                   # pannello, colonne, ordinamento
+//! [layout]                   # pannelli, anteprima, colonne, ordinamento
+//! [export]                   # formato, righe, ultima cartella di salvataggio
 //! ```
 //!
 //! Lettura tollerante: ogni campo si legge da solo, un valore mancante o non valido prende
@@ -30,6 +31,7 @@ use lynkeus_core::{AccentMode, CaseMode, Combine, MatchOptions, Query, Term, Wil
 use lynkeus_engine::{Extension, Filters};
 use toml::{Table, Value};
 
+use crate::export::{ExportFormat, ExportScope, ExportSettings};
 use crate::i18n::Language;
 use crate::platform;
 use crate::results::{SortColumn, SortOrder, SortSpec};
@@ -135,11 +137,17 @@ pub struct LayoutSettings {
     pub columns: ColumnWidths,
     /// Ordinamento scelto; `None` = File → Posizione.
     pub sort: Option<SortSpec>,
+    /// Anteprima visibile sotto la tabella.
+    pub preview_visible: bool,
+    /// Altezza dell'anteprima, in punti.
+    pub preview_height: f32,
 }
 
 impl LayoutSettings {
     /// Larghezza minima e massima del pannello di ricerca.
     pub const PANEL_RANGE: std::ops::RangeInclusive<f32> = 260.0..=560.0;
+    /// Altezza minima e massima dell'anteprima.
+    pub const PREVIEW_RANGE: std::ops::RangeInclusive<f32> = 80.0..=900.0;
 }
 
 impl Default for LayoutSettings {
@@ -149,6 +157,8 @@ impl Default for LayoutSettings {
             search_panel_visible: true,
             columns: ColumnWidths::default(),
             sort: None,
+            preview_visible: true,
+            preview_height: 220.0,
         }
     }
 }
@@ -176,6 +186,8 @@ pub struct Settings {
     pub filters: FilterSettings,
     /// Disposizione della finestra.
     pub layout: LayoutSettings,
+    /// Ultime scelte di esportazione.
+    pub export: ExportSettings,
 }
 
 /// Inserisce `item` in testa a un elenco di recenti, senza doppioni, al massimo
@@ -471,7 +483,27 @@ fn to_table(s: &Settings) -> Table {
     };
     layout.insert("sort_column".into(), column.into());
     layout.insert("sort_descending".into(), descending.into());
+    layout.insert("preview_visible".into(), l.preview_visible.into());
+    layout.insert("preview_height".into(), f64::from(l.preview_height).into());
     root.insert("layout".into(), Value::Table(layout));
+
+    let e = &s.export;
+    let mut export = Table::new();
+    let format = match e.format {
+        ExportFormat::Csv => "csv",
+        ExportFormat::Txt => "txt",
+    };
+    export.insert("format".into(), format.into());
+    let scope = match e.scope {
+        ExportScope::Visible => "visible",
+        ExportScope::Selected => "selected",
+    };
+    export.insert("scope".into(), scope.into());
+    // Come per le radici, un percorso non UTF-8 (raro, solo su Linux) non si salva.
+    if let Some(dir) = e.last_dir.as_deref().and_then(Path::to_str) {
+        export.insert("last_dir".into(), dir.into());
+    }
+    root.insert("export".into(), Value::Table(export));
     root
 }
 
@@ -498,6 +530,7 @@ fn from_table(root: &Table) -> Settings {
     let search = table(root, "search").unwrap_or(&empty);
     let filters = table(root, "filters").unwrap_or(&empty);
     let layout = table(root, "layout").unwrap_or(&empty);
+    let export = table(root, "export").unwrap_or(&empty);
 
     let language = match string(root, "language") {
         Some("it") => Some(Language::Italian),
@@ -613,9 +646,35 @@ fn from_table(root: &Table) -> Settings {
             position: column("column_position", layout_defaults.columns.position),
         },
         sort: sort_column.map(|column| SortSpec { column, order }),
+        preview_visible: boolean(layout, "preview_visible")
+            .unwrap_or(layout_defaults.preview_visible),
+        preview_height: float(layout, "preview_height").map_or(
+            layout_defaults.preview_height,
+            |v| {
+                v.clamp(
+                    *LayoutSettings::PREVIEW_RANGE.start(),
+                    *LayoutSettings::PREVIEW_RANGE.end(),
+                )
+            },
+        ),
+    };
+
+    let export = ExportSettings {
+        format: match string(export, "format") {
+            Some("txt") => ExportFormat::Txt,
+            _ => ExportFormat::Csv,
+        },
+        scope: match string(export, "scope") {
+            Some("selected") => ExportScope::Selected,
+            _ => ExportScope::Visible,
+        },
+        last_dir: string(export, "last_dir")
+            .filter(|s| !s.trim().is_empty() && s.len() <= MAX_STRING_BYTES)
+            .map(PathBuf::from),
     };
 
     Settings {
+        export,
         language,
         theme,
         options,
@@ -730,6 +789,13 @@ mod tests {
                     column: SortColumn::Word,
                     order: SortOrder::Descending,
                 }),
+                preview_visible: false,
+                preview_height: 300.0,
+            },
+            export: ExportSettings {
+                format: ExportFormat::Txt,
+                scope: ExportScope::Selected,
+                last_dir: Some(PathBuf::from("esportazioni")),
             },
         }
     }

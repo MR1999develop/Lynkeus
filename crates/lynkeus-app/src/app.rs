@@ -11,18 +11,27 @@
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::thread;
 use std::time::{Duration, Instant};
 
+use lynkeus_core::CompiledQuery;
 use lynkeus_engine::{
     DocPath, Hit, Limits, Notify, Outcome, ProgressSnapshot, Received, SearchEvent, SearchHandle,
     SearchRequest, Summary, Warning, start_search,
 };
 
+use crate::export::{self, ExportScope, ExportSettings};
 use crate::form::{
     FormErrors, PathInputError, PathInputStatus, RootKind, SearchForm, TermRowError,
 };
 use crate::i18n::{I18n, Language};
-use crate::results::{ResultsView, SortColumn, SortSpec};
+use crate::launch::{
+    self, ArchiveEntryExtractor, LaunchOutcome, LaunchTask, NoArchiveExtraction, OpenPlan,
+};
+use crate::preview::{self, DocumentUnits, Loaded, NoDocumentUnits, PreviewError, PreviewRequest};
+use crate::results::{ResultsView, SortColumn, SortSpec, Step};
 use crate::root_check::{RootCheck, RootChecks};
 use crate::settings::{LayoutSettings, Settings, SettingsError, SettingsFile, push_recent};
 use crate::theme::ThemeChoice;
@@ -113,6 +122,109 @@ pub struct ViewState {
     pub focus_first_term: bool,
     /// Richiesta di aprire la sezione Filtri al prossimo frame.
     pub open_filters: bool,
+    /// Dialogo "Impostazioni di esportazione" aperto, con la copia che modifica (Annulla
+    /// la butta).
+    pub export_dialog: Option<ExportSettings>,
+    /// Anteprima già portata in vista sull'unità del risultato: si scorre una volta sola
+    /// per ogni caricamento.
+    pub preview_scrolled: Option<PreviewKey>,
+}
+
+/// Quale anteprima: risultato `hit` della ricerca numero `generation`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreviewKey {
+    /// Numero della ricerca ([`Results::generation`]).
+    pub generation: u64,
+    /// Indice del risultato in [`Results::hits`].
+    pub hit: usize,
+}
+
+/// Stato dell'anteprima.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum PreviewState {
+    /// Nessun risultato con il cursore, o anteprima nascosta.
+    #[default]
+    NoRow,
+    /// Lettura in corso, dall'istante indicato.
+    Loading(PreviewKey, Instant),
+    /// Pronta.
+    Ready(PreviewKey, Loaded),
+    /// Non riuscita.
+    Failed(PreviewKey, PreviewError),
+}
+
+impl PreviewState {
+    /// Il risultato a cui si riferisce.
+    pub fn key(&self) -> Option<PreviewKey> {
+        match self {
+            PreviewState::NoRow => None,
+            PreviewState::Loading(key, _)
+            | PreviewState::Ready(key, _)
+            | PreviewState::Failed(key, _) => Some(*key),
+        }
+    }
+}
+
+/// Un messaggio per l'utente sopra la tabella, finché non lo chiude o ne arriva un altro.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Notice {
+    /// Il file è un programma o uno script: non si apre.
+    Executable {
+        /// Il documento (per "Mostra nella cartella").
+        doc: Arc<DocPath>,
+    },
+    /// Aprire una voce d'archivio non è ancora possibile.
+    ArchiveEntry,
+    /// Il sistema non ha aperto il file.
+    OpenFailed {
+        /// Il documento, come mostrato.
+        file: String,
+    },
+    /// Il sistema non ha mostrato il file nella cartella.
+    RevealFailed {
+        /// Il documento, come mostrato.
+        file: String,
+    },
+    /// Righe copiate negli appunti.
+    Copied {
+        /// Quante.
+        rows: usize,
+    },
+    /// Esportazione riuscita.
+    Exported {
+        /// Righe scritte.
+        rows: usize,
+        /// Il file scritto.
+        file: String,
+    },
+    /// Esportazione non riuscita: il file di prima, se c'era, è intatto.
+    ExportFailed {
+        /// Il file che si voleva scrivere.
+        file: String,
+    },
+    /// Il sistema non ha avviato il thread di lavoro.
+    NoThread,
+}
+
+/// Un'esportazione in corso.
+struct ExportJob {
+    rows: usize,
+    file: String,
+    done: Receiver<io::Result<()>>,
+}
+
+/// Un'anteprima in lettura.
+struct PreviewJob {
+    key: PreviewKey,
+    cancel: Arc<AtomicBool>,
+    done: Receiver<Result<Loaded, PreviewError>>,
+}
+
+/// Un'apertura in corso.
+struct LaunchJob {
+    task: LaunchTask,
+    file: String,
+    done: Receiver<LaunchOutcome>,
 }
 
 /// Una ricerca in corso.
@@ -139,6 +251,8 @@ pub struct Results {
     pub roots: Vec<PathBuf>,
     /// I termini della ricerca, per la colonna Termine (indici di [`Hit::terms`]).
     pub terms: Vec<String>,
+    /// La query compilata della ricerca, per evidenziare l'anteprima.
+    pub query: Option<Arc<CompiledQuery>>,
     /// Le righe, nell'ordine di arrivo.
     pub hits: Vec<Hit>,
     /// Gli avvisi, nell'ordine di arrivo.
@@ -165,6 +279,13 @@ pub struct Application {
     job: JobState,
     current_file: Option<Arc<DocPath>>,
     root_checks: RootChecks,
+    preview: PreviewState,
+    preview_job: Option<PreviewJob>,
+    documents: Arc<dyn DocumentUnits>,
+    archive_extractor: Arc<dyn ArchiveEntryExtractor>,
+    launch_job: Option<LaunchJob>,
+    export_job: Option<ExportJob>,
+    notice: Option<Notice>,
 }
 
 impl Application {
@@ -200,6 +321,13 @@ impl Application {
             job: JobState::Idle,
             current_file: None,
             root_checks,
+            preview: PreviewState::NoRow,
+            preview_job: None,
+            documents: Arc::new(NoDocumentUnits),
+            archive_extractor: Arc::new(NoArchiveExtraction),
+            launch_job: None,
+            export_job: None,
+            notice: None,
             settings,
             settings_file,
             saved,
@@ -383,6 +511,7 @@ impl Application {
             Ok(search) => search,
             Err(errors) => return Err(self.start_error.insert(StartError::Form(errors))),
         };
+        let query = search.query.clone();
         let request = SearchRequest {
             roots: search.roots.clone(),
             query: search.query,
@@ -399,6 +528,7 @@ impl Application {
             generation: self.results.generation.wrapping_add(1),
             roots: search.roots,
             terms: search.terms,
+            query: Some(Arc::new(query)),
             hits: Vec::new(),
             warnings: Vec::new(),
         };
@@ -516,6 +646,329 @@ impl Application {
         let spec = SortSpec::after_click(self.view.sort(), column);
         self.view
             .set_sort(spec, &self.results.hits, &self.results.roots);
+    }
+
+    // --- Anteprima -------------------------------------------------------------------
+
+    /// Collega la fonte delle unità di testo dei documenti per l'anteprima (fase 4B: la
+    /// cache del processo estrattore). Senza, i documenti mostrano il solo contesto.
+    pub fn set_document_units(&mut self, source: Arc<dyn DocumentUnits>) {
+        self.documents = source;
+    }
+
+    /// Lo stato dell'anteprima.
+    pub fn preview(&self) -> &PreviewState {
+        &self.preview
+    }
+
+    /// Il risultato con il cursore, se c'è.
+    pub fn cursor_hit(&self) -> Option<&Hit> {
+        self.results.hits.get(self.view.cursor_hit()?)
+    }
+
+    /// Allinea l'anteprima al risultato con il cursore, senza attendere: raccoglie la
+    /// lettura finita e, se il cursore è cambiato, annulla quella in corso e ne avvia
+    /// un'altra in un thread. `notify` è chiamata a lettura finita.
+    pub fn update_preview(&mut self, notify: &Notify) {
+        self.poll_preview();
+        let wanted = self
+            .view
+            .cursor_hit()
+            .filter(|_| self.layout.preview_visible)
+            .map(|hit| PreviewKey {
+                generation: self.results.generation,
+                hit,
+            });
+        if wanted == self.preview.key() {
+            return;
+        }
+        if let Some(job) = self.preview_job.take() {
+            job.cancel.store(true, Ordering::Relaxed);
+        }
+        self.preview = match wanted {
+            None => PreviewState::NoRow,
+            Some(key) => self.start_preview(key, notify),
+        };
+    }
+
+    fn start_preview(&mut self, key: PreviewKey, notify: &Notify) -> PreviewState {
+        let (Some(hit), Some(query)) = (self.results.hits.get(key.hit), &self.results.query) else {
+            return PreviewState::Ready(key, Loaded::ContextOnly);
+        };
+        let request = PreviewRequest {
+            doc: Arc::clone(&hit.doc),
+            location: hit.location.clone(),
+            query: Arc::clone(query),
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        let documents = Arc::clone(&self.documents);
+        let worker_cancel = Arc::clone(&cancel);
+        let notify = Arc::clone(notify);
+        let spawned = thread::Builder::new()
+            .name("anteprima".to_owned())
+            .spawn(move || {
+                let loaded = preview::load(&request, documents.as_ref(), &worker_cancel);
+                // Se l'app ha cambiato risultato nel frattempo nessuno ascolta più.
+                if tx.send(loaded).is_ok() {
+                    notify();
+                }
+            });
+        match spawned {
+            Ok(_) => {
+                self.preview_job = Some(PreviewJob {
+                    key,
+                    cancel,
+                    done: rx,
+                });
+                PreviewState::Loading(key, Instant::now())
+            }
+            Err(_) => PreviewState::Failed(key, PreviewError::NoThread),
+        }
+    }
+
+    fn poll_preview(&mut self) {
+        let Some(job) = &self.preview_job else {
+            return;
+        };
+        let state = match job.done.try_recv() {
+            Ok(Ok(loaded)) => PreviewState::Ready(job.key, loaded),
+            Ok(Err(error)) => PreviewState::Failed(job.key, error),
+            Err(TryRecvError::Empty) => return,
+            // Il thread è finito senza risposta: un panic nella lettura.
+            Err(TryRecvError::Disconnected) => {
+                PreviewState::Failed(job.key, PreviewError::NoThread)
+            }
+        };
+        self.preview = state;
+        self.preview_job = None;
+    }
+
+    /// Vero se l'anteprima sta leggendo.
+    pub fn preview_loading(&self) -> bool {
+        self.preview_job.is_some()
+    }
+
+    /// Dove porta `step` dal cursore (posizione mostrata), se c'è una riga.
+    pub fn step_target(&self, step: Step) -> Option<usize> {
+        self.view.step_target(&self.results.hits, step)
+    }
+
+    /// Sposta cursore e selezione con `step`; falso se non c'è una riga in quella
+    /// direzione.
+    pub fn step(&mut self, step: Step) -> bool {
+        match self.step_target(step) {
+            Some(position) => {
+                self.view.jump_to(position);
+                true
+            }
+            None => false,
+        }
+    }
+
+    // --- Apri e mostra nella cartella -------------------------------------------------
+
+    /// Collega l'estrazione delle voci d'archivio in una cartella temporanea privata (fasi
+    /// 4B e 7). Senza, "Apri" su una voce d'archivio mostra un messaggio.
+    pub fn set_archive_extractor(&mut self, extractor: Arc<dyn ArchiveEntryExtractor>) {
+        self.archive_extractor = extractor;
+    }
+
+    /// Apre il risultato con il cursore con il programma predefinito, in un thread; un
+    /// programma o uno script non si apre e lo dice un messaggio ([`Notice::Executable`]).
+    pub fn open_current(&mut self, notify: &Notify) {
+        let Some(doc) = self.cursor_hit().map(|hit| Arc::clone(&hit.doc)) else {
+            return;
+        };
+        let task = match launch::open_plan(&doc) {
+            OpenPlan::Executable => {
+                self.notice = Some(Notice::Executable { doc });
+                return;
+            }
+            OpenPlan::ArchiveEntry => LaunchTask::OpenArchiveEntry((*doc).clone()),
+            OpenPlan::File(path) => LaunchTask::Open(path),
+        };
+        self.start_launch(task, doc.to_string(), notify);
+    }
+
+    /// Mostra nella cartella il risultato con il cursore (per una voce d'archivio,
+    /// l'archivio), in un thread.
+    pub fn reveal_current(&mut self, notify: &Notify) {
+        if let Some(doc) = self.cursor_hit().map(|hit| Arc::clone(&hit.doc)) {
+            self.reveal(&doc, notify);
+        }
+    }
+
+    /// Mostra `doc` nella sua cartella (per una voce d'archivio, l'archivio).
+    pub fn reveal(&mut self, doc: &DocPath, notify: &Notify) {
+        let task = LaunchTask::Reveal(doc.path.clone());
+        self.start_launch(task, doc.to_string(), notify);
+    }
+
+    fn start_launch(&mut self, task: LaunchTask, file: String, notify: &Notify) {
+        let (tx, rx) = mpsc::channel();
+        let extractor = Arc::clone(&self.archive_extractor);
+        let worker_task = task.clone();
+        let notify = Arc::clone(notify);
+        let spawned = thread::Builder::new()
+            .name("apertura".to_owned())
+            .spawn(move || {
+                let outcome = launch::run(&worker_task, extractor.as_ref());
+                if tx.send(outcome).is_ok() {
+                    notify();
+                }
+            });
+        match spawned {
+            Ok(_) => {
+                self.launch_job = Some(LaunchJob {
+                    task,
+                    file,
+                    done: rx,
+                });
+            }
+            Err(_) => self.notice = Some(Notice::NoThread),
+        }
+    }
+
+    fn poll_launch(&mut self) {
+        let Some(job) = &self.launch_job else {
+            return;
+        };
+        let outcome = match job.done.try_recv() {
+            Ok(outcome) => outcome,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => LaunchOutcome::Failed,
+        };
+        let file = job.file.clone();
+        self.notice = match (outcome, &job.task) {
+            (LaunchOutcome::Done, _) => self.notice.take(),
+            (LaunchOutcome::ArchiveUnavailable, _) => Some(Notice::ArchiveEntry),
+            (LaunchOutcome::Failed, LaunchTask::Reveal(_)) => Some(Notice::RevealFailed { file }),
+            (LaunchOutcome::Failed, _) => Some(Notice::OpenFailed { file }),
+        };
+        self.launch_job = None;
+    }
+
+    // --- Copia ed esportazione --------------------------------------------------------
+
+    /// Le righe selezionate come TSV per gli appunti, con il loro numero; `None` senza
+    /// selezione.
+    pub fn selection_tsv(&self) -> Option<(String, usize)> {
+        let indices: Vec<usize> = self.view.selected_hits().collect();
+        if indices.is_empty() {
+            return None;
+        }
+        let results = &self.results;
+        let table = export::results_table(&self.i18n, &results.hits, &results.terms, indices);
+        Some((export::to_tsv(&table.rows), table.rows.len()))
+    }
+
+    /// Le ultime scelte di esportazione.
+    pub fn export_settings(&self) -> &ExportSettings {
+        &self.settings.export
+    }
+
+    /// Cambia le scelte di esportazione (salvate con le impostazioni).
+    pub fn set_export_settings(&mut self, settings: ExportSettings) {
+        self.settings.export = settings;
+    }
+
+    /// Righe che l'esportazione scriverebbe con `scope`.
+    pub fn export_row_count(&self, scope: ExportScope) -> usize {
+        match scope {
+            ExportScope::Visible => self.view.len(),
+            ExportScope::Selected => self.view.selected_count(),
+        }
+    }
+
+    /// Vero se un'esportazione sta scrivendo.
+    pub fn is_exporting(&self) -> bool {
+        self.export_job.is_some()
+    }
+
+    /// Esporta in `path` le righe e nel formato delle ultime scelte, in un thread; ricorda
+    /// la cartella. La conferma della sovrascrittura l'ha già chiesta il dialogo di
+    /// salvataggio; la scrittura è atomica e il file precedente resta se fallisce.
+    pub fn export_to(&mut self, path: PathBuf, notify: &Notify) {
+        let settings = self.settings.export.clone();
+        let indices: Vec<usize> = match settings.scope {
+            ExportScope::Visible => (0..self.view.len())
+                .filter_map(|p| self.view.hit_at(p))
+                .collect(),
+            ExportScope::Selected => self.view.selected_hits().collect(),
+        };
+        let results = &self.results;
+        let table = export::results_table(&self.i18n, &results.hits, &results.terms, indices);
+        let rows = table.rows.len();
+        let language = self.i18n.language();
+        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            self.settings.export.last_dir = Some(dir.to_owned());
+        }
+        let file = path.display().to_string();
+        let (tx, rx) = mpsc::channel();
+        let notify = Arc::clone(notify);
+        let spawned = thread::Builder::new()
+            .name("esportazione".to_owned())
+            .spawn(move || {
+                let bytes = export::encode(&table, settings.format, language);
+                let written = export::write_export(&path, &bytes);
+                if tx.send(written).is_ok() {
+                    notify();
+                }
+            });
+        match spawned {
+            Ok(_) => {
+                self.export_job = Some(ExportJob {
+                    rows,
+                    file,
+                    done: rx,
+                });
+            }
+            Err(_) => self.notice = Some(Notice::NoThread),
+        }
+    }
+
+    fn poll_export(&mut self) {
+        let Some(job) = &self.export_job else {
+            return;
+        };
+        let written = match job.done.try_recv() {
+            Ok(written) => written,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => Err(io::Error::other("thread interrotto")),
+        };
+        let file = job.file.clone();
+        self.notice = Some(match written {
+            Ok(()) => Notice::Exported {
+                rows: job.rows,
+                file,
+            },
+            Err(_) => Notice::ExportFailed { file },
+        });
+        self.export_job = None;
+    }
+
+    // --- Messaggi -----------------------------------------------------------------------
+
+    /// Il messaggio da mostrare, se c'è.
+    pub fn notice(&self) -> Option<&Notice> {
+        self.notice.as_ref()
+    }
+
+    /// Mostra un messaggio al posto di quello attuale.
+    pub fn set_notice(&mut self, notice: Notice) {
+        self.notice = Some(notice);
+    }
+
+    /// Chiude il messaggio.
+    pub fn dismiss_notice(&mut self) {
+        self.notice = None;
+    }
+
+    /// Raccoglie, senza attendere, l'esito delle aperture e delle esportazioni finite.
+    pub fn pump_actions(&mut self) {
+        self.poll_launch();
+        self.poll_export();
     }
 
     /// Salva le impostazioni se sono cambiate dall'ultimo salvataggio. Senza file (test)

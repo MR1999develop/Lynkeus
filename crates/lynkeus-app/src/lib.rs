@@ -11,10 +11,13 @@
 #![deny(unsafe_code)]
 
 mod app;
+pub mod export;
 pub mod form;
 pub mod format;
 pub mod i18n;
+pub mod launch;
 pub mod platform;
+pub mod preview;
 pub mod results;
 mod root_check;
 pub mod settings;
@@ -22,8 +25,8 @@ pub mod theme;
 mod ui;
 
 pub use app::{
-    Application, EmptyState, MAX_HITS_PER_FRAME, PROGRESS_DELAY, Pump, Results, SearchStatus,
-    StartError, Tab, ViewState,
+    Application, EmptyState, MAX_HITS_PER_FRAME, Notice, PROGRESS_DELAY, PreviewKey, PreviewState,
+    Pump, Results, SearchStatus, StartError, Tab, ViewState,
 };
 pub use settings::{Settings, SettingsFile};
 pub use ui::setup_context;
