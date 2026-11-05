@@ -133,8 +133,8 @@ dialog-export = Export the results
 
 error-no-folder = Add at least one folder or file to search in.
 error-path-not-found = No file or folder with this path.
-# $max: maximum number of places in the list.
-error-path-too-many-roots = The list already has { $max } places, the maximum. Remove some to add others.
+# $max (number): maximum number of search locations in the list.
+error-path-too-many-roots = The list already has { $max } search locations, the maximum. Remove some to add others.
 error-term-empty = Type the text to find, or remove this row.
 error-term-only-wildcards = The term has only * and ?: add at least one letter or digit.
 # $max (number): allowed characters.
@@ -287,7 +287,7 @@ preview-no-thread = Preview not available: the system has no free resources. Clo
 ## Messages above the table
 
 notice-executable = For safety, programs and scripts are not opened from here: use "Show in folder" and open it from there if you trust it.
-notice-archive-entry = Archive entries cannot be opened right now because the process that extracts them is not running: use "Show in folder" to open the archive.
+notice-archive-entry = Archive entries cannot be opened right now because the document reader is not running: use "Show in folder" to open the archive.
 # $file (text): file path.
 notice-open-failed = Error: { $file } did not open. Check that it still exists and that there is a program to open it.
 # $file (text): file path.
@@ -354,7 +354,7 @@ notice-entry-unreadable = Error: { $file } could not be extracted: the archive c
 # Text of the item in the right-click menu of Explorer and Nautilus.
 context-menu-label = Search with Lynkeus
 menu-context-menu = "Search with Lynkeus" in the right-click menu
-menu-context-menu-hint = Adds "Search with Lynkeus" to the right-click menu of files and folders; the item opens this window with the chosen item among the places to search. On Windows 11 it is under "Show more options".
+menu-context-menu-hint = Adds "Search with Lynkeus" to the right-click menu of files and folders; the item opens this window with the chosen item among the search locations. On Windows 11 it is under "Show more options".
 reason-no-context-menu = The right-click item is not available on this system.
 reason-context-menu-updating = The right-click item is being updated.
 notice-context-menu-exe-path = Error: the right-click item was not added because the program path contains characters that are not allowed. Move Lynkeus Searcher to a folder with a simple name and try again.
@@ -362,9 +362,9 @@ notice-context-menu-too-long = Error: the right-click item was not added because
 notice-context-menu-exe-dir = Error: the right-click item was not added because other users can change the program or its folder. Move Lynkeus Searcher to your user folder or to Program Files and try again.
 notice-context-menu-foreign = Error: the right-click menu already has an item with the same name from another program; it was not changed.
 notice-context-menu-io = Error: the right-click item was not updated. Try again; if it happens again, check the permissions of your profile.
-# $count (number): refused folders.
-# $max: maximum number of places in the list.
-notice-roots-limit = Warning: the list of places already has { $max } items, the maximum, so the other places were not added. Remove some and try again.
+# $max (number): maximum number of search locations in the list.
+notice-roots-limit = Warning: the list already has { $max } search locations, the maximum, so the others were not added. Remove some and try again.
+# $count (number): app folders that were refused.
 notice-private-dirs = { $count ->
         [one] Warning: one app folder can be accessed by other users and is not used in this session for safety (cache, log or settings may not be saved). Check the permissions of the Lynkeus Searcher folders in your profile.
        *[other] Warning: { $count } app folders can be accessed by other users and are not used in this session for safety (cache, log or settings may not be saved). Check the permissions of the Lynkeus Searcher folders in your profile.
