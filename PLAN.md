@@ -289,9 +289,9 @@ Ogni fase finisce con `cargo xtask check` verde e un commit. Il lavoro si orches
 
 ### Fase 6 — Azioni sui risultati
 - [x] Anteprima con navigazione
-- [ ] Apri (anche voci dentro archivi) e mostra nella cartella
+- [x] Apri (anche voci dentro archivi) e mostra nella cartella
 - [x] Esporta CSV/TXT e copia TSV
-- [ ] Controlli verdi e commit
+- [x] Controlli verdi e commit
 
 ### Fase 7 — Lingue, integrazione e rilascio
 - [x] Threat model della pipe e del registro
@@ -299,7 +299,7 @@ Ogni fase finisce con `cargo xtask check` verde e un commit. Il lavoro si orches
 - [ ] Clic destro su Windows e script Nautilus
 - [ ] Istanza unica con pipe autenticata
 - [ ] Cartelle private con descrittore esplicito
-- [ ] Icona, manifest, informazioni di versione
+- [ ] Icona (fatta: assets/), manifest, informazioni di versione
 - [ ] `xtask dist` con `SHA256SUMS` e controllo dei percorsi locali
 - [ ] README d'uso e `SECURITY.md`
 - [ ] Verifica finale (sezione Verifica) e commit
