@@ -6,20 +6,15 @@
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread;
+use std::thread::{self, JoinHandle};
 
 use crossbeam_channel::{Receiver, TryRecvError};
 
 use crate::documents::DocumentSource;
-use crate::event::SearchEvent;
+use crate::event::{Notify, SearchEvent};
 use crate::progress::Progress;
 use crate::request::SearchRequest;
 use crate::worker::{self, WorkerContext};
-
-/// Funzione chiamata dal worker dopo ogni evento inviato (es. `ctx.request_repaint()`).
-///
-/// Deve essere veloce e non bloccarsi: gira sul thread del worker.
-pub type Notify = Arc<dyn Fn() + Send + Sync>;
 
 /// Eventi in coda al massimo; oltre, il worker aspetta che il chiamante li legga.
 const EVENT_QUEUE_CAPACITY: usize = 256;
@@ -37,15 +32,17 @@ pub enum Received {
     WorkerLost,
 }
 
-/// Maniglia di una ricerca in corso.
+/// Maniglia di una ricerca in corso: possiede il thread della ricerca.
 ///
-/// Chiuderla (drop) annulla la ricerca senza aspettare il worker, che si ferma tra un file
-/// e l'altro o al primo evento che non può più consegnare.
+/// Chiuderla (drop) annulla la ricerca senza aspettare il thread, che si ferma tra un file
+/// e l'altro o al primo evento che non può più consegnare (entro circa un secondo); per
+/// aspettarlo, all'uscita del programma, [`SearchHandle::cancel_and_wait`].
 pub struct SearchHandle {
     events: Receiver<SearchEvent>,
     progress: Arc<Progress>,
     cancel: Arc<AtomicBool>,
     finished_delivered: bool,
+    thread: Option<JoinHandle<()>>,
 }
 
 impl SearchHandle {
@@ -79,11 +76,27 @@ impl SearchHandle {
             Err(TryRecvError::Disconnected) => Received::WorkerLost,
         }
     }
+
+    /// Annulla la ricerca e aspetta che il suo thread finisca (entro circa un secondo: il
+    /// worker controlla l'annullamento a ogni file, a ogni passo e mentre aspetta la coda).
+    /// Gli eventi non letti si scartano. Per l'uscita del programma, non per il thread
+    /// dell'interfaccia durante l'uso.
+    pub fn cancel_and_wait(mut self) {
+        self.cancel();
+        if let Some(thread) = self.thread.take() {
+            // Un panic del worker è già noto come `WorkerLost`: qui conta solo che sia finito.
+            let _ended = thread.join();
+        }
+    }
 }
 
 impl Drop for SearchHandle {
     fn drop(&mut self) {
         self.cancel();
+        // Un thread già finito si raccoglie subito; uno ancora in corso finisce da solo.
+        if let Some(thread) = self.thread.take_if(|thread| thread.is_finished()) {
+            let _ended = thread.join();
+        }
     }
 }
 
@@ -116,7 +129,7 @@ pub fn start_search(
         cancel: Arc::clone(&cancel),
         documents,
     };
-    thread::Builder::new()
+    let thread = thread::Builder::new()
         .name("lynkeus-search".to_owned())
         .spawn(move || worker::run(&request, &context))?;
     Ok(SearchHandle {
@@ -124,5 +137,6 @@ pub fn start_search(
         progress,
         cancel,
         finished_delivered: false,
+        thread: Some(thread),
     })
 }

@@ -8,43 +8,23 @@
 //! l'annullamento e si cercano le parole con [`find_words`]. I numeri di riga si
 //! ricostruiscono contando gli a capo con `memchr`.
 //!
-//! OR e AND con [`FileAccumulator`]: i risultati partono a lotti durante la lettura appena
-//! sono sicuri, cioè sempre con OR e, con AND, da quando ogni termine è comparso nel file
-//! (prima si trattengono; se un termine non compare mai, il file non dà risultati). Non si
-//! trattengono mai più risultati di quelli che il limite permette ancora di consegnare.
+//! OR, AND, lotti e limite li decide [`HitBatcher`]: se dice che il file va riletto
+//! ([`Verdict::Reread`]), chi chiama lo riapre e cerca di nuovo con un batcher già sicuro.
 
 use std::io::Read;
-use std::sync::Arc;
 
-use lynkeus_core::{
-    CompiledQuery, FileAccumulator, Location, WordMatch, find_words, snippet, word_text,
-};
+use lynkeus_core::{Location, find_words};
 use lynkeus_extract::text::soft_cut;
 use lynkeus_extract::{ExtractError, TextReader};
 
-use crate::doc::DocPath;
-use crate::event::Hit;
-use crate::request::Limits;
-use crate::worker::Stop;
+use crate::batch::{HitBatcher, HitLabel, HitSink, Verdict};
+use crate::halt::Stop;
 
 /// Righe massime di un passo, tra due controlli dell'annullamento.
 pub(crate) const STEP_MAX_LINES: usize = 10_000;
 
 /// Byte massimi di un passo: limita anche la memoria dei risultati di [`find_words`].
 pub(crate) const STEP_MAX_BYTES: usize = 1024 * 1024;
-
-/// Risultati già sicuri trattenuti al massimo prima di consegnarne un lotto.
-pub(crate) const BATCH_HITS: usize = 1024;
-
-/// Dove vanno i risultati di un file.
-pub(crate) trait HitSink {
-    /// Errore se la ricerca deve fermarsi (annullata, limite raggiunto, chiamante sparito).
-    fn check(&self) -> Result<(), Stop>;
-    /// Risultati che il limite permette ancora di consegnare.
-    fn remaining(&self) -> usize;
-    /// Consegna un lotto (mai vuoto) di risultati già filtrati da OR/AND.
-    fn deliver(&mut self, hits: Vec<Hit>) -> Result<(), Stop>;
-}
 
 /// Perché la ricerca in un file si è interrotta.
 #[derive(Debug)]
@@ -61,21 +41,23 @@ impl From<Stop> for FileError {
     }
 }
 
-/// Cosa cercare e come etichettare i risultati di un file.
-pub(crate) struct FileSearch<'a> {
-    pub query: &'a CompiledQuery,
-    pub limits: &'a Limits,
-    pub root: usize,
-    pub doc: Arc<DocPath>,
+/// Com'è finita la ricerca in un file letto per intero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TextEnd {
+    /// Risultati consegnati (forse nessuno).
+    Searched,
+    /// Il file va riletto con un batcher già sicuro (vedi [`HitBatcher`]): nulla è stato
+    /// consegnato.
+    Reread,
 }
 
-/// Cerca in tutto il testo di `reader` e consegna i risultati a `sink`.
+/// Cerca in tutto il testo di `reader` con `batcher` e consegna i risultati a `sink`.
 pub(crate) fn search_text<R: Read>(
     reader: &mut TextReader<R>,
-    file: &FileSearch<'_>,
+    label: &HitLabel<'_>,
+    mut batcher: HitBatcher<'_>,
     sink: &mut impl HitSink,
-) -> Result<(), FileError> {
-    let mut accumulator = FileAccumulator::new(file.query.term_count(), file.query.combine());
+) -> Result<TextEnd, FileError> {
     while let Some(chunk) = reader.next_chunk().map_err(FileError::Read)? {
         let mut offset = 0;
         let mut line = chunk.first_line;
@@ -84,67 +66,31 @@ pub(crate) fn search_text<R: Read>(
             let rest = &chunk.text[offset..];
             let step = &rest[..step_len(rest)];
             let room = sink.remaining();
-            for found in find_words(file.query, step) {
-                // Oltre il limite servono solo i risultati che portano un termine nuovo
-                // (perché AND sappia se il file li contiene tutti).
-                if accumulator.len() >= room && accumulator.seen().contains_all(found.terms) {
-                    continue;
+            for found in find_words(label.query, step) {
+                let make = || {
+                    let number = line.saturating_add(u64::from(found.line)).saturating_add(1);
+                    let location = Location::Line(u32::try_from(number).unwrap_or(u32::MAX));
+                    label.hit(step, &found, location)
+                };
+                if let Some(batch) = batcher.push(found.terms, room, make) {
+                    sink.deliver(batch)?;
                 }
-                accumulator.push(found.terms, make_hit(file, step, &found, line));
+            }
+            if batcher.is_settled() {
+                return Ok(TextEnd::Reread);
             }
             line = line.saturating_add(count_newlines(step));
             offset += step.len();
-
-            // Risultati già sicuri (sempre con OR, con AND da quando ogni termine è
-            // comparso): partono a lotti, o subito se bastano a riempire il limite (allora
-            // `deliver` ferma la ricerca).
-            let held = accumulator.len();
-            if accumulator.is_satisfied() && (held >= room || held >= BATCH_HITS) {
-                deliver_ready(sink, &mut accumulator)?;
-            }
         }
     }
-    deliver(sink, accumulator).map_err(FileError::Stop)
-}
-
-/// Consegna i risultati già sicuri dell'accumulatore, se ce ne sono.
-fn deliver_ready(
-    sink: &mut impl HitSink,
-    accumulator: &mut FileAccumulator<Hit>,
-) -> Result<(), Stop> {
-    let hits = accumulator.take_ready();
-    if hits.is_empty() {
-        Ok(())
-    } else {
-        sink.deliver(hits)
-    }
-}
-
-/// Chiude l'accumulatore e consegna ciò che resta, se qualcosa resta.
-fn deliver(sink: &mut impl HitSink, accumulator: FileAccumulator<Hit>) -> Result<(), Stop> {
-    let hits = accumulator.finish();
-    if hits.is_empty() {
-        Ok(())
-    } else {
-        sink.deliver(hits)
-    }
-}
-
-/// Una riga dei risultati; `first_line` è l'indice nel file della prima riga di `text`.
-fn make_hit(file: &FileSearch<'_>, text: &str, found: &WordMatch, first_line: u64) -> Hit {
-    let word = word_text(text, found, file.limits.word_max_chars);
-    let line = first_line
-        .saturating_add(u64::from(found.line))
-        .saturating_add(1);
-    Hit {
-        doc: Arc::clone(&file.doc),
-        root: file.root,
-        location: Location::Line(u32::try_from(line).unwrap_or(u32::MAX)),
-        word: word.text,
-        word_truncated_start: word.truncated_start,
-        word_truncated_end: word.truncated_end,
-        snippet: snippet(text, found, file.limits.context_chars),
-        terms: found.terms,
+    match batcher.finish() {
+        Verdict::Hits(hits) => {
+            if !hits.is_empty() {
+                sink.deliver(hits)?;
+            }
+            Ok(TextEnd::Searched)
+        }
+        Verdict::Reread => Ok(TextEnd::Reread),
     }
 }
 
@@ -174,9 +120,14 @@ fn count_newlines(text: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroUsize;
+    use std::sync::Arc;
 
     use super::*;
-    use lynkeus_core::{ByteSize, Combine, MatchOptions, Query, Term, WildcardMode};
+    use crate::batch::{BATCH_HITS, HeldHits};
+    use crate::doc::DocPath;
+    use crate::event::{Hit, WarningKind};
+    use crate::request::Limits;
+    use lynkeus_core::{ByteSize, Combine, CompiledQuery, MatchOptions, Query, Term, WildcardMode};
     use proptest::prelude::*;
 
     fn query(terms: &[&str], combine: Combine) -> CompiledQuery {
@@ -213,6 +164,32 @@ mod tests {
                 Ok(())
             }
         }
+        fn warn(&mut self, _doc: Arc<DocPath>, _kind: WarningKind) -> Result<(), Stop> {
+            Ok(())
+        }
+    }
+
+    /// Cerca `text` con al più `held` risultati trattenuti; l'esito e i lotti consegnati.
+    fn search(
+        text: &str,
+        query: &CompiledQuery,
+        limits: &Limits,
+        sink: &mut Collect,
+        held: usize,
+        block: usize,
+    ) -> Result<TextEnd, FileError> {
+        let label = HitLabel {
+            query,
+            limits,
+            root: 0,
+            doc: Arc::new(DocPath::file("prova.txt")),
+        };
+        let block = NonZeroUsize::new(block).unwrap_or(NonZeroUsize::MIN);
+        let mut reader =
+            TextReader::with_block_bytes(text.as_bytes(), ByteSize::from_mib(64), block)
+                .expect("testo");
+        let held = HeldHits::new(held);
+        search_text(&mut reader, &label, HitBatcher::new(query, &held), sink)
     }
 
     fn run(
@@ -223,23 +200,19 @@ mod tests {
         block: usize,
     ) -> (Vec<(String, Location)>, usize, bool) {
         let query = query(terms, combine);
-        let limits = Limits::default();
-        let file = FileSearch {
-            query: &query,
-            limits: &limits,
-            root: 0,
-            doc: Arc::new(DocPath::file("prova.txt")),
-        };
-        let block = NonZeroUsize::new(block).unwrap_or(NonZeroUsize::MIN);
-        let mut reader =
-            TextReader::with_block_bytes(text.as_bytes(), ByteSize::from_mib(64), block)
-                .expect("testo");
         let mut sink = Collect {
             remaining: max_results,
             batches: Vec::new(),
         };
         let stopped = matches!(
-            search_text(&mut reader, &file, &mut sink),
+            search(
+                text,
+                &query,
+                &Limits::default(),
+                &mut sink,
+                usize::MAX,
+                block
+            ),
             Err(FileError::Stop(Stop::LimitReached))
         );
         let batches = sink.batches.len();
@@ -286,24 +259,18 @@ mod tests {
             word_max_chars: 10,
             ..Limits::default()
         };
-        let file = FileSearch {
-            query: &query,
-            limits: &limits,
-            root: 0,
-            doc: Arc::new(DocPath::file("prova.txt")),
-        };
-        let text = format!("{}zeta{}\nzetabc\n", "a".repeat(30), "b".repeat(30));
-        let mut reader = TextReader::with_block_bytes(
-            text.as_bytes(),
-            ByteSize::from_mib(64),
-            NonZeroUsize::new(4096).unwrap_or(NonZeroUsize::MIN),
-        )
-        .expect("testo");
+        let text = format!(
+            "{}zeta{}
+zetabc
+",
+            "a".repeat(30),
+            "b".repeat(30)
+        );
         let mut sink = Collect {
             remaining: 10,
             batches: Vec::new(),
         };
-        search_text(&mut reader, &file, &mut sink).expect("ricerca");
+        search(&text, &query, &limits, &mut sink, 10, 4096).expect("ricerca");
         let sides: Vec<(bool, bool)> = sink
             .batches
             .iter()
@@ -348,6 +315,37 @@ mod tests {
         let (hits, _, stopped) = run(&text, &["ar", "zeta"], Combine::All, 5, 4096);
         assert!(stopped);
         assert_eq!(hits.len(), 5);
+    }
+
+    /// Senza posti per trattenere i risultati (altri file li occupano), un file AND che ha
+    /// tutti i termini chiede la seconda lettura e non consegna nulla; con i posti, consegna.
+    #[test]
+    fn without_places_to_hold_hits_the_file_is_reread() {
+        let mut text = "ar
+"
+        .repeat(50);
+        text.push_str(
+            "zeta
+",
+        );
+        text.push_str(
+            &"ar
+"
+            .repeat(3 * BATCH_HITS),
+        );
+        let query = query(&["ar", "zeta"], Combine::All);
+        let limits = Limits::default();
+        let mut sink = Collect {
+            remaining: usize::MAX,
+            batches: Vec::new(),
+        };
+        let end = search(&text, &query, &limits, &mut sink, 10, 4096).expect("ricerca");
+        assert_eq!(end, TextEnd::Reread);
+        assert!(sink.batches.is_empty());
+        let end = search(&text, &query, &limits, &mut sink, 100, 4096).expect("ricerca");
+        assert_eq!(end, TextEnd::Searched);
+        let delivered: usize = sink.batches.iter().map(Vec::len).sum();
+        assert_eq!(delivered, 3 * BATCH_HITS + 51);
     }
 
     #[test]

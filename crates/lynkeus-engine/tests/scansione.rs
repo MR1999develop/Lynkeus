@@ -287,6 +287,69 @@ fn cancel_during_the_search() {
     assert!(cancelled_at.elapsed() < TIMEOUT);
 }
 
+/// `cancel_and_wait` annulla e aspetta il thread della ricerca: dopo, il thread ha già
+/// rilasciato tutto ciò che teneva (la funzione `Notify` resta solo al test).
+#[test]
+fn cancel_and_wait_ends_the_search_thread() {
+    let files: Vec<(String, Vec<u8>)> = (0..600)
+        .map(|i| (format!("f{i:03}.txt"), b"carta".to_vec()))
+        .collect();
+    let refs: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|(n, c)| (n.as_str(), c.as_slice()))
+        .collect();
+    let dir = tree(&refs);
+    let (woken_tx, woken) = std::sync::mpsc::channel();
+    let notify: lynkeus_engine::Notify = std::sync::Arc::new(move || {
+        // Il test può essere già finito: un segnale perso non conta.
+        if woken_tx.send(()).is_err() {}
+    });
+    let handle = lynkeus_engine::start_search(
+        request(vec![dir.path().into()], &["ar"], Combine::Any),
+        None,
+        std::sync::Arc::clone(&notify),
+    )
+    .expect("thread avviato");
+    woken.recv_timeout(TIMEOUT).expect("primo evento");
+    let started = Instant::now();
+    handle.cancel_and_wait();
+    assert!(started.elapsed() < TIMEOUT);
+    assert_eq!(
+        std::sync::Arc::strong_count(&notify),
+        1,
+        "thread ancora vivo"
+    );
+}
+
+/// Misura P-03 (piano di test): 16 file con 300.000 "il" ciascuno, AND con "zzz": nessun
+/// risultato, e i risultati trattenuti da tutti i thread insieme non superano il limite (il
+/// picco di memoria privata si legge con Process Explorer). `cargo test --release -p
+/// lynkeus-engine --test scansione and_retained_hits -- --ignored --nocapture`.
+#[test]
+#[ignore = "misura di prestazioni (P-03), da lanciare a mano in release"]
+fn and_retained_hits_are_bounded_across_threads() {
+    let content = format!("{}\n", "il ".repeat(30))
+        .repeat(10_000)
+        .into_bytes();
+    let names: Vec<String> = (0..16).map(|n| format!("f{n:02}.txt")).collect();
+    let refs: Vec<(&str, &[u8])> = names
+        .iter()
+        .map(|n| (n.as_str(), content.as_slice()))
+        .collect();
+    let dir = tree(&refs);
+    for round in 0..5 {
+        let started = Instant::now();
+        let found = run(request(
+            vec![dir.path().into()],
+            &["il", "zzz"],
+            Combine::All,
+        ));
+        println!("P-03 giro {round}: {:?}", started.elapsed());
+        assert_eq!(found.summary.outcome, Outcome::Completed);
+        assert!(found.hits.is_empty());
+    }
+}
+
 #[test]
 fn a_file_larger_than_a_block_keeps_exact_line_numbers() {
     let mut text = "riga di riempimento\n".repeat(600_000);

@@ -21,12 +21,14 @@
 
 #![forbid(unsafe_code)]
 
+mod batch;
 mod cache;
 mod doc;
 mod docsearch;
 mod documents;
 mod event;
 mod filter;
+mod halt;
 mod handle;
 mod launcher;
 mod platform;
@@ -37,20 +39,25 @@ mod roots;
 mod textfile;
 mod worker;
 
-pub use cache::{CACHE_FORMAT_VERSION, CacheKey, DEFAULT_CACHE_SIZE, MAX_ENTRY_BYTES, TextCache};
+pub use cache::{
+    CACHE_FORMAT_VERSION, CacheKey, DEFAULT_CACHE_SIZE, MAX_ENTRY_BYTES, TextCache, WriteFailure,
+    WriteFailures,
+};
 pub use doc::DocPath;
 pub use documents::{DocumentSource, Origin};
-pub use event::{Hit, Outcome, SearchEvent, Summary, Warning, WarningKind};
-pub use handle::{Notify, Received, SearchHandle, start_search};
+pub use event::{Hit, Notify, Outcome, SearchEvent, Summary, Warning, WarningKind};
+pub use handle::{Received, SearchHandle, start_search};
 pub use launcher::{
     CommandLauncher, EXTRACT_WORKER_FLAG, LaunchedWorker, WorkerExit, WorkerLauncher,
     WorkerProcess, worker_args,
 };
 /// Cartelle e file privati, per la cache e per i file dell'app: il trait [`PrivateFs`]
-/// (l'app ne inietta uno con il descrittore esplicito su Windows) e la versione portabile.
-pub use platform::{
-    NotPrivate, PortablePrivateFs, PrivateFs, create_new_private_file, create_private_dir,
-};
+/// (l'app ne inietta uno con il descrittore esplicito su Windows) e il rifiuto di ogni
+/// creazione ([`RefusingFs`]), il default sicuro dove questo crate non sa fare di meglio.
+pub use platform::{NotPrivate, PrivateFs, RefusingFs};
+/// La versione portabile delle cartelle private, solo fuori da Windows (0700 e 0600).
+#[cfg(not(windows))]
+pub use platform::{PortablePrivateFs, create_new_private_file, create_private_dir};
 pub use pool::{
     EntryEnd, ExtractEnd, ExtractorPool, MAX_POOL_SIZE, STOP_GRACE, WorkerFailure,
     default_pool_size,

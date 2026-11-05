@@ -120,20 +120,13 @@ fn is_locked(path: &Path) -> bool {
     }
 }
 
-/// Il padre (un processo intermedio, al posto dell'app) muore di colpo: il processo
-/// estrattore resta senza chi scrive nel suo stdin, vede la fine del flusso ed esce entro
-/// [`EXIT_TIMEOUT`]. Su Linux è l'unica difesa contro gli orfani; su Windows c'è anche il Job
-/// Object dell'app. Il figlio tiene un lock sul file finché vive.
-#[test]
-fn an_orphaned_worker_exits_when_its_parent_dies() {
-    let dir = tempfile::tempdir().expect("cartella temporanea");
-    let lock = dir.path().join("lucchetto.txt");
-    std::fs::write(&lock, b"").expect("file");
-
+/// Avvia il padre intermedio con `flag` sul file `lock`, aspetta che dica «pronto» (il figlio
+/// tiene il lock) e lo restituisce.
+fn orphan_parent(flag: &str, lock: &Path) -> KillOnDrop {
     let mut parent = KillOnDrop(
         Command::new(test_worker())
-            .arg("--orphan-parent")
-            .arg(&lock)
+            .arg(flag)
+            .arg(lock)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -153,16 +146,48 @@ fn an_orphaned_worker_exits_when_its_parent_dies() {
         .expect("il padre non ha detto «pronto»")
         .expect("lettura dal padre");
     assert_eq!(line.trim_end(), "pronto");
-    assert!(is_locked(&lock), "il figlio deve tenere il lock");
+    assert!(is_locked(lock), "il figlio deve tenere il lock");
+    parent
+}
 
+/// Uccide il padre intermedio e aspetta che il figlio rilasci il lock (cioè esca) entro
+/// [`EXIT_TIMEOUT`].
+fn kill_parent_and_wait_for_the_child(mut parent: KillOnDrop, lock: &Path) {
     let killed = Instant::now();
     parent.0.kill().expect("uccisione del padre");
     parent.0.wait().expect("attesa del padre");
-    while is_locked(&lock) {
+    while is_locked(lock) {
         assert!(
             killed.elapsed() < EXIT_TIMEOUT,
             "il figlio è ancora vivo dopo {EXIT_TIMEOUT:?}"
         );
         std::thread::sleep(LOCK_POLL);
     }
+}
+
+/// Il padre (un processo intermedio, al posto dell'app) muore di colpo: il processo
+/// estrattore, libero, resta senza chi scrive nel suo stdin, vede la fine del flusso ed esce
+/// entro [`EXIT_TIMEOUT`] (su Linux può fermarlo prima il kernel, vedi sotto; su Windows c'è
+/// anche il Job Object dell'app). Il figlio tiene un lock sul file finché vive.
+#[test]
+fn an_orphaned_worker_exits_when_its_parent_dies() {
+    let dir = tempfile::tempdir().expect("cartella temporanea");
+    let lock = dir.path().join("lucchetto.txt");
+    std::fs::write(&lock, b"").expect("file");
+    let parent = orphan_parent("--orphan-parent", &lock);
+    kill_parent_and_wait_for_the_child(parent, &lock);
+}
+
+/// Come sopra, ma il figlio è occupato (un ciclo sulla CPU) e non legge stdin: non vede la
+/// fine del flusso, quindi lo ferma solo il kernel alla morte del padre (`PR_SET_PDEATHSIG`,
+/// chiesto dal figlio all'avvio). Il pool avvia i processi da un suo thread che vive quanto
+/// il pool, così il segnale non parte alla fine del thread che ha chiesto il file.
+#[cfg(target_os = "linux")]
+#[test]
+fn busy_orphan_exits_with_its_parent() {
+    let dir = tempfile::tempdir().expect("cartella temporanea");
+    let lock = dir.path().join("lucchetto-occupato.txt");
+    std::fs::write(&lock, b"").expect("file");
+    let parent = orphan_parent("--orphan-parent-busy", &lock);
+    kill_parent_and_wait_for_the_child(parent, &lock);
 }

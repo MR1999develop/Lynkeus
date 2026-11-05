@@ -9,16 +9,18 @@
     reason = "ogni file di test usa una parte diversa del driver"
 )]
 
+use std::fs::{File, OpenOptions};
+use std::io;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use lynkeus_core::{Combine, Location, MatchOptions, Query, Term, WildcardMode};
+use lynkeus_core::{ByteSize, Combine, Location, MatchOptions, Query, Term, WildcardMode};
 use lynkeus_engine::{
     CommandLauncher, DEFAULT_CACHE_SIZE, DocumentSource, ExtractorPool, Filters, Hit, Limits,
-    Received, SearchEvent, SearchHandle, SearchRequest, Summary, TextCache, Warning,
+    PrivateFs, Received, SearchEvent, SearchHandle, SearchRequest, Summary, TextCache, Warning,
     WorkerLauncher, start_search,
 };
 
@@ -92,6 +94,26 @@ pub fn launcher() -> Arc<dyn WorkerLauncher> {
     Arc::new(CommandLauncher::new(test_worker(), None).expect("percorso assoluto"))
 }
 
+/// Cartelle e file normali: nei test i permessi non contano (quelli veri li provano i test
+/// della piattaforma).
+#[derive(Debug)]
+pub struct PlainFs;
+
+impl PrivateFs for PlainFs {
+    fn create_dir(&self, dir: &Path) -> io::Result<()> {
+        std::fs::create_dir_all(dir)
+    }
+
+    fn create_new_file(&self, path: &Path) -> io::Result<File> {
+        OpenOptions::new().write(true).create_new(true).open(path)
+    }
+}
+
+/// Una cache del testo nella cartella `dir`, con limite `max`.
+pub fn text_cache(dir: &Path, max: ByteSize) -> TextCache {
+    TextCache::at(dir.to_owned(), max, Arc::new(PlainFs))
+}
+
 /// Una fonte dei documenti con `launcher`, `size` processi e, se indicata, la cache in
 /// `cache_dir`.
 pub fn documents_with(
@@ -100,7 +122,7 @@ pub fn documents_with(
     cache_dir: Option<&Path>,
 ) -> Arc<DocumentSource> {
     let size = NonZeroUsize::new(size).expect("almeno un processo");
-    let cache = cache_dir.map(|dir| TextCache::new(dir.to_owned(), DEFAULT_CACHE_SIZE));
+    let cache = cache_dir.map(|dir| text_cache(dir, DEFAULT_CACHE_SIZE));
     Arc::new(DocumentSource::new(
         ExtractorPool::new(launcher, size),
         cache,

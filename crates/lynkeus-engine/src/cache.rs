@@ -26,26 +26,36 @@
 //! ```
 //!
 //! In lettura si controllano, in quest'ordine, dimensione del file, magia, versioni, chiave,
-//! lunghezze (prima di allocare), CRC, decompressione esatta, frame e sequenza degli eventi.
+//! lunghezze (prima di allocare), CRC, decompressione esatta, frame e sequenza degli eventi;
+//! solo dopo gli eventi partono verso chi legge, uno alla volta (seconda decodifica dei
+//! frame), senza tenerli tutti in memoria.
 //!
 //! **Scrittura**: file temporaneo creato nuovo (mai sopra un file esistente) nella stessa
-//! cartella, poi rinomina sopra la voce. **Pulizia**: LRU sul totale dei byte delle voci; la
-//! data di modifica di una voce letta si aggiorna, così l'ordine sopravvive al riavvio. Una
-//! voce che da sola supera il limite non si salva.
+//! cartella, poi rinomina sopra la voce. Le scritture fallite si contano, con il primo
+//! errore ([`TextCache::write_failures`]): la cache non mostra messaggi, l'app li registra.
+//!
+//! **Pulizia**: LRU sul totale dei byte delle voci; la data di modifica di una voce letta si
+//! aggiorna, così l'ordine sopravvive al riavvio e vale tra istanze del programma. Una voce
+//! che da sola supera il limite non si salva. L'indice in memoria si rilegge dalla cartella
+//! ogni `RESCAN_PUTS` scritture e a ogni cambio di limite, così le voci scritte da un'altra
+//! istanza contano nel limite.
+//!
+//! L'I/O (elenco della cartella, cancellazioni) avviene sempre fuori dal lucchetto
+//! dell'indice.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use lynkeus_core::ByteSize;
 use lynkeus_extract::protocol::{FrameReader, PROTOCOL_VERSION, encode_frame};
-use lynkeus_extract::{ExtractEvent, ExtractOptions, SequenceCheck};
+use lynkeus_extract::{EventSink, ExtractEvent, ExtractOptions, SequenceCheck, Stopped};
 
-use crate::platform::{PortablePrivateFs, PrivateFs};
+use crate::platform::{self, PrivateFs};
 
 /// Versione del formato delle voci.
 pub const CACHE_FORMAT_VERSION: u16 = 1;
@@ -56,6 +66,9 @@ pub const DEFAULT_CACHE_SIZE: ByteSize = ByteSize::from_mib(500);
 /// Byte massimi dei frame di una voce, decompressi: il testo di un documento più grande non
 /// si salva (si rilegge ogni volta).
 pub const MAX_ENTRY_BYTES: usize = 64 * 1024 * 1024;
+
+/// Ogni quante scritture l'indice si rilegge dalla cartella.
+const RESCAN_PUTS: u64 = 64;
 
 const MAGIC: [u8; 4] = *b"LKC\0";
 const HEADER_BYTES: usize = 4 + 2 + 2 + 32 + 4 + 4 + 4;
@@ -143,6 +156,35 @@ enum Invalid {
     Corrupt,
 }
 
+/// Esito della lettura di una voce verso un destinatario.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CacheRead {
+    /// La voce non c'è o non vale (e si è cancellata): nessun evento mandato.
+    Missing,
+    /// Tutti gli eventi mandati.
+    Delivered,
+    /// Il destinatario ha chiesto di fermarsi.
+    Stopped,
+}
+
+/// Le scritture fallite: quante e la prima.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteFailures {
+    /// Quante, almeno una.
+    pub count: u64,
+    /// La prima: tipo e testo dell'errore del sistema.
+    pub first: WriteFailure,
+}
+
+/// Una scrittura fallita.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteFailure {
+    /// Il tipo di errore.
+    pub kind: io::ErrorKind,
+    /// Il testo dell'errore del sistema (la cartella è quella della cache).
+    pub message: String,
+}
+
 /// Una voce nell'indice in memoria.
 #[derive(Debug, Clone, Copy)]
 struct IndexEntry {
@@ -151,18 +193,24 @@ struct IndexEntry {
     used: u64,
 }
 
-/// L'indice delle voci, caricato al primo uso.
+/// L'indice delle voci, con l'ordine d'uso già ordinato: sfrattare non riordina tutto.
 #[derive(Debug, Default)]
 struct Index {
     entries: HashMap<String, IndexEntry>,
+    by_use: BTreeMap<u64, String>,
     total: u64,
     clock: u64,
+    /// Scritture dall'ultima lettura della cartella.
+    puts_since_scan: u64,
 }
 
 impl Index {
     fn touch(&mut self, name: &str) {
         self.clock += 1;
         if let Some(entry) = self.entries.get_mut(name) {
+            if let Some(owner) = self.by_use.remove(&entry.used) {
+                self.by_use.insert(self.clock, owner);
+            }
             entry.used = self.clock;
         }
     }
@@ -173,14 +221,17 @@ impl Index {
             bytes,
             used: self.clock,
         };
-        if let Some(old) = self.entries.insert(name, entry) {
+        if let Some(old) = self.entries.insert(name.clone(), entry) {
+            self.by_use.remove(&old.used);
             self.total = self.total.saturating_sub(old.bytes);
         }
+        self.by_use.insert(self.clock, name);
         self.total = self.total.saturating_add(bytes);
     }
 
     fn remove(&mut self, name: &str) {
         if let Some(old) = self.entries.remove(name) {
+            self.by_use.remove(&old.used);
             self.total = self.total.saturating_sub(old.bytes);
         }
     }
@@ -188,21 +239,16 @@ impl Index {
     /// Toglie dall'indice le voci meno usate finché il totale sta in `max`, tranne `keep`;
     /// restituisce i nomi da cancellare.
     fn evict(&mut self, max: u64, keep: Option<&str>) -> Vec<String> {
-        if self.total <= max {
-            return Vec::new();
-        }
-        let mut by_age: Vec<(u64, String)> = self
-            .entries
-            .iter()
-            .filter(|(name, _)| Some(name.as_str()) != keep)
-            .map(|(name, entry)| (entry.used, name.clone()))
-            .collect();
-        by_age.sort_unstable();
         let mut victims = Vec::new();
-        for (_, name) in by_age {
-            if self.total <= max {
+        while self.total > max {
+            let oldest = self
+                .by_use
+                .values()
+                .find(|name| Some(name.as_str()) != keep)
+                .cloned();
+            let Some(name) = oldest else {
                 break;
-            }
+            };
             self.remove(&name);
             victims.push(name);
         }
@@ -218,26 +264,37 @@ pub struct TextCache {
     max_bytes: AtomicU64,
     index: Mutex<Option<Index>>,
     private_fs: Arc<dyn PrivateFs>,
+    failed_writes: AtomicU64,
+    first_failure: OnceLock<WriteFailure>,
 }
 
 /// Contatore per i nomi dei temporanei del processo.
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 impl TextCache {
-    /// Una cache nella cartella `dir` (creata, privata, al primo salvataggio), con limite
-    /// `max`. Non tocca il disco finché non serve. Cartella e file si creano con
-    /// [`PortablePrivateFs`]; l'app ne passa uno proprio con [`TextCache::with_private_fs`].
-    pub fn new(dir: PathBuf, max: ByteSize) -> TextCache {
+    /// Una cache nella cartella `dir` (creata al primo salvataggio con `private_fs`, privata),
+    /// con limite `max`. Non tocca il disco finché non serve.
+    pub fn at(dir: PathBuf, max: ByteSize, private_fs: Arc<dyn PrivateFs>) -> TextCache {
         TextCache {
             dir,
             max_bytes: AtomicU64::new(max.bytes()),
             index: Mutex::new(None),
-            private_fs: Arc::new(PortablePrivateFs),
+            private_fs,
+            failed_writes: AtomicU64::new(0),
+            first_failure: OnceLock::new(),
         }
     }
 
-    /// La stessa cache, con cartella e file creati da `private_fs` (su Windows quello
-    /// dell'app, con il descrittore esplicito).
+    /// Come [`TextCache::at`] con le cartelle private di questo crate: fuori da Windows
+    /// `PortablePrivateFs`; su Windows nessuna ([`RefusingFs`](crate::RefusingFs)), quindi
+    /// la cache non scrive finché non riceve quelle dell'app con
+    /// [`TextCache::with_private_fs`]. Per compatibilità: usare [`TextCache::at`].
+    pub fn new(dir: PathBuf, max: ByteSize) -> TextCache {
+        TextCache::at(dir, max, platform::default_private_fs())
+    }
+
+    /// La stessa cache, con cartella e file creati da `private_fs`. Per compatibilità:
+    /// usare [`TextCache::at`].
     #[must_use]
     pub fn with_private_fs(mut self, private_fs: Arc<dyn PrivateFs>) -> TextCache {
         self.private_fs = private_fs;
@@ -254,63 +311,115 @@ impl TextCache {
         ByteSize::from_bytes(self.max_bytes.load(Ordering::Relaxed))
     }
 
-    /// Cambia il limite e, se serve, toglie subito le voci meno usate.
-    pub fn set_max_size(&self, max: ByteSize) {
+    /// Cambia il limite, senza toccare il disco (dal thread dell'interfaccia, nell'ordine
+    /// delle scelte dell'utente); le voci in più le toglie [`TextCache::evict_to_limit`] o la
+    /// prossima scrittura.
+    pub fn set_limit(&self, max: ByteSize) {
         self.max_bytes.store(max.bytes(), Ordering::Relaxed);
+    }
+
+    /// Rilegge la cartella (anche le voci di altre istanze) e toglie le voci meno usate
+    /// finché il totale sta nel limite attuale. Fa I/O: da un thread di lavoro.
+    pub fn evict_to_limit(&self) {
+        let fresh = scan(&self.dir);
         let victims = {
             let mut guard = self.lock_index();
-            self.loaded(&mut guard).evict(max.bytes(), None)
+            guard.insert(fresh).evict(self.max_bytes(), None)
         };
         self.remove_files(&victims);
     }
 
+    /// [`TextCache::set_limit`] più [`TextCache::evict_to_limit`].
+    pub fn set_max_size(&self, max: ByteSize) {
+        self.set_limit(max);
+        self.evict_to_limit();
+    }
+
     /// Byte occupati dalle voci (dopo il primo uso, l'indice in memoria).
     pub fn usage(&self) -> ByteSize {
-        let mut guard = self.lock_index();
-        ByteSize::from_bytes(self.loaded(&mut guard).total)
+        ByteSize::from_bytes(self.with_index(|index| index.total))
+    }
+
+    /// Le scritture fallite finora, con la prima; `None` se nessuna.
+    pub fn write_failures(&self) -> Option<WriteFailures> {
+        let count = self.failed_writes.load(Ordering::Relaxed);
+        let first = self.first_failure.get()?.clone();
+        (count > 0).then_some(WriteFailures { count, first })
     }
 
     /// Gli eventi salvati per `key`, se la voce c'è ed è valida. Una voce non valida si
     /// cancella.
     pub fn get(&self, key: &CacheKey) -> Option<Vec<ExtractEvent>> {
+        let mut events = Vec::new();
+        match self.read(key, &mut events) {
+            CacheRead::Delivered => Some(events),
+            CacheRead::Missing | CacheRead::Stopped => None,
+        }
+    }
+
+    /// Manda a `sink` gli eventi salvati per `key`, uno alla volta, dopo aver verificato
+    /// tutta la voce: o tutti, o nessuno (salvo che `sink` si fermi). Una voce non valida si
+    /// cancella.
+    pub(crate) fn read(&self, key: &CacheKey, sink: &mut dyn EventSink) -> CacheRead {
         let name = key.file_name();
         let path = self.dir.join(&name);
         // Assente o illeggibile ora: nessuna conclusione sulla voce.
         let Ok(Some(bytes)) = read_bounded(&path) else {
-            return None;
+            return CacheRead::Missing;
         };
-        match decode_entry(&bytes, key) {
-            Ok(events) => {
-                if let Some(index) = self.lock_index().as_mut() {
-                    index.touch(&name);
-                }
-                // L'ordine LRU sopravvive al riavvio; se non riesce, poco male.
-                let _touched = touch_file(&path);
-                Some(events)
-            }
+        let checked = decompress_entry(bytes, key)
+            .and_then(|frames| visit_frames(&frames, &mut |_| Ok(())).map(|_| frames));
+        let frames = match checked {
+            Ok(frames) => frames,
             Err(Invalid::Corrupt) => {
                 if let Some(index) = self.lock_index().as_mut() {
                     index.remove(&name);
                 }
+                // Già sparita (altra istanza, pulizia) va bene.
                 let _removed = fs::remove_file(&path);
-                None
+                return CacheRead::Missing;
             }
+        };
+        if let Some(index) = self.lock_index().as_mut() {
+            index.touch(&name);
+        }
+        // L'ordine LRU sopravvive al riavvio; se non riesce, poco male.
+        let _touched = touch_file(&path);
+        // Gli stessi frame appena verificati: la seconda decodifica non fallisce.
+        match visit_frames(&frames, &mut |event| sink.emit(event)) {
+            Ok(Ok(())) | Err(Invalid::Corrupt) => CacheRead::Delivered,
+            Ok(Err(Stopped)) => CacheRead::Stopped,
         }
     }
 
     /// Salva gli eventi di `key`. Una voce più grande del limite (o di [`MAX_ENTRY_BYTES`]
-    /// decompressa) non si salva e non è un errore.
+    /// decompressa) non si salva e non è un errore. Un errore si conta anche in
+    /// [`TextCache::write_failures`].
     pub fn put(&self, key: &CacheKey, events: &[ExtractEvent]) -> io::Result<()> {
+        let saved = self.save(key, events);
+        if let Err(error) = &saved {
+            self.failed_writes.fetch_add(1, Ordering::Relaxed);
+            let first = WriteFailure {
+                kind: error.kind(),
+                message: error.to_string(),
+            };
+            // Solo la prima resta: le altre sono contate.
+            let _kept_first = self.first_failure.set(first);
+        }
+        saved
+    }
+
+    fn save(&self, key: &CacheKey, events: &[ExtractEvent]) -> io::Result<()> {
         let Some(entry) = encode_entry(key, events) else {
             return Ok(());
         };
         let entry_bytes = u64::try_from(entry.len()).unwrap_or(u64::MAX);
-        let max = self.max_bytes.load(Ordering::Relaxed);
+        let max = self.max_bytes();
         if entry_bytes > max {
             return Ok(());
         }
-        // Prima l'indice (che fa anche la pulizia dei temporanei avanzati), poi il file.
-        drop(self.lock_index_loaded());
+        // Prima l'indice (la prima lettura cancella anche i temporanei avanzati), poi il file.
+        self.with_index(|_| ());
         self.private_fs.create_dir(&self.dir)?;
         let name = key.file_name();
         let target = self.dir.join(&name);
@@ -319,28 +428,33 @@ impl TextCache {
             let _removed = fs::remove_file(&temp);
             return Err(error);
         }
-        let victims = {
-            let mut guard = self.lock_index();
-            let index = self.loaded(&mut guard);
+        let (victims, rescan) = self.with_index(|index| {
             index.insert(name.clone(), entry_bytes);
-            index.evict(max, Some(&name))
-        };
+            index.puts_since_scan += 1;
+            (
+                index.evict(max, Some(&name)),
+                index.puts_since_scan >= RESCAN_PUTS,
+            )
+        });
         self.remove_files(&victims);
+        if rescan {
+            self.evict_to_limit();
+        }
         Ok(())
     }
 
-    /// Cancella tutte le voci (e i temporanei); restituisce i byte liberati.
+    /// Cancella tutte le voci (e i temporanei); restituisce i byte liberati. L'elenco e le
+    /// cancellazioni avvengono senza il lucchetto dell'indice, che alla fine si rilegge.
     pub fn clear(&self) -> io::Result<ByteSize> {
-        let mut guard = self.lock_index();
-        let mut freed = 0_u64;
         let listing = match fs::read_dir(&self.dir) {
             Ok(listing) => listing,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                *guard = Some(Index::default());
+                *self.lock_index() = Some(Index::default());
                 return Ok(ByteSize::from_bytes(0));
             }
             Err(error) => return Err(error),
         };
+        let mut freed = 0_u64;
         let mut first_error = None;
         for item in listing.flatten() {
             let path = item.path();
@@ -356,26 +470,33 @@ impl TextCache {
             }
         }
         // L'indice si ricostruisce al prossimo uso da ciò che è rimasto.
-        *guard = None;
+        *self.lock_index() = None;
         match first_error {
             Some(error) => Err(error),
             None => Ok(ByteSize::from_bytes(freed)),
         }
     }
 
+    fn max_bytes(&self) -> u64 {
+        self.max_bytes.load(Ordering::Relaxed)
+    }
+
     fn lock_index(&self) -> MutexGuard<'_, Option<Index>> {
         self.index.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn lock_index_loaded(&self) -> MutexGuard<'_, Option<Index>> {
-        let mut guard = self.lock_index();
-        self.loaded(&mut guard);
-        guard
-    }
-
-    /// L'indice, caricato dalla cartella se non c'è ancora.
-    fn loaded<'g>(&self, guard: &'g mut MutexGuard<'_, Option<Index>>) -> &'g mut Index {
-        guard.get_or_insert_with(|| scan(&self.dir))
+    /// Chiama `use_index` con l'indice; se non c'è ancora lo legge dalla cartella, fuori dal
+    /// lucchetto.
+    fn with_index<T>(&self, use_index: impl FnOnce(&mut Index) -> T) -> T {
+        if self.lock_index().is_none() {
+            let scanned = scan(&self.dir);
+            let mut guard = self.lock_index();
+            if guard.is_none() {
+                *guard = Some(scanned);
+            }
+        }
+        // Svuotata nel frattempo: l'indice vuoto vale fino alla prossima rilettura.
+        use_index(self.lock_index().get_or_insert_with(Index::default))
     }
 
     /// Scrive `entry` in un temporaneo nuovo accanto alla voce `name`.
@@ -518,21 +639,22 @@ fn take<const N: usize>(bytes: &[u8], at: &mut usize) -> Result<[u8; N], Invalid
     slice.try_into().map_err(|_| Invalid::Corrupt)
 }
 
-/// Decodifica una voce e verifica che sia di `key`.
-fn decode_entry(bytes: &[u8], key: &CacheKey) -> Result<Vec<ExtractEvent>, Invalid> {
+/// Verifica intestazione e CRC di una voce di `key` e ne restituisce i frame decompressi; i
+/// byte letti si liberano prima di restituire.
+fn decompress_entry(bytes: Vec<u8>, key: &CacheKey) -> Result<Vec<u8>, Invalid> {
     let mut at = 0;
-    if take::<4>(bytes, &mut at)? != MAGIC
-        || u16::from_le_bytes(take(bytes, &mut at)?) != CACHE_FORMAT_VERSION
-        || u16::from_le_bytes(take(bytes, &mut at)?) != PROTOCOL_VERSION
-        || take::<32>(bytes, &mut at)? != key.0
+    if take::<4>(&bytes, &mut at)? != MAGIC
+        || u16::from_le_bytes(take(&bytes, &mut at)?) != CACHE_FORMAT_VERSION
+        || u16::from_le_bytes(take(&bytes, &mut at)?) != PROTOCOL_VERSION
+        || take::<32>(&bytes, &mut at)? != key.0
     {
         return Err(Invalid::Corrupt);
     }
-    let original_len =
-        usize::try_from(u32::from_le_bytes(take(bytes, &mut at)?)).map_err(|_| Invalid::Corrupt)?;
-    let compressed_len =
-        usize::try_from(u32::from_le_bytes(take(bytes, &mut at)?)).map_err(|_| Invalid::Corrupt)?;
-    let crc = u32::from_le_bytes(take(bytes, &mut at)?);
+    let original_len = usize::try_from(u32::from_le_bytes(take(&bytes, &mut at)?))
+        .map_err(|_| Invalid::Corrupt)?;
+    let compressed_len = usize::try_from(u32::from_le_bytes(take(&bytes, &mut at)?))
+        .map_err(|_| Invalid::Corrupt)?;
+    let crc = u32::from_le_bytes(take(&bytes, &mut at)?);
     if original_len > MAX_ENTRY_BYTES {
         return Err(Invalid::Corrupt);
     }
@@ -545,18 +667,30 @@ fn decode_entry(bytes: &[u8], key: &CacheKey) -> Result<Vec<ExtractEvent>, Inval
     if frames.len() != original_len {
         return Err(Invalid::Corrupt);
     }
-    let mut reader = FrameReader::new(frames.as_slice());
+    // I byte letti non servono più: la memoria si libera prima di decodificare gli eventi.
+    drop(bytes);
+    Ok(frames)
+}
+
+/// Decodifica i frame uno alla volta, controlla la sequenza e passa ogni evento a `visit`.
+/// `Err` se i frame non valgono; `Ok(Err(Stopped))` se `visit` si è fermato.
+fn visit_frames(
+    frames: &[u8],
+    visit: &mut dyn FnMut(ExtractEvent) -> Result<(), Stopped>,
+) -> Result<Result<(), Stopped>, Invalid> {
+    let mut reader = FrameReader::new(frames);
     let mut sequence = SequenceCheck::new();
-    let mut events = Vec::new();
     while let Some(event) = reader
         .read::<ExtractEvent>()
         .map_err(|_| Invalid::Corrupt)?
     {
         sequence.accept(&event).map_err(|_| Invalid::Corrupt)?;
-        events.push(event);
+        if visit(event).is_err() {
+            return Ok(Err(Stopped));
+        }
     }
     sequence.finish().map_err(|_| Invalid::Corrupt)?;
-    Ok(events)
+    Ok(Ok(()))
 }
 
 #[cfg(test)]
@@ -594,8 +728,35 @@ mod tests {
         ]
     }
 
+    /// Cartelle e file normali: nei test i permessi non contano.
+    #[derive(Debug)]
+    struct PlainFs;
+
+    impl PrivateFs for PlainFs {
+        fn create_dir(&self, dir: &Path) -> io::Result<()> {
+            fs::create_dir_all(dir)
+        }
+
+        fn create_new_file(&self, path: &Path) -> io::Result<File> {
+            OpenOptions::new().write(true).create_new(true).open(path)
+        }
+    }
+
     fn cache(dir: &Path, max: ByteSize) -> TextCache {
-        TextCache::new(dir.join("cache"), max)
+        TextCache::at(dir.join("cache"), max, Arc::new(PlainFs))
+    }
+
+    /// Decodifica completa di una voce, come la lettura.
+    fn decode_entry(entry: &[u8], key: &CacheKey) -> Result<Vec<ExtractEvent>, Invalid> {
+        let frames = decompress_entry(entry.to_vec(), key)?;
+        let mut events = Vec::new();
+        match visit_frames(&frames, &mut |event| {
+            events.push(event);
+            Ok(())
+        })? {
+            Ok(()) => Ok(events),
+            Err(Stopped) => Err(Invalid::Corrupt),
+        }
     }
 
     #[test]
@@ -723,7 +884,7 @@ mod tests {
         assert_eq!(second.get(&key(1)), None);
         assert_eq!(second.usage().bytes(), 0);
         // Svuotare una cache mai creata non è un errore.
-        let never = TextCache::new(dir.path().join("mai"), DEFAULT_CACHE_SIZE);
+        let never = cache(&dir.path().join("mai"), DEFAULT_CACHE_SIZE);
         assert_eq!(never.clear().ok(), Some(ByteSize::from_bytes(0)));
     }
 
@@ -736,6 +897,90 @@ mod tests {
         cache.set_max_size(ByteSize::from_bytes(0));
         assert_eq!(cache.usage().bytes(), 0);
         assert_eq!(cache.get(&key(2)), None);
+    }
+
+    /// Su Windows la cache creata senza le cartelle private dell'app non scrive nulla:
+    /// nessuna cartella con i permessi ereditati dal padre (default sicuro).
+    #[cfg(windows)]
+    #[test]
+    fn without_the_private_fs_nothing_is_written_on_windows() {
+        let dir = tempfile::tempdir().expect("cartella");
+        let cache = TextCache::new(dir.path().join("cache"), DEFAULT_CACHE_SIZE);
+        assert!(cache.put(&key(1), &events("carta")).is_err());
+        assert!(!dir.path().join("cache").exists());
+    }
+
+    /// Una scrittura fallita (la cartella della cache è un file) si conta, con il primo
+    /// errore; quelle dopo aumentano solo il conteggio.
+    #[test]
+    fn failed_cache_put_is_counted() {
+        let dir = tempfile::tempdir().expect("cartella");
+        fs::write(dir.path().join("cache"), b"non una cartella").expect("file");
+        let cache = cache(dir.path(), DEFAULT_CACHE_SIZE);
+        assert_eq!(cache.write_failures(), None);
+        assert!(cache.put(&key(1), &events("carta")).is_err());
+        let first = cache.write_failures().expect("errore contato");
+        assert_eq!(first.count, 1);
+        assert!(!first.first.message.is_empty());
+        assert!(cache.put(&key(2), &events("carta")).is_err());
+        let second = cache.write_failures().expect("errore contato");
+        assert_eq!(second.count, 2);
+        assert_eq!(second.first, first.first);
+        // Una voce troppo grande per la cache non è un errore.
+        let small = TextCache::at(
+            dir.path().join("altra"),
+            ByteSize::from_bytes(16),
+            Arc::new(PlainFs),
+        );
+        assert!(small.put(&key(1), &events("carta")).is_ok());
+        assert_eq!(small.write_failures(), None);
+    }
+
+    /// La lettura manda gli eventi uno alla volta e si ferma quando il destinatario lo
+    /// chiede; la voce resta valida.
+    #[test]
+    fn reading_stops_when_the_sink_asks() {
+        struct FirstOnly(Vec<ExtractEvent>);
+        impl EventSink for FirstOnly {
+            fn emit(&mut self, event: ExtractEvent) -> Result<(), Stopped> {
+                self.0.push(event);
+                Err(Stopped)
+            }
+        }
+        let dir = tempfile::tempdir().expect("cartella");
+        let cache = cache(dir.path(), DEFAULT_CACHE_SIZE);
+        assert!(cache.put(&key(1), &events("carta")).is_ok());
+        let mut first = FirstOnly(Vec::new());
+        assert_eq!(cache.read(&key(1), &mut first), CacheRead::Stopped);
+        assert_eq!(first.0.len(), 1);
+        assert_eq!(cache.get(&key(1)), Some(events("carta")));
+    }
+
+    /// Le voci scritte da un'altra istanza contano nel limite dopo la rilettura; l'ordine
+    /// d'uso dell'indice segue letture e scritture.
+    #[test]
+    fn rescans_see_entries_of_other_instances() {
+        let dir = tempfile::tempdir().expect("cartella");
+        let one = encode_entry(&key(1), &events("carta")).expect("voce").len();
+        let max = ByteSize::from_bytes(u64::try_from(one * 2).expect("piccolo"));
+        let first = cache(dir.path(), max);
+        let second = cache(dir.path(), max);
+        assert!(first.put(&key(1), &events("carta")).is_ok());
+        assert!(first.put(&key(2), &events("carta")).is_ok());
+        assert!(second.put(&key(3), &events("carta")).is_ok());
+        assert_eq!(
+            first.usage().bytes(),
+            u64::try_from(one * 2).expect("piccolo")
+        );
+        first.evict_to_limit();
+        assert!(first.usage() <= max);
+        let on_disk = fs::read_dir(first.dir()).expect("cartella").count();
+        assert_eq!(on_disk, 2);
+        // Il limite si cambia senza I/O; lo sfratto lo applica.
+        first.set_limit(ByteSize::from_bytes(0));
+        assert_eq!(first.max_size(), ByteSize::from_bytes(0));
+        first.evict_to_limit();
+        assert_eq!(first.usage().bytes(), 0);
     }
 
     proptest! {

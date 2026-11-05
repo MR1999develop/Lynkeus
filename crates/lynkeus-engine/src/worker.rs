@@ -6,40 +6,51 @@
 //! Tutte le radici vanno in un'unica scansione parallela di `ignore` (filtri standard
 //! spenti, link e junction non seguiti); i thread della scansione leggono anche i file, uno
 //! alla volta ciascuno. `filter_entry` pota le cartelle da saltare e le radici annidate;
-//! il visitatore filtra i file (contandoli) e li cerca.
+//! il visitatore filtra i file (contandoli) e li cerca. I filtri si preparano una volta per
+//! ricerca ([`FileFilter`]).
 //!
 //! I documenti (formato riconosciuto da [`Format::for_path`]) non si leggono nei thread
 //! della scansione: vanno in una coda limitata letta da tanti thread quanti sono i processi
 //! del pool, che li mandano al [`DocumentSource`] (cache o processo estrattore) e cercano
 //! negli eventi ([`DocSearch`]). Senza una fonte dei documenti si contano tra i saltati.
 //!
+//! I risultati non ancora sicuri (AND) trattenuti da tutti i thread insieme non superano il
+//! limite dei risultati ([`HeldHits`]); un file o un documento che non trova posto si
+//! rilegge alla fine con i risultati già sicuri (vedi [`crate::batch`]).
+//!
+//! Il tempo in cui un lettore di documenti aspetta la coda verso il chiamante (interfaccia
+//! lenta o occupata) non conta nella scadenza del processo estrattore.
+//!
 //! Arresto: l'annullamento si controlla prima di ogni voce della scansione e a ogni passo
 //! dentro un file; il primo thread che raggiunge il limite dei risultati o trova il canale
 //! chiuso ferma tutti gli altri. [`SearchEvent::Finished`] parte per ultimo, quando tutti i
 //! thread sono finiti.
 
+use std::cell::Cell;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, SendTimeoutError, Sender};
 use ignore::{DirEntry, WalkBuilder, WalkState};
+use lynkeus_core::Query;
 use lynkeus_extract::{ExtractError, ExtractOptions, Format, open_text};
 
+use crate::batch::{HeldHits, HitBatcher, HitLabel, HitSink};
 use crate::doc::DocPath;
-use crate::docsearch::DocSearch;
+use crate::docsearch::{DocSearch, Pass};
 use crate::documents::DocumentSource;
-use crate::event::{Hit, Outcome, SearchEvent, Summary, Warning, WarningKind};
-use crate::filter::{self, EntryFacts};
-use crate::handle::Notify;
-use crate::pool::ExtractEnd;
+use crate::event::{Hit, Notify, Outcome, SearchEvent, Summary, Warning, WarningKind};
+use crate::filter::{EntryFacts, FileFilter};
+use crate::halt::{Halt, Stop};
+use crate::pool::{ExtractBudget, ExtractEnd};
 use crate::progress::{Counter, Progress};
-use crate::request::{Filters, SearchRequest};
+use crate::request::SearchRequest;
 use crate::roots::{self, PlannedRoot, RootIndex};
-use crate::textfile::{FileError, FileSearch, HitSink, search_text};
+use crate::textfile::{FileError, TextEnd, search_text};
 
 /// Attesa massima su una coda piena prima di ricontrollare l'annullamento.
 const SEND_RECHECK: Duration = Duration::from_millis(50);
@@ -62,60 +73,18 @@ struct QueuedDocument {
     path: PathBuf,
 }
 
-/// Perché la ricerca si ferma prima della fine.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Stop {
-    Cancelled,
-    LimitReached,
-    /// Il chiamante ha chiuso la maniglia: non c'è più nessuno a cui consegnare eventi.
-    Disconnected,
-}
-
-/// Il primo motivo d'arresto, condiviso tra i thread; il canale chiuso prevale su tutto.
-#[derive(Debug, Default)]
-struct Halt(AtomicU8);
-
-impl Halt {
-    const RUNNING: u8 = 0;
-    const CANCELLED: u8 = 1;
-    const LIMIT_REACHED: u8 = 2;
-    const DISCONNECTED: u8 = 3;
-
-    fn record(&self, stop: Stop) {
-        let code = match stop {
-            Stop::Cancelled => Self::CANCELLED,
-            Stop::LimitReached => Self::LIMIT_REACHED,
-            Stop::Disconnected => {
-                self.0.store(Self::DISCONNECTED, Ordering::Relaxed);
-                return;
-            }
-        };
-        // Vince il primo; se un altro thread ha già registrato un motivo, va bene così.
-        if self
-            .0
-            .compare_exchange(Self::RUNNING, code, Ordering::Relaxed, Ordering::Relaxed)
-            .is_err()
-        {}
-    }
-
-    fn get(&self) -> Option<Stop> {
-        match self.0.load(Ordering::Relaxed) {
-            Self::CANCELLED => Some(Stop::Cancelled),
-            Self::LIMIT_REACHED => Some(Stop::LimitReached),
-            Self::DISCONNECTED => Some(Stop::Disconnected),
-            _ => None,
-        }
-    }
-}
-
 /// Esegue tutta la ricerca e manda [`SearchEvent::Finished`] per ultimo.
 pub(crate) fn run(request: &SearchRequest, context: &WorkerContext) {
     let started = Instant::now();
     let search = Search {
         request,
         context,
+        filter: FileFilter::new(&request.filters),
         halt: Halt::default(),
         budget: Budget::new(request.limits.max_results),
+        // Oltre il limite un documento tiene solo i risultati con un termine nuovo: al più
+        // uno per termine in più.
+        held: HeldHits::new(request.limits.max_results.saturating_add(Query::MAX_TERMS)),
     };
     search.all_roots();
     let outcome = match search.halt.get() {
@@ -137,24 +106,16 @@ pub(crate) fn run(request: &SearchRequest, context: &WorkerContext) {
 }
 
 /// Stato di una ricerca, condiviso (per riferimento) dai thread della scansione.
-pub(crate) struct Search<'a> {
+struct Search<'a> {
     request: &'a SearchRequest,
     context: &'a WorkerContext,
+    filter: FileFilter,
     halt: Halt,
     budget: Budget,
+    held: HeldHits,
 }
 
 impl Search<'_> {
-    /// La richiesta.
-    pub(crate) fn request(&self) -> &SearchRequest {
-        self.request
-    }
-
-    /// Il contesto condiviso con la maniglia.
-    pub(crate) fn context(&self) -> &WorkerContext {
-        self.context
-    }
-
     fn all_roots(&self) {
         if let Err(stop) = self.check() {
             self.halt.record(stop);
@@ -204,7 +165,7 @@ impl Search<'_> {
             builder.add(&root.path);
         }
         let dir_filter = DirFilter {
-            filters: self.request.filters.clone(),
+            filter: self.filter.clone(),
             roots: Arc::clone(index),
         };
         builder
@@ -255,8 +216,11 @@ impl Search<'_> {
         progress.add(Counter::FilesSeen, 1);
         let metadata = entry.metadata().ok();
         let facts = EntryFacts::read(entry.file_name(), metadata.as_ref());
-        let filters = &self.request.filters;
-        if filter::check_file(entry.path(), facts, entry.depth() == 0, filters).is_err() {
+        if self
+            .filter
+            .check_file(entry.path(), facts, entry.depth() == 0)
+            .is_err()
+        {
             progress.add(Counter::FilesSkipped, 1);
             return Ok(());
         }
@@ -312,66 +276,103 @@ impl Search<'_> {
         }
     }
 
-    /// Legge e cerca un documento.
+    /// Legge e cerca un documento; se qualche documento interno va riletto (vedi
+    /// [`crate::batch`]), lo rilegge.
     fn document(&self, documents: &DocumentSource, document: &QueuedDocument) -> Result<(), Stop> {
         let progress = &self.context.progress;
         progress.set_current(Some(Arc::new(DocPath::file(&document.path))));
+        let mut rereads = Vec::new();
+        let end = self.extract_document(documents, document, Pass::First, &mut rereads)?;
+        if end == ExtractEnd::Completed {
+            progress.add(Counter::FilesSearched, 1);
+            if !rereads.is_empty() {
+                self.extract_document(
+                    documents,
+                    document,
+                    Pass::Reread(&rereads),
+                    &mut Vec::new(),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Una lettura del documento: gli eventi vanno a una [`DocSearch`] per `pass`; un
+    /// fallimento diventa un avviso. Le voci da rileggere finiscono in `rereads`.
+    fn extract_document(
+        &self,
+        documents: &DocumentSource,
+        document: &QueuedDocument,
+        pass: Pass<'_>,
+        rereads: &mut Vec<Vec<String>>,
+    ) -> Result<ExtractEnd, Stop> {
         let options = ExtractOptions {
             limits: self.request.limits.archive,
         };
         let stop = || self.check().is_err();
+        let waited = Cell::new(Duration::ZERO);
+        let paused = || waited.get();
+        let budget = ExtractBudget::with_pause(self.request.limits.extract_timeout, &paused);
+        let sink = SharedSink {
+            search: self,
+            waited: Some(&waited),
+        };
         let mut events = DocSearch::new(
-            self,
-            SharedSink { search: self },
+            self.request,
+            &self.context.progress,
+            &self.held,
+            sink,
             &document.path,
             document.root,
+            pass,
         );
-        let (end, _) = documents.extract(
-            &document.path,
-            &options,
-            self.request.limits.extract_timeout,
-            &stop,
-            &mut events,
-        );
+        let (end, _) =
+            documents.extract_within(&document.path, &options, &budget, &stop, &mut events);
+        *rereads = events.take_rereads();
         match end {
-            ExtractEnd::Completed => {
-                progress.add(Counter::FilesSearched, 1);
-                Ok(())
-            }
+            ExtractEnd::Completed => Ok(end),
             ExtractEnd::Stopped => match events.stopped() {
                 Some(stop) => Err(stop),
-                None => self.check(),
+                None => self.check().map(|()| end),
             },
-            ExtractEnd::Failed(failure) => {
-                let doc = events.interrupted_doc();
-                self.warn_shared(doc, failure.warning_kind())
-            }
+            ExtractEnd::Failed(failure) => events
+                .warn_interrupted(failure.warning_kind())
+                .map(|()| end),
         }
     }
 
-    /// Legge e cerca un file di testo.
+    /// Legge e cerca un file di testo; se il file va riletto (vedi [`crate::batch`]), lo
+    /// rilegge con i risultati già sicuri.
     fn text_file(&self, root: &PlannedRoot, path: &Path) -> Result<(), Stop> {
         let progress = &self.context.progress;
         let doc = Arc::new(DocPath::file(path));
         progress.set_current(Some(Arc::clone(&doc)));
-        let max_size = filter::max_read_size(&self.request.filters);
-        let mut reader = match open_text(path, max_size) {
-            Ok(reader) => reader,
-            Err(error) => return self.unreadable(doc, &error),
-        };
-        let file = FileSearch {
+        let label = HitLabel {
             query: &self.request.query,
             limits: &self.request.limits,
             root: root.index,
             doc: Arc::clone(&doc),
         };
-        match search_text(&mut reader, &file, &mut SharedSink { search: self }) {
-            Ok(()) => {
-                progress.add(Counter::FilesSearched, 1);
-                Ok(())
+        let query = &self.request.query;
+        let mut batcher = HitBatcher::new(query, &self.held);
+        loop {
+            let mut reader = match open_text(path, self.filter.max_read_size()) {
+                Ok(reader) => reader,
+                Err(error) => return self.unreadable(doc, &error),
+            };
+            let sink = &mut SharedSink {
+                search: self,
+                waited: None,
+            };
+            match search_text(&mut reader, &label, batcher, sink) {
+                Ok(TextEnd::Searched) => {
+                    progress.add(Counter::FilesSearched, 1);
+                    return Ok(());
+                }
+                Ok(TextEnd::Reread) => batcher = HitBatcher::satisfied(query, &self.held),
+                Err(FileError::Stop(stop)) => return Err(stop),
+                Err(FileError::Read(error)) => return self.unreadable(doc, &error),
             }
-            Err(FileError::Stop(stop)) => Err(stop),
-            Err(FileError::Read(error)) => self.unreadable(doc, &error),
         }
     }
 
@@ -405,7 +406,7 @@ impl Search<'_> {
         self.warn_shared(Arc::new(doc), kind)
     }
 
-    pub(crate) fn warn_shared(&self, doc: Arc<DocPath>, kind: WarningKind) -> Result<(), Stop> {
+    fn warn_shared(&self, doc: Arc<DocPath>, kind: WarningKind) -> Result<(), Stop> {
         self.context.progress.add(Counter::Warnings, 1);
         self.send(SearchEvent::Warning(Warning { doc, kind }))
     }
@@ -467,9 +468,23 @@ impl Budget {
     }
 }
 
-/// I risultati di un file verso il canale, nel rispetto del limite.
+/// I risultati e gli avvisi di un file verso il canale, nel rispetto del limite.
 struct SharedSink<'a, 'b> {
     search: &'a Search<'b>,
+    /// Se c'è, vi si somma il tempo passato ad aspettare la coda verso il chiamante.
+    waited: Option<&'a Cell<Duration>>,
+}
+
+impl SharedSink<'_, '_> {
+    /// Manda `event` contando l'attesa in `waited`.
+    fn send_timed(&self, send: impl FnOnce() -> Result<(), Stop>) -> Result<(), Stop> {
+        let started = Instant::now();
+        let sent = send();
+        if let Some(waited) = self.waited {
+            waited.set(waited.get().saturating_add(started.elapsed()));
+        }
+        sent
+    }
 }
 
 impl HitSink for SharedSink<'_, '_> {
@@ -487,7 +502,7 @@ impl HitSink for SharedSink<'_, '_> {
         if !hits.is_empty() {
             let count = u64::try_from(hits.len()).unwrap_or(u64::MAX);
             self.search.context.progress.add(Counter::Hits, count);
-            self.search.send(SearchEvent::Hits(hits))?;
+            self.send_timed(|| self.search.send(SearchEvent::Hits(hits)))?;
         }
         if full {
             Err(Stop::LimitReached)
@@ -495,11 +510,15 @@ impl HitSink for SharedSink<'_, '_> {
             Ok(())
         }
     }
+
+    fn warn(&mut self, doc: Arc<DocPath>, kind: WarningKind) -> Result<(), Stop> {
+        self.send_timed(|| self.search.warn_shared(doc, kind))
+    }
 }
 
 /// Il filtro delle voci della scansione: pota cartelle e radici annidate.
 struct DirFilter {
-    filters: Filters,
+    filter: FileFilter,
     roots: Arc<RootIndex>,
 }
 
@@ -520,7 +539,7 @@ impl DirFilter {
             return true;
         }
         let facts = EntryFacts::read(entry.file_name(), entry.metadata().ok().as_ref());
-        filter::enter_dir(entry.file_name(), facts, &self.filters)
+        self.filter.enter_dir(entry.file_name(), facts)
     }
 }
 
@@ -546,17 +565,6 @@ fn error_path(error: &ignore::Error) -> Option<&Path> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn halt_keeps_the_first_reason_but_disconnection_wins() {
-        let halt = Halt::default();
-        assert_eq!(halt.get(), None);
-        halt.record(Stop::LimitReached);
-        halt.record(Stop::Cancelled);
-        assert_eq!(halt.get(), Some(Stop::LimitReached));
-        halt.record(Stop::Disconnected);
-        assert_eq!(halt.get(), Some(Stop::Disconnected));
-    }
 
     #[test]
     fn budget_reservations() {

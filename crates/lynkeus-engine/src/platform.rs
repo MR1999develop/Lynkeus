@@ -6,9 +6,10 @@
 //!
 //! **File privati** ([`PrivateFs`]): l'engine non ha codice `unsafe`, quindi su Windows il
 //! descrittore esplicito (solo utente e SYSTEM) lo mette l'app, che inietta la sua
-//! implementazione; [`PortablePrivateFs`] è quella di questo crate: su Linux completa
-//! (0700 e 0600, verifica di proprietario e permessi di una cartella esistente), su Windows
-//! senza descrittore (la cartella eredita i permessi del padre).
+//! implementazione. Questo crate ha solo `PortablePrivateFs`, fuori da Windows (0700 e
+//! 0600, verifica di proprietario e permessi di una cartella esistente); su Windows al suo
+//! posto c'è [`RefusingFs`], che rifiuta ogni creazione: senza l'implementazione dell'app
+//! nulla si scrive con i permessi ereditati dal padre.
 //!
 //! Gli attributi si leggono dai metadati della scansione: su Windows vengono dall'elenco
 //! della cartella (`FindNextFileW`), senza aprire il file, quindi senza scaricare i file
@@ -58,17 +59,16 @@ impl NotPrivate {
     }
 }
 
-/// Cartelle e file privati senza codice `unsafe`.
-///
-/// - Linux: cartelle create con 0700, file con `O_CREAT|O_EXCL|O_NOFOLLOW` e 0600 (la
-///   `umask` può solo restringere); una cartella esistente si apre con
-///   `O_DIRECTORY|O_NOFOLLOW` e si controlla sul descrittore: stesso uid, nessun permesso
-///   per gruppo e altri, altrimenti [`NotPrivate`] (nessun `chmod` silenzioso).
-/// - Windows: `create_dir_all` e `create_new`, con i permessi ereditati dal padre. L'app
-///   usa al suo posto la versione con il descrittore esplicito.
+/// Cartelle e file privati senza codice `unsafe`, fuori da Windows: cartelle create con
+/// 0700, file con `O_CREAT|O_EXCL|O_NOFOLLOW` e 0600 (la `umask` può solo restringere); una
+/// cartella esistente si apre con `O_DIRECTORY|O_NOFOLLOW` e si controlla sul descrittore:
+/// stesso uid, nessun permesso per gruppo e altri, altrimenti [`NotPrivate`] (nessun `chmod`
+/// silenzioso).
+#[cfg(not(windows))]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PortablePrivateFs;
 
+#[cfg(not(windows))]
 impl PrivateFs for PortablePrivateFs {
     fn create_dir(&self, dir: &Path) -> io::Result<()> {
         imp::create_private_dir(dir)
@@ -80,13 +80,43 @@ impl PrivateFs for PortablePrivateFs {
 }
 
 /// [`PortablePrivateFs::create_dir`].
+#[cfg(not(windows))]
 pub fn create_private_dir(dir: &Path) -> io::Result<()> {
     PortablePrivateFs.create_dir(dir)
 }
 
 /// [`PortablePrivateFs::create_new_file`].
+#[cfg(not(windows))]
 pub fn create_new_private_file(path: &Path) -> io::Result<File> {
     PortablePrivateFs.create_new_file(path)
+}
+
+/// Rifiuta ogni creazione (`PermissionDenied`): la scelta sicura dove questo crate non sa
+/// creare file privati (Windows) e nessuno gli ha dato un [`PrivateFs`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RefusingFs;
+
+impl PrivateFs for RefusingFs {
+    fn create_dir(&self, _dir: &Path) -> io::Result<()> {
+        Err(refused())
+    }
+
+    fn create_new_file(&self, _path: &Path) -> io::Result<File> {
+        Err(refused())
+    }
+}
+
+fn refused() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        "nessuna implementazione delle cartelle private",
+    )
+}
+
+/// Le cartelle private di questo crate: `PortablePrivateFs` fuori da Windows,
+/// [`RefusingFs`] su Windows.
+pub(crate) fn default_private_fs() -> std::sync::Arc<dyn PrivateFs> {
+    imp::default_private_fs()
 }
 
 /// Vero se il file o la cartella è nascosto o di sistema: su Windows attributi `HIDDEN` o
@@ -101,14 +131,46 @@ pub fn is_online_only(metadata: &Metadata) -> bool {
     imp::is_online_only(metadata)
 }
 
-/// Confronto tra un nome di cartella e un nome da saltare: senza maiuscole su Windows,
-/// dove il file system non le distingue; esatto altrove.
-pub fn dir_name_matches(name: &OsStr, skip: &str) -> bool {
+/// La forma di confronto di un nome di cartella da saltare, da preparare una volta per
+/// ricerca: in minuscolo su Windows, dove il file system non distingue le maiuscole;
+/// identica altrove.
+pub(crate) fn dir_name_key(skip: &str) -> String {
+    if imp::CASE_INSENSITIVE {
+        skip.to_lowercase()
+    } else {
+        skip.to_owned()
+    }
+}
+
+/// Vero se il nome di cartella `name` corrisponde a `key` ([`dir_name_key`]); senza
+/// allocare per i nomi ASCII.
+pub(crate) fn dir_name_is(name: &OsStr, key: &str) -> bool {
     let name = name.to_string_lossy();
     if imp::CASE_INSENSITIVE {
-        name.to_lowercase() == skip.to_lowercase()
+        lowercase_eq(&name, key)
     } else {
-        name == skip
+        name == key
+    }
+}
+
+/// Vero se l'ultima estensione di `path` è `lower` (in minuscolo), senza distinguere le
+/// maiuscole del nome del file e senza allocare per le estensioni ASCII.
+pub(crate) fn extension_is(path: &Path, lower: &str) -> bool {
+    path.extension()
+        .is_some_and(|ext| lowercase_eq(&ext.to_string_lossy(), lower))
+}
+
+/// Vero se `candidate` in minuscolo è `lower` (già in minuscolo): come
+/// `candidate.to_lowercase() == lower`, ma senza allocare quando `candidate` è ASCII.
+pub(crate) fn lowercase_eq(candidate: &str, lower: &str) -> bool {
+    if candidate.is_ascii() {
+        candidate.len() == lower.len()
+            && candidate
+                .bytes()
+                .zip(lower.bytes())
+                .all(|(c, l)| c.to_ascii_lowercase() == l)
+    } else {
+        candidate.to_lowercase() == lower
     }
 }
 
@@ -150,21 +212,18 @@ fn lexical_normalize(path: &Path) -> PathBuf {
 #[cfg(windows)]
 mod imp {
     use std::ffi::OsStr;
-    use std::fs::{File, Metadata, OpenOptions};
-    use std::io;
+    use std::fs::Metadata;
     use std::os::windows::fs::MetadataExt;
-    use std::path::Path;
+    use std::sync::Arc;
+
+    use super::{PrivateFs, RefusingFs};
 
     pub const CASE_INSENSITIVE: bool = true;
 
     pub const KEPT_ENV_VARS: &[&str] = &["SystemRoot"];
 
-    pub fn create_private_dir(dir: &Path) -> io::Result<()> {
-        std::fs::create_dir_all(dir)
-    }
-
-    pub fn create_new_private_file(path: &Path) -> io::Result<File> {
-        OpenOptions::new().write(true).create_new(true).open(path)
+    pub fn default_private_fs() -> Arc<dyn PrivateFs> {
+        Arc::new(RefusingFs)
     }
 
     const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
@@ -196,13 +255,19 @@ mod imp {
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
     use std::path::Path;
 
+    use std::sync::Arc;
+
     use rustix::fs::{Mode, OFlags};
 
-    use super::NotPrivate;
+    use super::{NotPrivate, PortablePrivateFs, PrivateFs};
 
     pub const CASE_INSENSITIVE: bool = false;
 
     pub const KEPT_ENV_VARS: &[&str] = &[];
+
+    pub fn default_private_fs() -> Arc<dyn PrivateFs> {
+        Arc::new(PortablePrivateFs)
+    }
 
     /// Permessi di gruppo e altri: in una cartella privata devono essere tutti spenti.
     const GROUP_OTHER_BITS: u32 = 0o077;
@@ -262,12 +327,28 @@ mod tests {
 
     #[test]
     fn skip_names() {
-        assert!(dir_name_matches(OsStr::new("target"), "target"));
-        assert!(!dir_name_matches(OsStr::new("targets"), "target"));
-        assert_eq!(
-            dir_name_matches(OsStr::new("$Recycle.Bin"), "$RECYCLE.BIN"),
-            cfg!(windows)
-        );
+        let matches = |name: &str, skip: &str| dir_name_is(OsStr::new(name), &dir_name_key(skip));
+        assert!(matches("target", "target"));
+        assert!(!matches("targets", "target"));
+        assert_eq!(matches("$Recycle.Bin", "$RECYCLE.BIN"), cfg!(windows));
+        assert_eq!(matches("CITTÀ", "città"), cfg!(windows));
+    }
+
+    proptest::proptest! {
+        /// Il confronto senza allocazioni dà lo stesso esito di `to_lowercase`, anche per
+        /// i caratteri che cambiano lunghezza o hanno regole speciali (sigma finale).
+        #[test]
+        fn lowercase_eq_matches_to_lowercase(
+            candidate in "[a-zA-Z0-9ÀÈàèΣσςİıẞß.]{0,8}",
+            other in "[a-zA-Z0-9ÀÈàèΣσςİıẞß.]{0,8}",
+        ) {
+            let lower = other.to_lowercase();
+            proptest::prop_assert_eq!(
+                lowercase_eq(&candidate, &lower),
+                candidate.to_lowercase() == lower
+            );
+            proptest::prop_assert!(lowercase_eq(&candidate, &candidate.to_lowercase()));
+        }
     }
 
     #[test]
@@ -283,6 +364,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn private_files_are_new_only() {
         let dir = tempfile::tempdir().expect("cartella");
@@ -297,6 +379,16 @@ mod tests {
             again.map_err(|e| e.kind()),
             Err(io::ErrorKind::AlreadyExists)
         );
+    }
+
+    #[test]
+    fn the_refusing_fs_creates_nothing() {
+        let dir = tempfile::tempdir().expect("cartella");
+        let inside = dir.path().join("cache");
+        assert!(RefusingFs.create_dir(&inside).is_err());
+        assert!(RefusingFs.create_new_file(&dir.path().join("f")).is_err());
+        assert!(!inside.exists());
+        assert!(!dir.path().join("f").exists());
     }
 
     #[test]
