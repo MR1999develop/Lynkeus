@@ -533,28 +533,29 @@ fn malicious_files_end_with_the_expected_warnings_and_write_nothing_outside() {
     assert_eq!(summary.outcome, Outcome::Completed);
 
     let all = &app.results().warnings;
-    let expected = [
+    let memory = WarningKind::LimitExceeded(LimitKind::Memory);
+    let expected: [(&str, &[WarningKind]); 7] = [
         (
             "bomba.zip",
-            WarningKind::LimitExceeded(LimitKind::CompressionRatio),
+            &[WarningKind::LimitExceeded(LimitKind::CompressionRatio)],
         ),
         (
             "annidato-profondo.zip",
-            WarningKind::LimitExceeded(LimitKind::ArchiveDepth),
+            &[WarningKind::LimitExceeded(LimitKind::ArchiveDepth)],
         ),
-        ("immagine-finta.pdf", WarningKind::ContentMismatch),
-        ("entita.docx", WarningKind::Corrupt),
-        ("troncato.pdf", WarningKind::Corrupt),
-        (
-            "testo-ripetuto.ods",
-            WarningKind::LimitExceeded(LimitKind::Memory),
-        ),
+        ("immagine-finta.pdf", &[WarningKind::ContentMismatch]),
+        ("entita.docx", &[WarningKind::Corrupt]),
+        ("troncato.pdf", &[WarningKind::Corrupt]),
+        ("testo-ripetuto.ods", &[memory]),
+        // Il nome GNU e l'estensione PAX oltre il tetto: un avviso per voce.
+        ("nomi-lunghi.tar.gz", &[memory, memory]),
     ];
-    for (file, kind) in expected {
-        assert_eq!(warning_kinds(&app, file), [kind], "{file}: {all:?}");
+    for (file, kinds) in expected {
+        assert_eq!(warning_kinds(&app, file), kinds, "{file}: {all:?}");
     }
     // Nessun altro avviso: percorsi.zip e riga-lunga.txt si leggono.
-    assert_eq!(all.len(), expected.len(), "{all:?}");
+    let count: usize = expected.iter().map(|(_, kinds)| kinds.len()).sum();
+    assert_eq!(all.len(), count, "{all:?}");
 
     let hits = &app.results().hits;
     assert!(
