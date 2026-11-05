@@ -7,6 +7,7 @@
 
 mod common;
 
+use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -353,6 +354,63 @@ fn second_search_reads_from_the_cache_and_corrupt_entries_are_dropped() {
             .all(|(_, _, kind)| *kind == WarningKind::ExtractorUnavailable)
     );
     assert!(entries.iter().all(|e| !e.exists()));
+}
+
+/// Una scrittura della cache interrotta (app uccisa, disco pieno) lascia un temporaneo
+/// parziale; una copia o un ripristino interrotti della cartella lasciano una voce troncata.
+/// La voce troncata si scarta e il documento si rilegge; il temporaneo vecchio si cancella,
+/// quello recente (forse di un'altra istanza che sta scrivendo) resta.
+#[test]
+fn interrupted_cache_writes_are_ignored_and_the_document_is_read_again() {
+    let docs = misbehaving_dir(&[]);
+    let cache = tempfile::tempdir().expect("cartella della cache");
+    let cache_dir = cache.path().join("cache");
+    let carta = || request(vec![docs.path().to_owned()], &["carta"], Combine::Any);
+
+    let first = run_with(
+        carta(),
+        Some(documents_with(launcher(), 1, Some(&cache_dir))),
+    );
+    assert!(first.warnings.is_empty(), "{:?}", first.warnings);
+    assert_eq!(words(&first), [row("note.docx", &[], "carta")]);
+    let entries: Vec<PathBuf> = std::fs::read_dir(&cache_dir)
+        .expect("cartella della cache")
+        .flatten()
+        .map(|e| e.path())
+        .collect();
+    let [entry] = entries.as_slice() else {
+        panic!("una sola voce attesa: {entries:?}");
+    };
+    let bytes = std::fs::read(entry).expect("voce");
+    let half = bytes.get(..bytes.len() / 2).expect("metà");
+    std::fs::write(entry, half).expect("voce troncata");
+    let name = file_name(entry);
+    let stale = cache_dir.join(format!("{name}.1-0.tmp"));
+    let fresh = cache_dir.join(format!("{name}.2-0.tmp"));
+    std::fs::write(&stale, half).expect("temporaneo vecchio");
+    std::fs::write(&fresh, half).expect("temporaneo recente");
+    let two_hours_ago = std::time::SystemTime::now() - Duration::from_secs(2 * 60 * 60);
+    File::options()
+        .write(true)
+        .open(&stale)
+        .and_then(|f| f.set_modified(two_hours_ago))
+        .expect("data del temporaneo");
+
+    let source = documents_with(launcher(), 1, Some(&cache_dir));
+    let second = run_with(carta(), Some(Arc::clone(&source)));
+    assert!(second.warnings.is_empty(), "{:?}", second.warnings);
+    assert_eq!(words(&second), words(&first));
+    assert_eq!(source.cache_hits(), 0);
+    assert_eq!(source.pool().launches(), 1);
+    assert!(!stale.exists(), "temporaneo vecchio non cancellato");
+    assert!(fresh.exists(), "temporaneo recente cancellato");
+
+    // La voce riscritta è valida: senza processi la terza ricerca la legge dalla cache.
+    let cached = documents_with(Arc::new(NoLaunch), 1, Some(&cache_dir));
+    let third = run_with(carta(), Some(Arc::clone(&cached)));
+    assert!(third.warnings.is_empty(), "{:?}", third.warnings);
+    assert_eq!(words(&third), words(&first));
+    assert_eq!(cached.cache_hits(), 1);
 }
 
 #[test]

@@ -2,7 +2,9 @@
 // Copyright (C) 2026 MR
 
 //! Archivi costruiti dal test: limiti abbassati, voci cifrate e speciali, contenuto che
-//! mente dentro un archivio, arresto chiesto dal destinatario.
+//! mente dentro un archivio, arresto chiesto dal destinatario. Le fixture ostili che
+//! sarebbero grandi o dipendenti dal sistema (molte voci, link simbolici) si generano qui
+//! invece di stare in `fixtures/malevoli/`.
 
 use std::io::{Cursor, Write};
 use std::path::Path;
@@ -114,6 +116,31 @@ fn too_many_entries() {
     assert_eq!(documents(&run("tante.zip", bytes, limits)).len(), 3);
 }
 
+/// `malevoli/molte-voci.zip` del threat model, generato al volo: 100.001 voci vuote (circa
+/// 9 MB) non stanno nel repository.
+#[test]
+fn many_entries_zip_hits_the_default_limit() {
+    let over = ArchiveLimits::default().max_entries.saturating_add(1);
+    let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+    for i in 0..over {
+        assert!(
+            writer
+                .start_file(format!("{i}.txt"), SimpleFileOptions::default())
+                .is_ok()
+        );
+    }
+    let bytes = writer.finish().map(Cursor::into_inner).unwrap_or_default();
+    let events = run("molte-voci.zip", bytes, ArchiveLimits::default());
+    // L'elenco si conta prima di decomprimere: nessuna voce letta.
+    assert_eq!(
+        events,
+        [ExtractEvent::Warning {
+            inner: Vec::new(),
+            kind: WarningKind::LimitExceeded(LimitKind::ArchiveEntries)
+        }]
+    );
+}
+
 #[test]
 fn entry_size_limit_is_counted_on_the_stream() {
     let bytes = zip_of(&[("grande.txt", &[b'x'; 5000]), ("piccolo.txt", b"aragosta")]);
@@ -184,6 +211,67 @@ fn lying_extension_inside_archive() {
     assert!(!png.is_empty());
     let bytes = zip_of(&[("finta.pdf", &png), ("vera.txt", b"aragosta")]);
     let events = run("a.zip", bytes, ArchiveLimits::default());
+    assert_eq!(
+        warnings(&events),
+        [(names(&["finta.pdf"]), WarningKind::ContentMismatch)]
+    );
+    assert_eq!(documents(&events), [names(&["vera.txt"])]);
+}
+
+/// Un tar ostile: link simbolici verso file di sistema e fuori dall'archivio, link fisico,
+/// FIFO e una voce con estensione che mente. I link non si seguono e non creano file; la
+/// voce che mente dà l'avviso; la voce regolare si legge.
+#[test]
+fn tar_with_links_special_entries_and_a_lying_extension() {
+    let png = std::fs::read(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/malevoli/immagine-finta.pdf"),
+    )
+    .unwrap_or_default();
+    assert!(!png.is_empty());
+    let mut builder = tar::Builder::new(Vec::new());
+    for (name, target, kind) in [
+        ("passwd.txt", "/etc/passwd", tar::EntryType::Symlink),
+        ("fuori.txt", "../../fuori.txt", tar::EntryType::Symlink),
+        ("windows.txt", "C:/Windows/win.ini", tar::EntryType::Symlink),
+        ("duro.txt", "vera.txt", tar::EntryType::Link),
+    ] {
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(kind);
+        header.set_size(0);
+        assert!(builder.append_link(&mut header, name, target).is_ok());
+    }
+    let mut fifo = tar::Header::new_gnu();
+    fifo.set_entry_type(tar::EntryType::Fifo);
+    fifo.set_size(0);
+    fifo.set_cksum();
+    assert!(builder.append_data(&mut fifo, "tubo.txt", &[][..]).is_ok());
+    for (name, data) in [("finta.pdf", png.as_slice()), ("vera.txt", b"aragosta")] {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(u64::try_from(data.len()).unwrap_or(0));
+        header.set_mode(0o644);
+        header.set_cksum();
+        assert!(builder.append_data(&mut header, name, data).is_ok());
+    }
+    let bytes = builder.into_inner().unwrap_or_default();
+    let events = run("ostile.tar", bytes, ArchiveLimits::default());
+    let skipped: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            ExtractEvent::Skipped { inner, reason } => Some((inner.clone(), *reason)),
+            _ => None,
+        })
+        .collect();
+    let special = |name: &str| (names(&[name]), SkipReason::SpecialEntry);
+    assert_eq!(
+        skipped,
+        [
+            special("passwd.txt"),
+            special("fuori.txt"),
+            special("windows.txt"),
+            special("duro.txt"),
+            special("tubo.txt"),
+        ]
+    );
     assert_eq!(
         warnings(&events),
         [(names(&["finta.pdf"]), WarningKind::ContentMismatch)]
