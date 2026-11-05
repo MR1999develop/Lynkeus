@@ -12,6 +12,14 @@ Solo ciò che è specifico di questo progetto. Le decisioni stanno in `PLAN.md`.
 - `cargo xtask check`: fmt, clippy `-Dwarnings`, test, `cargo deny check`.
 - `cargo xtask check-linux`: controllo di compilazione per il target Linux.
 - `cargo xtask dist`: build di rilascio, verifiche, zip e `SHA256SUMS`.
+- `cargo xtask release`: come `dist`, con `cargo auditable` e SBOM (usato dalla CI di rilascio).
+- `cargo xtask test-plan [--quick] [--level 1,2,3,4,5]`: piano di test automatico, rapporto in `target/test-plan/`. `--clipboard` (sovrascrive gli appunti) e `--registry` (scrive nel registro) solo su richiesta.
+- Build e test uno alla volta, con `CARGO_BUILD_JOBS=6` e `RUST_TEST_THREADS=6`: build parallele in release hanno saturato la memoria della macchina.
+
+## `unsafe`
+
+- `#![forbid(unsafe_code)]` in core, extract ed engine; nell'app `#![deny(unsafe_code)]` con un solo modulo ammesso, `crates/lynkeus-app/src/platform/windows_ffi.rs`.
+- Nei test, solo `crates/lynkeus-engine/tests/misura/mod.rs` (una chiamata a `K32GetProcessMemoryInfo` per la memoria di picco), con `// SAFETY:` e interfaccia safe.
 
 ## Documenti di stato e decisioni
 
