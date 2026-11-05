@@ -741,9 +741,11 @@ fn sort_order(order: &mut [usize], spec: SortSpec, hits: &[Hit], docs: &DocIndex
         }};
     }
     match spec.column {
-        SortColumn::Word => by_key!(|hit: &Hit| folded(&hit.word).collect::<String>()),
+        SortColumn::Word => sort_by_folded_text(order, hits, |hit| &hit.word, descending),
         SortColumn::Term => by_key!(first_term),
-        SortColumn::Context => by_key!(|hit: &Hit| folded(&hit.snippet.text).collect::<String>()),
+        SortColumn::Context => {
+            sort_by_folded_text(order, hits, |hit| &hit.snippet.text, descending);
+        }
         SortColumn::File | SortColumn::Position => {
             let ranks = docs.ranks();
             let file = |i: usize| docs.of(i).and_then(|doc| ranks.get(doc).copied());
@@ -765,6 +767,105 @@ fn sort_order(order: &mut [usize], spec: SortSpec, hits: &[Hit], docs: &DocIndex
             });
         }
     }
+}
+
+/// Byte del testo in minuscolo tenuti nella chiave di [`sort_by_folded_text`]: le parole e
+/// gran parte dei contesti si distinguono già lì.
+const HEAD_BYTES: usize = 16;
+
+/// La chiave di una riga in [`sort_by_folded_text`].
+struct FoldedKey {
+    /// I primi [`HEAD_BYTES`] byte del testo in minuscolo, completati con zeri: risolvono
+    /// quasi tutti i confronti senza leggere il buffer.
+    head: u128,
+    /// Il testo in minuscolo, nel buffer comune.
+    text: std::ops::Range<usize>,
+    /// La posizione della riga prima dell'ordinamento: a parità resta l'ordine precedente.
+    position: usize,
+    /// Falso per un indice fuori dai risultati (va per primo, come in [`sort_order`]).
+    present: bool,
+}
+
+impl FoldedKey {
+    /// L'ordine dei testi in minuscolo, dai byte di `buffer`.
+    fn cmp_text(&self, other: &FoldedKey, buffer: &[u8]) -> Ordering {
+        self.head.cmp(&other.head).then_with(|| {
+            let (len, other_len) = (self.text.len(), other.text.len());
+            if len <= HEAD_BYTES && other_len <= HEAD_BYTES {
+                // Teste uguali e testi tutti dentro: il più corto è un prefisso dell'altro.
+                len.cmp(&other_len)
+            } else {
+                buffer[self.text.clone()].cmp(&buffer[other.text.clone()])
+            }
+        })
+    }
+}
+
+/// Ordina `order` per il testo `text` di ogni riga in minuscolo ([`folded`]), stabile: la
+/// stessa relazione di [`compare`] per Parola e Contesto, perché l'ordine dei byte UTF-8 è
+/// quello dei caratteri. I testi in minuscolo stanno in un solo buffer (niente stringa per
+/// riga) e la chiave ne tiene i primi [`HEAD_BYTES`] byte in un intero: con 200 000 righe
+/// l'ordinamento resta sotto i 50 ms (misura P-06).
+fn sort_by_folded_text(
+    order: &mut [usize],
+    hits: &[Hit],
+    text: impl Fn(&Hit) -> &str,
+    descending: bool,
+) {
+    let mut buffer = String::new();
+    let mut keys: Vec<FoldedKey> = Vec::with_capacity(order.len());
+    for (position, &index) in order.iter().enumerate() {
+        let start = buffer.len();
+        let hit = hits.get(index);
+        if let Some(hit) = hit {
+            push_folded(&mut buffer, text(hit));
+        }
+        let end = buffer.len();
+        keys.push(FoldedKey {
+            head: head_bytes(&buffer.as_bytes()[start..end]),
+            text: start..end,
+            position,
+            present: hit.is_some(),
+        });
+    }
+    let bytes = buffer.as_bytes();
+    keys.sort_unstable_by(|a, b| {
+        let by_text = a.cmp_text(b, bytes);
+        let by_text = if descending {
+            by_text.reverse()
+        } else {
+            by_text
+        };
+        a.present
+            .cmp(&b.present)
+            .then(by_text)
+            .then(a.position.cmp(&b.position))
+    });
+    let sorted: Vec<usize> = keys.iter().map(|key| order[key.position]).collect();
+    order.copy_from_slice(&sorted);
+}
+
+/// Aggiunge a `out` il testo in minuscolo come [`folded`]; un testo ASCII senza passare
+/// carattere per carattere.
+fn push_folded(out: &mut String, text: &str) {
+    if text.is_ascii() {
+        let start = out.len();
+        out.push_str(text);
+        if let Some(pushed) = out.get_mut(start..) {
+            pushed.make_ascii_lowercase();
+        }
+    } else {
+        out.extend(folded(text));
+    }
+}
+
+/// I primi [`HEAD_BYTES`] byte di `bytes` in un intero, in ordine (big endian), completati
+/// con zeri.
+fn head_bytes(bytes: &[u8]) -> u128 {
+    let mut head = [0u8; HEAD_BYTES];
+    let len = bytes.len().min(HEAD_BYTES);
+    head[..len].copy_from_slice(&bytes[..len]);
+    u128::from_be_bytes(head)
 }
 
 /// Chiave del file di una riga: la radice, poi il percorso relativo in minuscolo.
@@ -1066,6 +1167,37 @@ mod tests {
         specs
     };
 
+    /// Testi che differiscono solo per dei NUL in fondo hanno la stessa testa nella chiave
+    /// dell'ordinamento: il più corto viene prima, come con [`compare`]; lo stesso oltre la
+    /// testa.
+    #[test]
+    fn texts_differing_by_trailing_nul_sort_shorter_first() {
+        let long = "x".repeat(HEAD_BYTES);
+        let words = [
+            "a\0".to_owned(),
+            "a".to_owned(),
+            "a\0\0".to_owned(),
+            String::new(),
+            format!("{long}\0"),
+            long.clone(),
+        ];
+        let hits: Vec<Hit> = words.iter().map(|word| hit("a.txt", 1, word)).collect();
+        let docs = DocIndex::default();
+        for order in [SortOrder::Ascending, SortOrder::Descending] {
+            let spec = SortSpec {
+                column: SortColumn::Word,
+                order,
+            };
+            let mut sorted: Vec<usize> = (0..hits.len()).collect();
+            sort_order(&mut sorted, spec, &hits, &docs);
+            let mut expected = vec![3, 1, 0, 2, 5, 4];
+            if order == SortOrder::Descending {
+                expected.reverse();
+            }
+            assert_eq!(sorted, expected, "{order:?}");
+        }
+    }
+
     proptest::proptest! {
         /// Inserire le righe al loro posto man mano che arrivano dà lo stesso ordine
         /// dell'ordinamento completo a fine ricerca, parità comprese.
@@ -1088,6 +1220,39 @@ mod tests {
             full.extend_to(&hits, &roots());
             full.set_sort(spec, &hits, &roots());
             proptest::prop_assert_eq!(&incremental.order, &full.order);
+        }
+
+        /// Parola e Contesto: l'ordinamento con i testi in un buffer e i primi byte in un
+        /// intero dà lo stesso ordine di un ordinamento stabile con [`compare`], partendo da
+        /// un ordine qualsiasi, con maiuscole, lettere non ASCII (anche quelle che in
+        /// minuscolo cambiano lunghezza), NUL e prefissi comuni oltre la testa.
+        #[test]
+        fn folded_text_sort_equals_a_stable_sort_by_compare(
+            words in proptest::collection::vec("(prefisso-comune-lungo )?[aAàÀİiẞßΣσς\\x00 b]{0,20}", 0..40),
+            spec_index in 0usize..4,
+            rotate in 0usize..40,
+        ) {
+            let hits: Vec<Hit> = words
+                .iter()
+                .enumerate()
+                .map(|(n, word)| hit("a.txt", u32::try_from(n).unwrap_or(0), word))
+                .collect();
+            let spec = [
+                SortSpec { column: SortColumn::Word, order: SortOrder::Ascending },
+                SortSpec { column: SortColumn::Word, order: SortOrder::Descending },
+                SortSpec { column: SortColumn::Context, order: SortOrder::Ascending },
+                SortSpec { column: SortColumn::Context, order: SortOrder::Descending },
+            ][spec_index];
+            let mut docs = DocIndex::default();
+            docs.extend(&hits, &roots());
+            let mut start: Vec<usize> = (0..hits.len()).rev().collect();
+            let shift = rotate.min(start.len());
+            start.rotate_left(shift);
+            let mut fast = start.clone();
+            sort_order(&mut fast, spec, &hits, &docs);
+            let mut naive = start;
+            naive.sort_by(|&a, &b| compare(spec, &hits, &docs, a, b));
+            proptest::prop_assert_eq!(fast, naive);
         }
 
         /// I passi con gli indici coincidono con quelli calcolati scorrendo le righe, in
