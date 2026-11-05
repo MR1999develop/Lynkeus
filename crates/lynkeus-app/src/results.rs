@@ -749,22 +749,15 @@ fn sort_order(order: &mut [usize], spec: SortSpec, hits: &[Hit], docs: &DocIndex
         SortColumn::File | SortColumn::Position => {
             let ranks = docs.ranks();
             let file = |i: usize| docs.of(i).and_then(|doc| ranks.get(doc).copied());
-            let location = |i: usize| hits.get(i).map(|hit| &hit.location);
-            let file_first = spec.column == SortColumn::File;
-            order.sort_by(|&a, &b| {
-                let by_file = file(a).cmp(&file(b));
-                let by_location = location(a).cmp(&location(b));
-                let ordering = if file_first {
-                    by_file.then(by_location)
-                } else {
-                    by_location.then(by_file)
-                };
-                if descending {
-                    ordering.reverse()
-                } else {
-                    ordering
-                }
-            });
+            // La posizione si copia nella chiave (una stringa solo per il foglio delle
+            // celle): i confronti non tornano ai risultati, sparsi in memoria.
+            let location = |i: usize| hits.get(i).map(|hit| hit.location.clone());
+            match (spec.column == SortColumn::File, descending) {
+                (true, false) => order.sort_by_cached_key(|&i| (file(i), location(i))),
+                (true, true) => order.sort_by_cached_key(|&i| Reverse((file(i), location(i)))),
+                (false, false) => order.sort_by_cached_key(|&i| (location(i), file(i))),
+                (false, true) => order.sort_by_cached_key(|&i| Reverse((location(i), file(i)))),
+            }
         }
     }
 }
