@@ -26,6 +26,7 @@ Versioni risolte da `Cargo.lock`. Licenze da `cargo info`. Conteggio `unsafe`: o
 | encoding_rs | 0.8.44 | (Apache-2.0 OR MIT) AND BSD-3-Clause | Decodifica a blocchi dei file di testo (`Decoder`, tabelle WHATWG) in UTF-8: UTF-16 e le codifiche rilevate, come Windows-1252 (`text/mod.rs`, `text/detect.rs`). | lynkeus-extract | sì (193 in `src`) | no (Rust puro; `build.rs` solo imposta un cfg) | 2026-11-04 | ok |
 | flate2 | 1.1.10 | MIT OR Apache-2.0 | Decodifica gzip (`.gz`, `.tgz`, `.tar.gz`) in `extract/tarball.rs` (`MultiGzDecoder`). Feature di default (`rust_backend`, `runtime_detection`): il backend attivo è zlib-rs, senza C. Lo usano anche il deflate di sevenz-rust2 e zip. | lynkeus-extract (dev: `tests/formats.rs`, per costruire i .gz di prova) | sì (37 in `src`; `ffi/c.rs` con 25 non si compila, perché `any_c_zlib` non è attiva; il backend zlib-rs ha 456 occorrenze nel sottoalbero, vedi nota) | no (`build = false`; il C si attiva solo con `zlib` o `any_c_zlib`) | 2026-11-04 | ok, con `unsafe` da rivalutare (zlib-rs, vedi nota) |
 | fluent-templates | 0.15.1 | MIT/Apache-2.0 | Traduzioni Fluent in `locales/it` e `locales/en`. | lynkeus-app | no (0) | no | 2026-11-04 | ok |
+| getrandom | 0.3.4 (la 0.4.3 è nel lock per altre dipendenze) | MIT OR Apache-2.0 | Token casuale dell'istanza unica (`instance.rs`, `Token::random`) e suffisso casuale del nome del canale (`random_suffix`), con `getrandom::fill` dal generatore del sistema operativo; altre casualità di piattaforma in `platform/mod.rs` e `platform/windows_ffi.rs`. Nessuna feature esplicita (`default`). | lynkeus-app | sì (93 in `src`, 26 file: chiamate di sistema per piattaforma) | no (`build.rs` legge solo la versione di rustc e il sanitizer; nessun `cc`) | 2026-11-05 | ok (nota: la 0.4.3 è l'ultima; la linea 0.3 è richiesta dal progetto, e `cargo deny` segnala il duplicato) |
 | ignore | 0.4.34 | Unlicense OR MIT | Scansione ricorsiva delle cartelle (`WalkBuilder`). | lynkeus-engine | no (0) | no | 2026-11-04 | ok |
 | libfuzzer-sys | 0.4.13 | (MIT OR Apache-2.0) AND NCSA | Runtime di libFuzzer per i quattro target di `fuzz/` (`fuzz_targets/`). Solo nel crate `fuzz/`, fuori dal workspace: non entra nel binario. | lynkeus-fuzz (`fuzz/`) | sì (11 in `src`, nell'API FFI verso libFuzzer) | sì, solo nel build di `fuzz/`: `build.rs` con `cc` compila il C++ di libFuzzer (`build.cpp(true)`) | 2026-11-04 | problema: licenza NCSA fuori da `allow` di `deny.toml`; `cargo deny` dentro `fuzz/` fallisce (exit 4) |
 | lz4_flex | 0.14.0 | MIT | Compressione delle voci della cache (`cache.rs`, `block::compress` e `block::decompress`, con dimensione dichiarata controllata prima di decomprimere). Feature `safe-encode`, `safe-decode`, `checked-decode`: il codice `unsafe` non è compilato. | lynkeus-engine | sì nel sorgente (76 in 4 file), 0 compilati con le feature del progetto (i moduli con `unsafe` sono esclusi da `cfg` o hanno `forbid(unsafe_code)`) | no (`build = false`) | 2026-11-04 | ok |
@@ -39,15 +40,20 @@ Versioni risolte da `Cargo.lock`. Licenze da `cargo info`. Conteggio `unsafe`: o
 | regex | 1.13.1 | MIT OR Apache-2.0 | Ricerca lineare dei termini; tabelle Unicode delle categorie `Mn` e `P` (`unicode.rs`). | lynkeus-core | sì (1 in `src`) | no | 2026-11-04 | ok |
 | rfd | 0.17.2 | MIT | Dialoghi nativi per scegliere cartelle e file (`FileDialog`, `ui/mod.rs`). Su Linux tramite il portale XDG, senza libreria GTK; su Windows API di sistema. | lynkeus-app | sì (249 in `src`, FFI delle piattaforme) | no (il `build.rs` fa solo controlli di feature e cfg) | 2026-11-04 | ok |
 | rlimit | 0.11.0 | MIT | Solo Unix (`cfg(unix)`): limite `RLIMIT_AS` del processo estrattore, impostato da sé all'avvio (`platform.rs`, `Resource::AS.set`). Su Windows non entra nell'albero. | lynkeus-extract (solo Unix) | sì (8 in `src`, chiamate `getrlimit`, `setrlimit` e `prlimit` tramite libc, compilate su Unix) | no (`build.rs` solo probe di cfg, nessun C) | 2026-11-04 | ok |
+| rustix | 1.1.6 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | Solo non Windows (`cfg(not(windows))`): permessi delle cartelle private (`fstat`, `geteuid`, `umask` in `platform/mod.rs`), apertura con `O_NOFOLLOW` e controllo del proprietario sul descrittore aperto, `SO_PEERCRED` sul socket dell'istanza unica (`platform/mod.rs`). Nel processo estrattore, lo stesso controllo del proprietario in `platform.rs` di lynkeus-engine. `default-features = false` con `std`, `fs`, `process`, `net`. | lynkeus-app, lynkeus-engine (non Windows) | sì (1.672 in `src`, 154 file; 1.188 in `src/backend`, il backend `linux_raw` è quello compilato su Linux senza `use-libc`, con istruzioni inline; su Windows non entra nell'albero) | no (`build.rs` solo probe di cfg; nessun `cc`) | 2026-11-05 | ok (nota: la 0.38.44 è nel lock per altre dipendenze, warning di duplicato in `cargo deny`) |
 | serde | 1.0.229 | MIT OR Apache-2.0 | Tipi del protocollo tra processi e impostazioni (con `derive`). | lynkeus-core, lynkeus-extract, lynkeus-engine, lynkeus-app | sì (2 in `src`) | no (il `build.rs` fa solo probe) | 2026-11-04 | ok |
 | sevenz-rust2 | 0.24.2 | Apache-2.0 | Lettura degli archivi 7z (`extract/sevenz.rs`), blocco per blocco, con i limiti per voce. Solo deflate: `default-features = false` con la feature `deflate`; niente compressione; le voci cifrate danno "protetto da password". | lynkeus-extract | no nel codice del crate (le 3 occorrenze sono nei messaggi "unsafe entry path"); sì nella dipendenza transitiva lzma-rust2 0.23.0, con feature `optimization`: 15 in `src`, vedi nota | no (`build = false`) | 2026-11-04 | ok, con `unsafe` transitivo da rivalutare (threat model, sezione 5) |
+| subtle | 2.6.1 | BSD-3-Clause | Confronto in tempo costante del token dell'istanza unica (`instance.rs`, `Token::matches`, con `ConstantTimeEq`). `default-features = false`, feature `std`. | lynkeus-app | sì (2 in `src/lib.rs`: il `black_box` di ottimizzazione e il cast da `i8` a `Ordering`, entrambi con `SAFETY`) | no (nessun `build.rs`, nessun C) | 2026-11-05 | ok (nota: manutenzione ferma, nessuna release dal 2024-06-24 e nessun push dal 2024-08-03; da rivalutare alla prossima revisione dell'istanza unica) |
 | sys-locale | 0.3.2 | MIT OR Apache-2.0 | Lingua di sistema, per scegliere l'interfaccia in italiano o inglese. | lynkeus-app | sì (7 in `src`, chiamate di sistema Windows, Apple, Android) | no | 2026-11-04 | ok (nota: ultima release 2024-11-01, repository attivo) |
 | tar | 0.4.46 | MIT OR Apache-2.0 | Lettura degli archivi tar (`extract/tarball.rs`, `tar::Archive`); in test, costruzione di tar di prova (`tests/formats.rs`). `default-features = false`: senza `xattr`. | lynkeus-extract | sì (26 in `src`: intestazioni in `header.rs` 22, `entry.rs` 2, `builder.rs` 2) | no (`build = false`) | 2026-11-04 | ok |
 | tempfile | 3.27.0 | MIT OR Apache-2.0 | Cartelle temporanee per i test di scansione (`engine/tests/scansione.rs`) e delle impostazioni (`settings.rs`). Solo dev-dependency. | lynkeus-engine (dev), lynkeus-app (dev) | sì (4 in `src`) | no | 2026-11-04 | ok |
 | thiserror | 2.0.21 | MIT OR Apache-2.0 | Errori tipizzati delle librerie. | lynkeus-core, lynkeus-extract, lynkeus-engine, lynkeus-app | no (0) | no (il `build.rs` fa solo probe) | 2026-11-04 | ok (nota: la 1.0.69 entra in transitivo tramite calloop, warning di duplicato) |
 | toml | 1.2.0 (richiesta 1.1.8) | MIT OR Apache-2.0 | Lettura e scrittura di `settings.toml` (`Table`, `Value`, `to_string`) in `settings.rs`. Solo `parse`, `display`, `serde`. | lynkeus-app | sì (3 in `src`) | no | 2026-11-04 | ok |
+| tracing | 0.1.44 | MIT | Log strutturati con campi (`info!`, `warn!`, `error!`) nel guscio dell'app: `app.rs`, `main.rs`, `instance.rs`, `platform/mod.rs`, `private_dirs.rs`, `ui/mod.rs`, `diagnostics.rs`. Il nucleo e il motore non lo usano. `default-features = false`, feature `std`. | lynkeus-app | sì (7 in `src`, 3 file: `instrument.rs` (5, pin delle future), `lib.rs` (1, `from_utf8_unchecked`), `span.rs` (1, `unsafe impl Sync`)) | no (nessun `build.rs`, nessun C) | 2026-11-05 | ok |
+| tracing-subscriber | 0.3.23 | MIT | Filtro di livello regolabile a runtime (`reload`, `LevelFilter`) e formato dei log su file e su stderr (`diagnostics.rs`: `fmt::layer`, `Registry`). `default-features = false`, feature `fmt` e `std`. | lynkeus-app | sì (28 in `src`, 6 file: `layer/mod.rs`, `layer/layered.rs`, `filter/layer_filters/mod.rs`, `reload.rs`, `fmt/mod.rs`, `fmt/fmt_layer.rs`) | no (nessun `build.rs`, nessun C) | 2026-11-05 | ok |
+| tracing-appender | 0.2.5 | MIT | Log su file con rotazione giornaliera e numero massimo di file (`diagnostics.rs`, `rolling::Builder` con `Rotation::DAILY`), scritti da un thread a parte (`non_blocking`). Senza feature. | lynkeus-app | no (0 in `src`) | no (nessun `build.rs`, nessun C) | 2026-11-05 | ok |
 | unicode-normalization | 0.1.26 | (MIT OR Apache-2.0) AND Unicode-3.0 | Normalizzazione NFC/NFD dei termini (`AccentMode`) e decomposizione canonica per la tabella delle varianti accentate (`unicode.rs`, `pattern.rs`). | lynkeus-core (anche in test `proprieta.rs`, dev) | sì (5 in `src`) | no | 2026-11-04 | ok |
-| windows-sys | 0.61.2 | MIT OR Apache-2.0 | Solo Windows: API Win32 senza involucri per il processo estrattore (`CreateProcessW`, Job Object con limite di memoria, pipe, `SetDefaultDllDirectories`) in `platform/windows_ffi.rs`. | lynkeus-app (solo Windows) | sì nel sorgente (12.530 in 192 file: dichiarazioni FFI generate; conteggio indicativo) | no (`build = false`, solo binding) | 2026-11-04 | ok (nota: nel lock anche 0.52.0 e 0.59.0 per altre dipendenze, warning di duplicato) |
+| windows-sys | 0.61.2 | MIT OR Apache-2.0 | Solo Windows: API Win32 senza involucri per il processo estrattore (`CreateProcessW`, Job Object con limite di memoria, pipe, `SetDefaultDllDirectories`), descrittori di sicurezza delle cartelle private (`Authorization`: `ConvertStringSecurityDescriptorToSecurityDescriptorW`, `GetSecurityInfo`), file (`CreateFileW`, `Storage::FileSystem`) e `AllowSetForegroundWindow` dell'istanza unica (`UI::WindowsAndMessaging`), tutto in `platform/windows_ffi.rs`. | lynkeus-app (solo Windows) | sì nel sorgente (12.530 in 192 file: dichiarazioni FFI generate; conteggio indicativo) | no (`build = false`, solo binding) | 2026-11-04 | ok (nota: nel lock anche 0.52.0 e 0.59.0 per altre dipendenze, warning di duplicato) |
 | winit | 0.30.13 | Apache-2.0 | Solo Linux. Non è importata nel codice: serve la feature Wayland caricata a runtime e le decorazioni su GNOME senza titolo (`-notitle`), che evitano la catena ab_glyph → ttf-parser. `ttf-parser` (RUSTSEC-2026-0192) entra comunque nell'albero tramite `pdf_oxide`: vedi eccezioni. | lynkeus-app (solo Linux) | sì (932 in `src`, FFI delle piattaforme) | no diretto; su Linux indiretto (vedi sezione Codice C) | 2026-11-04 | ok |
 | sha2 | 0.11.1 | MIT OR Apache-2.0 | Calcolo dei SHA-256 per `SHA256SUMS` nel rilascio (`cargo xtask dist`). | xtask | sì (39 in `src`) | no | 2026-11-04 | ok |
 | zbus | 5.19.0 | MIT | Solo non Windows (`cfg(not(windows))`; nei target del progetto è Linux): portale XDG `org.freedesktop.portal.OpenURI`, metodi `OpenFile` e `OpenDirectory` con il file come descrittore, in `platform.rs` (`call_open_uri_portal`). Feature `async-io` e `blocking-api`, senza default. Resta la 5 perché AccessKit la porta già nell'albero: la 6 ne aggiungerebbe una seconda copia. | lynkeus-app (non Windows) | sì (58 in `src`, socket e FFI) | no (`build = false`, nessun `build.rs`) | 2026-11-04 | ok (nota: la 6.2.1 è disponibile, vedi Dettagli di verifica) |
@@ -61,7 +67,7 @@ Crate transitivi nuovi di `opener` (solo Windows): 24, oltre a `opener` stesso. 
 
 ## Dettagli di verifica
 
-Manutenzione dal repository GitHub (`pushed_at`, `archived`) e dall'ultimo aggiornamento su crates.io, entrambi verificati il 2026-11-04. Per tutti i crate la versione risolta coincide con l'ultima stabile su crates.io, tranne `zbus` (risolta 5.19.0, ultima 6.2.1).
+Manutenzione dal repository GitHub (`pushed_at`, `archived`) e dall'ultimo aggiornamento su crates.io, entrambi verificati il 2026-11-04. Per tutti i crate la versione risolta coincide con l'ultima stabile su crates.io, tranne `zbus` (risolta 5.19.0, ultima 6.2.1) e `getrandom` (risolta 0.3.4, ultima 0.4.3). Per i crate della fase 7 la manutenzione è verificata il 2026-11-05.
 
 | crate | ultima versione stabile | ultimo aggiornamento crates.io | ultimo push del repository | archiviato | note |
 |---|---|---|---|---|---|
@@ -81,6 +87,7 @@ Manutenzione dal repository GitHub (`pushed_at`, `archived`) e dall'ultimo aggio
 | encoding_rs | 0.8.44 | 2026-10-30 | 2026-10-30 | no | |
 | flate2 | 1.1.10 | 2026-11-02 | 2026-11-02 | no | versione pubblicata il 2026-08-28; repository `rust-lang/flate2-rs`, attivo; Apache-2.0 sul repository, MIT OR Apache-2.0 su crates.io |
 | fluent-templates | 0.15.1 | 2026-08-05 | 2026-08-05 | no | |
+| getrandom | 0.4.3 (risolta 0.3.4) | 2026-06-17 | 2026-11-02 | no | repository `rust-random/getrandom`, attivo; MIT OR Apache-2.0. La linea 0.3 è quella richiesta dal progetto: il passaggio alla 0.4 è un aggiornamento da pianificare |
 | ignore | 0.4.34 | 2026-10-27 | 2026-10-27 | no | |
 | libfuzzer-sys | 0.4.13 | 2026-06-04 | 2026-06-04 | no | versione pubblicata il 2026-06-04; repository `rust-fuzz/libfuzzer`, attivo; Apache-2.0 sul repository, `(MIT OR Apache-2.0) AND NCSA` su crates.io |
 | lz4_flex | 0.14.0 | 2026-07-14 | 2026-10-25 | no | repository `PSeitz/lz4_flex`, attivo; MIT |
@@ -94,15 +101,22 @@ Manutenzione dal repository GitHub (`pushed_at`, `archived`) e dall'ultimo aggio
 | regex | 1.13.1 | 2026-07-15 | 2026-10-28 | no | |
 | rfd | 0.17.2 | 2026-10-22 | 2026-10-25 | no | |
 | rlimit | 0.11.0 | 2026-02-01 | 2026-11-01 | no | repository `Nugine/rlimit`, attivo; MIT |
+| rustix | 1.1.6 | 2026-10-27 | 2026-10-27 | no | repository `bytecodealliance/rustix`, attivo; Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT |
 | serde | 1.0.229 | 2026-07-18 | 2026-10-16 | no | |
 | sevenz-rust2 | 0.24.2 | 2026-10-30 | 2026-11-01 | no | versione pubblicata il 2026-10-30; repository `hasenbanck/sevenz-rust`, attivo; Apache-2.0 |
+| subtle | 2.6.1 | 2024-06-24 | 2024-08-03 | no | repository `dalek-cryptography/subtle`, non archiviato ma fermo: nessuna release né push da oltre due anni. `cargo deny` non segnala advisory. Da tenere d'occhio |
 | sys-locale | 0.3.2 | 2024-11-01 | 2026-11-04 | no | nessuna release da oltre due anni: da tenere d'occhio |
 | tar | 0.4.46 | 2026-05-18 | 2026-09-21 | no | versione pubblicata il 2026-05-18; repository `composefs/tar-rs`, attivo; Apache-2.0 sul repository, MIT OR Apache-2.0 su crates.io |
 | tempfile | 3.27.0 | 2026-03-11 | 2026-10-30 | no | |
 | thiserror | 2.0.21 | 2026-09-23 | 2026-10-16 | no | |
 | toml | 1.2.0 | 2026-11-04 | 2026-11-04 | no | |
+| tracing | 0.1.44 | 2025-12-18 | 2026-10-29 (repository `tokio-rs/tracing`) | no | MIT; stesso repository per `tracing-subscriber` e `tracing-appender` |
+| tracing-appender | 0.2.5 | 2026-04-17 | 2026-10-29 (repository `tokio-rs/tracing`) | no | MIT |
+| tracing-subscriber | 0.3.23 | 2026-03-13 | 2026-10-29 (repository `tokio-rs/tracing`) | no | MIT |
 | unicode-normalization | 0.1.26 | 2026-10-16 | 2026-10-29 | no | |
 | windows-sys | 0.61.2 | 2025-10-06 | 2026-11-04 | no | repository `microsoft/windows-rs`, attivo; Apache-2.0 sul repository, MIT OR Apache-2.0 su crates.io |
+| winreg | 0.56.0 | 2026-03-14 | 2026-03-14 | no | repository `gentoo90/winreg-rs`, attivo; MIT |
+| winresource | 0.1.34 | 2026-10-12 | 2026-10-12 | no | repository `BenjaminRi/winresource`, attivo; MIT |
 | winit | 0.30.13 | 2026-10-24 | 2026-11-03 | no | |
 | sha2 | 0.11.1 | 2026-10-12 | 2026-11-03 | no | |
 | zbus | 5.19.0 (ultima 6.2.1, pubblicata il 2026-11-01) | 2026-08-09 (5.19.0) | 2026-11-03 | no | repository `z-galaxy/zbus` attivo. GitHub non riconosce la licenza (`NOASSERTION`), ma il file `LICENSE` è MIT e `cargo info` riporta MIT |
@@ -130,6 +144,7 @@ Feature risolte con `cargo tree -p <crate> --depth 0 -f "{p} | {f}"`.
 | encoding_rs | alloc, default |
 | flate2 | default (`rust_backend`, `runtime_detection`); risolte anche `miniz_oxide` e `zlib-rs` (il backend attivo è zlib-rs, attivato anche da zip e sevenz-rust2) |
 | fluent-templates | default, fluent-template-macros, ignore, macros |
+| getrandom | nessuna (`default`, senza feature esplicite) |
 | ignore | nessuna |
 | libfuzzer-sys | default (`link_libfuzzer`) |
 | lz4_flex | alloc, checked-decode, safe-decode, safe-encode, std (`default-features = false`; `frame` e `nightly` non attive) |
@@ -143,15 +158,22 @@ Feature risolte con `cargo tree -p <crate> --depth 0 -f "{p} | {f}"`.
 | regex | default e tutte le feature `perf-*` e `unicode-*` che ne derivano |
 | rfd | pollster, wayland, wayland-backend, wayland-client, wayland-protocols, xdg-portal (`default-features = false`) |
 | rlimit | nessuna |
+| rustix | std, fs, process, net dal workspace (`default-features = false`); risolte anche alloc, default, event, pipe, shm, system, time per altri crate dell'albero |
 | serde | default, derive, serde_derive, std |
 | sevenz-rust2 | deflate (`default-features = false`) |
+| subtle | std (`default-features = false`) |
 | sys-locale | nessuna |
 | tar | nessuna (`default-features = false`) |
 | tempfile | default, getrandom |
 | thiserror | default, std |
 | toml | display, parse, serde (`default-features = false`) |
+| tracing | std (`default-features = false`) |
+| tracing-appender | nessuna |
+| tracing-subscriber | alloc, fmt, registry, sharded-slab, std, thread_local (dal workspace `fmt` e `std` con `default-features = false`) |
 | unicode-normalization | default, std |
-| windows-sys | dal workspace: Win32, Win32_Foundation, Win32_Security, Win32_System_IO, Win32_System_JobObjects, Win32_System_LibraryLoader, Win32_System_Pipes, Win32_System_SystemServices, Win32_System_Threading. Con l'unificazione l'albero Windows attiva molte altre feature (UI, Shell, COM, Storage) |
+| windows-sys | dal workspace: Win32_Foundation, Win32_Security, Win32_Security_Authorization, Win32_Storage_FileSystem, Win32_System_IO, Win32_System_JobObjects, Win32_System_LibraryLoader, Win32_System_Pipes, Win32_System_SystemServices, Win32_System_Threading, Win32_UI_WindowsAndMessaging. Con l'unificazione l'albero Windows attiva molte altre feature (UI, Shell, COM, Storage) |
+| winreg | nessuna |
+| winresource | nessuna (`default-features = false`, quindi senza `toml`) |
 | winit | rwh_06, wayland-dlopen e wayland-csd-adwaita-notitle dal workspace (`default-features = false`); risolte anche ahash, bytemuck, memmap2, percent-encoding, sctk, wayland, wayland-backend, wayland-client, wayland-protocols, wayland-protocols-plasma, x11, x11-dl, x11rb |
 | sha2 | alloc, default, oid |
 | zbus | async-executor, async-fs, async-io, async-lock, async-process, async-task, blocking, blocking-api (`default-features = false`; nel workspace `async-io` e `blocking-api`, il resto arriva da `async-io`) |
@@ -173,6 +195,7 @@ Verificato sull'albero di Windows (`x86_64-pc-windows-msvc`) e su quello di Linu
 - Windows e Linux, `rlimit` 0.11.0 (Linux): `build.rs` solo probe di cfg; nessun C.
 - Windows e Linux, `-sys` nell'albero del workspace: `dirs-sys`, `renderdoc-sys`, `windows-sys`, `linux-raw-sys`, `wayland-sys`, `yeslogic-fontconfig-sys`. Sono già trattati nelle sezioni precedenti; `windows-sys` e `linux-raw-sys` sono binding senza C. Nessuno è introdotto da `pdf_oxide`.
 - `calamine`, `cfb`, `crc32fast`, `flate2`, `lz4_flex`, `mail-parser`, `postcard`, `quick-xml`, `sevenz-rust2`, `tar`, `zip`: `build = false` o `build.rs` senza C (`crc32fast` legge solo la versione di rustc). `zlib-rs`, `lzma-rust2`, `uuid` e `filetime` (transitivi di questi crate) non hanno `build.rs`.
+- Windows e Linux, dipendenze della fase 7: `subtle`, `getrandom` 0.3.4, `rustix` 1.1.6, `winreg`, `tracing`, `tracing-subscriber` e `tracing-appender` non hanno `build.rs` con `cc` né codice C. `getrandom` e `rustix` hanno un `build.rs` che solo sonda rustc o i cfg. `winresource` 0.1.34 (build-dependency di `lynkeus-app`) non compila C: il suo `build.rs` invoca `rc.exe` del Windows SDK solo sul target Windows, mentre su Linux il crate si compila ma il suo `build.rs` non fa nulla.
 - Solo `fuzz/` (fuori dal binario): `libfuzzer-sys` 0.4.13 → build script con `cc` compila il C++ di libFuzzer (`build.cpp(true)`). Non entra nell'albero di `lynkeus-app` né di `lynkeus-extract`.
 
 I crate nuovi di codice Rust puro (`encoding_rs`, `memchr`, `crossbeam-channel`, `chardetng`, `rfd` lato build script, `calamine`, `lz4_flex`, `postcard`, `quick-xml`, `zip`, `pdf_oxide`) non compilano C.
@@ -191,11 +214,26 @@ Nessun'altra eccezione: `exceptions = []` per le licenze.
 
 ## Ultimo `cargo deny check`
 
-Eseguito il 2026-11-04 sul workspace, con le dipendenze della fase 5 (`cfb`, `flate2`, `mail-parser`, `sevenz-rust2`, `tar`): exit code 0. Esito per sezione: advisories ok, bans ok, licenses ok, sources ok. Nessun warning di duplicato in più rispetto all'elenco sotto. Il `deny.toml` vieta `pdf-extract` e `lopdf` in `[bans]` (ADR 0002): divieto presente e attivo.
+Eseguito il 2026-11-05 sul workspace, con le dipendenze della fase 7 (`subtle`, `getrandom`, `rustix`, `winreg`, `winresource`, `tracing`, `tracing-subscriber`, `tracing-appender`, e le feature nuove di `windows-sys`): exit code 0. Esito per sezione: advisories ok, bans ok, licenses ok, sources ok. Nessun warning di duplicato in più rispetto all'elenco sotto. Il `deny.toml` vieta `pdf-extract` e `lopdf` in `[bans]` (ADR 0002): divieto presente e attivo.
 
 Crate `fuzz/` (workspace proprio, fuori dal `cargo deny check` della radice): `cargo deny check` dentro `fuzz/` con il `deny.toml` del progetto esce con codice 4. Advisories, bans e sources ok; `licenses` FAILED: `libfuzzer-sys` 0.4.13 ha licenza `(MIT OR Apache-2.0) AND NCSA` e NCSA non è in `allow`. Da decidere: aggiungere NCSA all'allowlist o sostituire il crate. `deny.toml` non è stato modificato.
 
 Warning (non bloccanti, `multiple-versions = "warn"`, 21 voci): calloop, calloop-wayland-source, fax, foldhash, font-types, getrandom, hashbrown (3 versioni), linux-raw-sys, miniz_oxide, pollster (0.4.0 da rfd e 1.0.1 da eframe), quick-xml (0.41.0 da wayland-scanner, 0.42.0 nel progetto), read-fonts, rustc-hash, rustix, skrifa, smithay-client-toolkit, syn, thiserror (1.0.69 e 2.0.21), thiserror-impl, weezl, windows-sys (3 versioni: 0.52.0, 0.59.0, 0.61.2).
+
+## Dipendenze dirette di fase 7
+
+Registrate il 2026-11-05 in tabella: `subtle`, `getrandom`, `rustix`, `winreg`, `winresource`, `tracing`, `tracing-subscriber` e `tracing-appender`, più le feature nuove di `windows-sys` (`Win32_Security_Authorization`, `Win32_Storage_FileSystem`, `Win32_UI_WindowsAndMessaging`). Usi per target: `rustix` in `lynkeus-app` e `lynkeus-engine` solo su non Windows; `winreg` e `windows-sys` solo su Windows; `winresource` è una build-dependency di `lynkeus-app`. `lynkeus-engine` non usa le altre nuove dipendenze.
+
+Nota sull'`unsafe` delle nuove dipendenze, verificato sui sorgenti scaricati:
+
+- `rustix` 1.1.6: 1.672 occorrenze in `src`, quasi tutte nel backend `linux_raw` (istruzioni inline, attivo su Linux senza `use-libc`). Il codice del progetto che la usa (`platform/mod.rs`, `platform.rs` dell'engine) non contiene `unsafe`.
+- `winreg` 0.56.0: 38 occorrenze in `src`, nelle chiamate a `advapi32` (`reg_key.rs`, 24) e nei `unsafe impl Send` di `RegKey`. Il progetto la usa solo nella voce del clic destro.
+- `getrandom` 0.3.4: 93 occorrenze in `src`, nelle chiamate di sistema per piattaforma. Il progetto chiama solo `getrandom::fill`.
+- `subtle` 2.6.1: 2 blocchi `unsafe` (`black_box` come barriera di ottimizzazione, cast di `Ordering`), con commento `SAFETY`. Nessuno nel progetto.
+- `tracing` 0.1.44: 7 occorrenze in `src` (pin delle future in `instrument.rs`, `from_utf8_unchecked` in `lib.rs`, `unsafe impl Sync` in `span.rs`). `tracing-subscriber` 0.3.23: 28 occorrenze in 6 file, nei layer (`layer/`), nei filtri e in `reload.rs`. Il progetto non ha `unsafe` nel guscio dei log.
+- `tracing-appender` 0.2.5, `winresource` 0.1.34: nessuna occorrenza.
+
+Il `cargo deny check` del 2026-11-05 non segnala advisory né licenze fuori elenco per queste dipendenze; `getrandom` e `rustix` compaiono tra i duplicati già elencati (0.4.3 e 0.38.44 nel lock per altre dipendenze).
 
 ## Dipendenze dirette di fase 5
 
