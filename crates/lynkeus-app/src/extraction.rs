@@ -21,8 +21,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use lynkeus_core::{ByteSize, Location, TextUnit};
 use lynkeus_engine::{
-    DocPath, DocumentSource, EntryEnd, ExtractorPool, Limits, TextCache, WarningKind,
-    create_new_private_file, create_private_dir, default_pool_size,
+    DocPath, DocumentSource, EntryEnd, ExtractorPool, Limits, PrivateFs, TextCache, WarningKind,
+    default_pool_size,
 };
 use lynkeus_extract::text::soft_cut;
 use lynkeus_extract::{EntrySink, ExtractError, ExtractOptions, Stopped};
@@ -31,6 +31,7 @@ use crate::format::ELLIPSIS;
 use crate::launch::{ArchiveEntryExtractor, opened_extension};
 use crate::platform;
 use crate::preview::{DocumentUnits, MAX_UNIT_BYTES};
+use crate::private_dirs::PreparedDirs;
 use crate::settings::CacheSettings;
 
 /// Limite di memoria di ogni processo estrattore: 1 GiB, abbastanza per un PDF di 200 MiB
@@ -50,28 +51,31 @@ pub struct ExtractionSetup {
 }
 
 impl ExtractionSetup {
-    /// Questo programma (`current_exe`, assoluto) con le cartelle della piattaforma.
-    pub fn for_this_program() -> io::Result<ExtractionSetup> {
+    /// Questo programma (`current_exe`, assoluto) con le cartelle private preparate
+    /// (una cartella rifiutata spegne la sua funzione).
+    pub fn for_this_program(dirs: &PreparedDirs) -> io::Result<ExtractionSetup> {
         Ok(ExtractionSetup {
             worker_exe: std::env::current_exe()?,
-            cache_dir: platform::cache_dir(),
-            opened_entries_dir: platform::opened_entries_dir(),
+            cache_dir: dirs.cache.clone(),
+            opened_entries_dir: dirs.opened_entries.clone(),
         })
     }
 }
 
 /// La fonte dei documenti: pool di `min(core/2, 4)` processi avviati al primo documento e,
-/// se c'è la cartella, la cache con le impostazioni `cache`.
+/// se c'è la cartella, la cache con le impostazioni `cache` e cartella e file creati da
+/// `private_fs`.
 pub fn document_source(
     setup: &ExtractionSetup,
     cache: CacheSettings,
+    private_fs: &Arc<dyn PrivateFs>,
 ) -> io::Result<Arc<DocumentSource>> {
     let launcher = platform::worker_launcher(setup.worker_exe.clone(), WORKER_MEMORY_LIMIT)?;
     let pool = ExtractorPool::new(launcher, default_pool_size());
-    let text_cache = setup
-        .cache_dir
-        .clone()
-        .map(|dir| TextCache::new(dir, ByteSize::from_mib(cache.max_size_mib)));
+    let text_cache = setup.cache_dir.clone().map(|dir| {
+        TextCache::new(dir, ByteSize::from_mib(cache.max_size_mib))
+            .with_private_fs(Arc::clone(private_fs))
+    });
     let source = DocumentSource::new(pool, text_cache);
     source.set_cache_enabled(cache.enabled);
     Ok(Arc::new(source))
@@ -164,15 +168,23 @@ pub struct OpenedEntries {
     source: Arc<DocumentSource>,
     dir: PathBuf,
     limits: Limits,
+    private_fs: Arc<dyn PrivateFs>,
 }
 
 impl OpenedEntries {
-    /// Voci estratte in `dir` (creata privata al primo uso), con i limiti delle ricerche.
-    pub fn new(source: Arc<DocumentSource>, dir: PathBuf, limits: Limits) -> OpenedEntries {
+    /// Voci estratte in `dir` (creata privata al primo uso con `private_fs`), con i limiti
+    /// delle ricerche.
+    pub fn new(
+        source: Arc<DocumentSource>,
+        dir: PathBuf,
+        limits: Limits,
+        private_fs: Arc<dyn PrivateFs>,
+    ) -> OpenedEntries {
         OpenedEntries {
             source,
             dir,
             limits,
+            private_fs,
         }
     }
 }
@@ -182,8 +194,9 @@ impl ArchiveEntryExtractor for OpenedEntries {
         let Some(name) = doc.inner.last() else {
             return Ok(None);
         };
-        let (path, file) = create_new_entry_file(&self.dir, &opened_extension(name))
-            .map_err(ExtractError::from_io)?;
+        let (path, file) =
+            create_new_entry_file(self.private_fs.as_ref(), &self.dir, &opened_extension(name))
+                .map_err(ExtractError::from_io)?;
         let mut sink = FileSink {
             file: BufWriter::new(file),
             error: None,
@@ -251,11 +264,15 @@ static OPENED_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// Crea un file nuovo `voce-<16 cifre esadecimali>.<extension>` in `dir` (creata privata se
 /// manca); il nome non dipende mai dal nome della voce, l'estensione è già resa innocua da
 /// chi chiama.
-fn create_new_entry_file(dir: &Path, extension: &str) -> io::Result<(PathBuf, File)> {
-    create_private_dir(dir)?;
+fn create_new_entry_file(
+    private_fs: &dyn PrivateFs,
+    dir: &Path,
+    extension: &str,
+) -> io::Result<(PathBuf, File)> {
+    private_fs.create_dir(dir)?;
     for _ in 0..16 {
         let path = dir.join(format!("voce-{:016x}.{extension}", unique_number()));
-        match create_new_private_file(&path) {
+        match private_fs.create_new_file(&path) {
             Ok(file) => return Ok((path, file)),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error),
@@ -302,10 +319,11 @@ mod tests {
     fn entry_files_have_generated_names_and_are_new() {
         let dir = tempfile::tempdir().expect("cartella");
         let target = dir.path().join("aperti");
-        let (first, mut file) = create_new_entry_file(&target, "pdf").expect("creato");
+        let fs = platform::private_fs();
+        let (first, mut file) = create_new_entry_file(fs.as_ref(), &target, "pdf").expect("creato");
         assert!(file.write_all(b"%PDF").is_ok());
         drop(file);
-        let (second, _) = create_new_entry_file(&target, "txt").expect("creato");
+        let (second, _) = create_new_entry_file(fs.as_ref(), &target, "txt").expect("creato");
         assert_ne!(first, second);
         for (path, extension) in [(&first, ".pdf"), (&second, ".txt")] {
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");

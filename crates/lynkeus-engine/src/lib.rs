@@ -46,9 +46,11 @@ pub use launcher::{
     CommandLauncher, EXTRACT_WORKER_FLAG, LaunchedWorker, WorkerExit, WorkerLauncher,
     WorkerProcess, worker_args,
 };
-/// Cartelle e file privati (0700 e 0600 su Linux), per la cache e per i file temporanei
-/// dell'app.
-pub use platform::{create_new_private_file, create_private_dir};
+/// Cartelle e file privati, per la cache e per i file dell'app: il trait [`PrivateFs`]
+/// (l'app ne inietta uno con il descrittore esplicito su Windows) e la versione portabile.
+pub use platform::{
+    NotPrivate, PortablePrivateFs, PrivateFs, create_new_private_file, create_private_dir,
+};
 pub use pool::{
     EntryEnd, ExtractEnd, ExtractorPool, MAX_POOL_SIZE, STOP_GRACE, WorkerFailure,
     default_pool_size,

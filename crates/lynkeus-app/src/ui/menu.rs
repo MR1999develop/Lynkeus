@@ -8,6 +8,7 @@ use egui::{Button, Ui};
 
 use super::{Action, Command};
 use crate::app::{Application, Tab};
+use crate::diagnostics::LogLevel;
 use crate::i18n::Language;
 use crate::results::Step;
 use crate::settings::CacheSettings;
@@ -117,6 +118,9 @@ pub(super) fn bar(app: &Application, ui: &mut Ui, actions: &mut Vec<Action>) {
                 }
             });
             cache_menu(app, ui, actions);
+            ui.separator();
+            context_menu_item(app, ui, actions);
+            log_menu(app, ui, actions);
         });
         ui.menu_button(i18n.tr("menu-help"), |ui| {
             item(app, ui, Command::About, actions);
@@ -164,6 +168,46 @@ fn cache_menu(app: &Application, ui: &mut Ui, actions: &mut Vec<Action>) {
         })
         .response
         .on_disabled_hover_text(i18n.tr("reason-no-cache"));
+    });
+}
+
+/// La voce "Cerca con Lynkeus" nel clic destro, con la spunta; disabilitata con il motivo
+/// mentre cambia o se non è disponibile.
+fn context_menu_item(app: &Application, ui: &mut Ui, actions: &mut Vec<Action>) {
+    let i18n = app.i18n();
+    let enabled = app.context_menu_enabled();
+    let button = Button::selectable(enabled, i18n.tr("menu-context-menu"));
+    let response = ui
+        .add_enabled(app.can_change_context_menu(), button)
+        .on_hover_text(i18n.tr("menu-context-menu-hint"));
+    let reason = if app.is_updating_context_menu() {
+        "reason-context-menu-updating"
+    } else {
+        "reason-no-context-menu"
+    };
+    let response = response.on_disabled_hover_text(i18n.tr(reason));
+    if response.clicked() {
+        actions.push(Action::SetContextMenu(!enabled));
+        ui.close();
+    }
+}
+
+/// Il livello del log.
+fn log_menu(app: &Application, ui: &mut Ui, actions: &mut Vec<Action>) {
+    let i18n = app.i18n();
+    ui.menu_button(i18n.tr("menu-log-level"), |ui| {
+        for level in LogLevel::ALL {
+            let id = match level {
+                LogLevel::Error => "log-level-error",
+                LogLevel::Warn => "log-level-warn",
+                LogLevel::Info => "log-level-info",
+                LogLevel::Debug => "log-level-debug",
+            };
+            if ui.radio(app.log_level() == level, i18n.tr(id)).clicked() {
+                actions.push(Action::SetLogLevel(level));
+                ui.close();
+            }
+        }
     });
 }
 

@@ -15,6 +15,8 @@
 //! [layout]                   # pannelli, anteprima, colonne, ordinamento
 //! [export]                   # formato, righe, ultima cartella di salvataggio
 //! [cache]                    # cache del testo dei documenti: accesa, dimensione massima
+//! [integration]              # context_menu: voce "Cerca con Lynkeus" nel clic destro
+//! [diagnostics]              # log_level: "error", "warn", "info", "debug"
 //! ```
 //!
 //! Lettura tollerante: ogni campo si legge da solo, un valore mancante o non valido prende
@@ -32,6 +34,7 @@ use lynkeus_core::{AccentMode, CaseMode, Combine, MatchOptions, Query, Term, Wil
 use lynkeus_engine::{Extension, Filters};
 use toml::{Table, Value};
 
+use crate::diagnostics::LogLevel;
 use crate::export::{ExportFormat, ExportScope, ExportSettings};
 use crate::i18n::Language;
 use crate::platform;
@@ -216,6 +219,10 @@ pub struct Settings {
     pub export: ExportSettings,
     /// Cache dei documenti.
     pub cache: CacheSettings,
+    /// Voce "Cerca con Lynkeus" nel clic destro (spenta per default).
+    pub context_menu: bool,
+    /// Livello del log.
+    pub log_level: LogLevel,
 }
 
 /// Inserisce `item` in testa a un elenco di recenti, senza doppioni, al massimo
@@ -538,6 +545,13 @@ fn to_table(s: &Settings) -> Table {
     let max_size = i64::try_from(s.cache.max_size_mib).unwrap_or(i64::MAX);
     cache.insert("max_size_mib".into(), max_size.into());
     root.insert("cache".into(), Value::Table(cache));
+
+    let mut integration = Table::new();
+    integration.insert("context_menu".into(), s.context_menu.into());
+    root.insert("integration".into(), Value::Table(integration));
+    let mut diagnostics = Table::new();
+    diagnostics.insert("log_level".into(), s.log_level.key().into());
+    root.insert("diagnostics".into(), Value::Table(diagnostics));
     root
 }
 
@@ -566,6 +580,8 @@ fn from_table(root: &Table) -> Settings {
     let layout = table(root, "layout").unwrap_or(&empty);
     let export = table(root, "export").unwrap_or(&empty);
     let cache = table(root, "cache").unwrap_or(&empty);
+    let integration = table(root, "integration").unwrap_or(&empty);
+    let diagnostics = table(root, "diagnostics").unwrap_or(&empty);
 
     let language = match string(root, "language") {
         Some("it") => Some(Language::Italian),
@@ -721,6 +737,10 @@ fn from_table(root: &Table) -> Settings {
     Settings {
         export,
         cache,
+        context_menu: boolean(integration, "context_menu").unwrap_or(defaults.context_menu),
+        log_level: string(diagnostics, "log_level")
+            .and_then(LogLevel::from_key)
+            .unwrap_or(defaults.log_level),
         language,
         theme,
         options,
@@ -847,7 +867,26 @@ mod tests {
                 enabled: false,
                 max_size_mib: 250,
             },
+            context_menu: true,
+            log_level: LogLevel::Debug,
         }
+    }
+
+    /// La voce del clic destro è spenta per default; un livello del log sconosciuto torna
+    /// al predefinito.
+    #[test]
+    fn integration_defaults_and_unknown_levels() {
+        assert!(!Settings::default().context_menu);
+        let table: Table = "[diagnostics]
+log_level = \"trace\"
+[integration]
+context_menu = 1
+"
+        .parse()
+        .expect("toml");
+        let settings = from_table(&table);
+        assert_eq!(settings.log_level, LogLevel::default());
+        assert!(!settings.context_menu);
     }
 
     #[test]

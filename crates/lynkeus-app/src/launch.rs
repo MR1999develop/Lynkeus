@@ -226,8 +226,43 @@ pub enum LaunchOutcome {
     /// L'apertura delle voci d'archivio non è disponibile (processo estrattore non
     /// collegato).
     ArchiveUnavailable,
+    /// La voce d'archivio non si è potuta estrarre, per questo motivo.
+    EntryFailed(EntryFailure),
     /// Il sistema ha rifiutato (file sparito, nessun programma associato, …).
     Failed,
+}
+
+/// Perché una voce d'archivio non si è estratta: ognuno ha il suo messaggio e il suo
+/// rimedio.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryFailure {
+    /// La voce o l'archivio è protetto da password.
+    Encrypted,
+    /// La voce supera i limiti degli archivi (dimensione, rapporto di compressione,
+    /// profondità) o il tempo massimo.
+    LimitExceeded,
+    /// L'archivio è danneggiato o la voce non c'è più.
+    Corrupt,
+    /// L'archivio non si legge (accesso negato, file in uso o sparito) o la voce non si è
+    /// potuta scrivere nella cartella temporanea.
+    Unreadable,
+}
+
+impl EntryFailure {
+    /// Il motivo per l'utente dall'errore dell'estrazione.
+    pub fn from_error(error: &ExtractError) -> EntryFailure {
+        match error {
+            ExtractError::Encrypted => EntryFailure::Encrypted,
+            ExtractError::LimitExceeded(_)
+            | ExtractError::TooLarge { .. }
+            | ExtractError::Timeout => EntryFailure::LimitExceeded,
+            ExtractError::Corrupt { .. }
+            | ExtractError::ContentMismatch
+            | ExtractError::Binary
+            | ExtractError::NoText => EntryFailure::Corrupt,
+            _ => EntryFailure::Unreadable,
+        }
+    }
 }
 
 /// Esegue `task` (blocca: da chiamare in un thread di lavoro).
@@ -243,7 +278,7 @@ pub fn run(task: &LaunchTask, extractor: &dyn ArchiveEntryExtractor) -> LaunchOu
             Ok(Some(path)) if is_executable_name(&path) => return LaunchOutcome::Failed,
             Ok(Some(path)) => platform::open_with_default_program(&path),
             Ok(None) => return LaunchOutcome::ArchiveUnavailable,
-            Err(_) => return LaunchOutcome::Failed,
+            Err(error) => return LaunchOutcome::EntryFailed(EntryFailure::from_error(&error)),
         },
     };
     match result {
@@ -422,6 +457,47 @@ mod tests {
             inner: vec!["installa.vbs".to_owned()],
         };
         assert_eq!(open_plan(&script), OpenPlan::Executable);
+    }
+
+    /// Un estrattore che fallisce con un errore dato.
+    struct FailingExtractor(fn() -> ExtractError);
+
+    impl ArchiveEntryExtractor for FailingExtractor {
+        fn extract_to_private_temp(&self, _doc: &DocPath) -> Result<Option<PathBuf>, ExtractError> {
+            Err((self.0)())
+        }
+    }
+
+    /// Ogni motivo di fallimento dell'estrazione ha il suo esito, non il generico "non si è
+    /// aperto".
+    #[test]
+    fn entry_failures_say_why() {
+        let entry = DocPath {
+            path: "a.zip".into(),
+            inner: vec!["b.pdf".to_owned()],
+        };
+        let cases: [(fn() -> ExtractError, EntryFailure); 5] = [
+            (|| ExtractError::Encrypted, EntryFailure::Encrypted),
+            (
+                || ExtractError::LimitExceeded(lynkeus_extract::LimitKind::CompressionRatio),
+                EntryFailure::LimitExceeded,
+            ),
+            (|| ExtractError::Timeout, EntryFailure::LimitExceeded),
+            (
+                || ExtractError::Corrupt {
+                    reason: "x".to_owned(),
+                },
+                EntryFailure::Corrupt,
+            ),
+            (|| ExtractError::AccessDenied, EntryFailure::Unreadable),
+        ];
+        for (error, expected) in cases {
+            let task = LaunchTask::OpenArchiveEntry(entry.clone());
+            assert_eq!(
+                run(&task, &FailingExtractor(error)),
+                LaunchOutcome::EntryFailed(expected)
+            );
+        }
     }
 
     #[test]

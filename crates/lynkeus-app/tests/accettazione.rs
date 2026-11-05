@@ -203,7 +203,12 @@ fn archive_entries_open_from_a_private_copy() {
     let app = connected_app(dir.path());
     let source = Arc::clone(app.document_source().expect("fonte collegata"));
     let opened_dir = dir.path().join("aperti");
-    let entries = OpenedEntries::new(source, opened_dir.clone(), Limits::default());
+    let entries = OpenedEntries::new(
+        source,
+        opened_dir.clone(),
+        Limits::default(),
+        lynkeus_app::platform::private_fs(),
+    );
 
     // Una voce di testo con un nome pericoloso: il file ha un nome generato, nella cartella
     // privata, con i byte originali.

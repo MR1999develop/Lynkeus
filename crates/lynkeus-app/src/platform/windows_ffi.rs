@@ -16,6 +16,14 @@
 //!   percorso assoluto, ambiente con la sola `SystemRoot`, nessuna console, cartella corrente =
 //!   cartella dell'eseguibile.
 //!
+//! - Identità e descrittori: SID dell'utente dal token ([`current_user`], [`process_user`]),
+//!   cartelle e file privati con descrittore esplicito e protetto (solo utente e SYSTEM:
+//!   [`create_private_dir`], [`create_new_private_file`], [`WindowsPrivateFs`]), lettura di
+//!   proprietario e DACL ([`read_security`], [`dir_writable_by_others`]).
+//! - Istanza unica: named pipe con `FILE_FLAG_FIRST_PIPE_INSTANCE`, solo client locali, DACL
+//!   con il solo utente e I/O sovrapposto con tempi limite ([`PipeServer`], [`PipeClient`],
+//!   aperto con SQoS Identification); [`allow_set_foreground`].
+//!
 //! Ogni blocco `unsafe` ha il suo `// SAFETY:`; gli handle sono posseduti da `OwnedHandle`
 //! (chiusi una volta sola) e i puntatori passati vivono fino al ritorno della chiamata.
 #![allow(
@@ -30,14 +38,37 @@ use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::Path;
 use std::sync::{Mutex, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
-    ERROR_ACCESS_DENIED, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation,
-    WAIT_OBJECT_0, WAIT_TIMEOUT,
+    ERROR_ACCESS_DENIED, ERROR_BROKEN_PIPE, ERROR_IO_PENDING, ERROR_NO_DATA, ERROR_PIPE_BUSY,
+    ERROR_PIPE_CONNECTED, ERROR_PIPE_NOT_CONNECTED, GENERIC_ALL, GENERIC_WRITE, HANDLE,
+    HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, LocalFree, SetHandleInformation, WAIT_OBJECT_0,
+    WAIT_TIMEOUT,
+};
+use windows_sys::Win32::Security::Authorization::{
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+    ConvertStringSidToSidW, GetSecurityInfo, SDDL_REVISION_1, SE_FILE_OBJECT,
+};
+use windows_sys::Win32::Security::{
+    ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_SIZE_INFORMATION, AclSizeInformation,
+    CreateWellKnownSid, DACL_SECURITY_INFORMATION, GetAce, GetAclInformation, GetLengthSid,
+    GetSecurityDescriptorControl, GetTokenInformation, INHERIT_ONLY_ACE, IsValidSid,
+    OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED, SECURITY_ATTRIBUTES,
+    SECURITY_MAX_SID_SIZE, TOKEN_QUERY, TOKEN_USER, TokenUser, WinBuiltinAdministratorsSid,
+    WinCreatorOwnerRightsSid, WinCreatorOwnerSid, WinLocalSystemSid,
+};
+use windows_sys::Win32::Storage::FileSystem::{
+    BY_HANDLE_FILE_INFORMATION, CREATE_NEW, CreateDirectoryW, CreateFileW,
+    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OPEN_REPARSE_POINT,
+    FILE_FLAG_OVERLAPPED, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    GetFileInformationByHandle, OPEN_EXISTING, PIPE_ACCESS_DUPLEX, READ_CONTROL, ReadFile,
+    SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT, WriteFile,
 };
 use windows_sys::Win32::System::IO::{
-    CreateIoCompletionPort, GetQueuedCompletionStatus, OVERLAPPED,
+    CancelIoEx, CreateIoCompletionPort, GetOverlappedResult, GetOverlappedResultEx,
+    GetQueuedCompletionStatus, OVERLAPPED,
 };
 use windows_sys::Win32::System::JobObjects::{
     CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION,
@@ -50,14 +81,22 @@ use windows_sys::Win32::System::LibraryLoader::{
     LOAD_LIBRARY_SEARCH_SYSTEM32, SetDefaultDllDirectories,
 };
 use windows_sys::Win32::System::Pipes::CreatePipe;
+use windows_sys::Win32::System::Pipes::{
+    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeServerProcessId,
+    PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT, WaitNamedPipeW,
+};
 use windows_sys::Win32::System::SystemServices::JOB_OBJECT_MSG_PROCESS_MEMORY_LIMIT;
 use windows_sys::Win32::System::Threading::{
-    CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DETACHED_PROCESS, DeleteProcThreadAttributeList,
-    EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, INFINITE, InitializeProcThreadAttributeList,
+    CREATE_UNICODE_ENVIRONMENT, CreateEventW, CreateProcessW, DETACHED_PROCESS,
+    DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess,
+    GetExitCodeProcess, INFINITE, InitializeProcThreadAttributeList, OpenProcess, OpenProcessToken,
     PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_JOB_LIST, PROCESS_INFORMATION,
-    STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW, TerminateProcess,
-    UpdateProcThreadAttribute, WaitForSingleObject,
+    PROCESS_QUERY_LIMITED_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW,
+    SetEvent, TerminateProcess, UpdateProcThreadAttribute, WaitForMultipleObjects,
+    WaitForSingleObject,
 };
+use windows_sys::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow;
+use windows_sys::core::PWSTR;
 
 /// Codice d'uscita dato ai processi terminati da qui.
 const KILLED_EXIT_CODE: u32 = 1;
@@ -522,6 +561,902 @@ pub fn spawn_in_job(exe: &Path, args: &[OsString], job: &Job) -> io::Result<Spaw
     })
 }
 
+// --- Identità e descrittori di sicurezza ---------------------------------------------------
+
+/// Un SID copiato in memoria propria (byte del formato binario di Windows).
+#[derive(Clone, PartialEq, Eq)]
+pub struct Sid(Vec<u8>);
+
+impl std::fmt::Debug for Sid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.to_sddl() {
+            Ok(text) => f.write_str(&text),
+            Err(_) => f.write_str("<SID>"),
+        }
+    }
+}
+
+/// SID ben noti che le cartelle dell'app e dei programmi possono contenere senza aprirle ad
+/// altri utenti.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KnownSid {
+    LocalSystem,
+    Administrators,
+    CreatorOwner,
+    OwnerRights,
+}
+
+/// SID del servizio TrustedInstaller, proprietario delle cartelle di Windows e dei programmi
+/// installati (non è tra i SID ben noti di `CreateWellKnownSid`).
+const TRUSTED_INSTALLER_SDDL: &str =
+    "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
+
+impl Sid {
+    /// Copia il SID puntato da `psid`.
+    ///
+    /// # Safety
+    ///
+    /// `psid` deve essere nullo o puntare a memoria leggibile che contiene un SID per tutta
+    /// la sua lunghezza.
+    unsafe fn copy_from(psid: PSID) -> io::Result<Sid> {
+        if psid.is_null() {
+            return Err(io::Error::other("SID nullo"));
+        }
+        // SAFETY: il chiamante garantisce un SID leggibile; `IsValidSid` controlla la
+        // struttura prima di leggerne la lunghezza.
+        if unsafe { IsValidSid(psid) } == 0 {
+            return Err(io::Error::other("SID non valido"));
+        }
+        // SAFETY: SID valido (controllato sopra).
+        let len = unsafe { GetLengthSid(psid) } as usize;
+        // SAFETY: `len` byte leggibili a partire da `psid` (lunghezza dichiarata dal SID
+        // valido); la copia non tiene il puntatore.
+        let bytes = unsafe { std::slice::from_raw_parts(psid.cast::<u8>(), len) }.to_vec();
+        Ok(Sid(bytes))
+    }
+
+    /// Il puntatore per le API che leggono un SID (che non lo modificano).
+    fn as_psid(&self) -> PSID {
+        self.0.as_ptr().cast_mut().cast::<c_void>()
+    }
+
+    /// Un SID ben noto.
+    fn well_known(kind: KnownSid) -> io::Result<Sid> {
+        let kind = match kind {
+            KnownSid::LocalSystem => WinLocalSystemSid,
+            KnownSid::Administrators => WinBuiltinAdministratorsSid,
+            KnownSid::CreatorOwner => WinCreatorOwnerSid,
+            KnownSid::OwnerRights => WinCreatorOwnerRightsSid,
+        };
+        let mut buffer = vec![0u8; SECURITY_MAX_SID_SIZE as usize];
+        let mut len = SECURITY_MAX_SID_SIZE;
+        // SAFETY: buffer scrivibile di `len` byte; nessun SID di dominio.
+        let ok = unsafe {
+            CreateWellKnownSid(
+                kind,
+                std::ptr::null_mut(),
+                buffer.as_mut_ptr().cast::<c_void>(),
+                &raw mut len,
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        buffer.truncate(len as usize);
+        Ok(Sid(buffer))
+    }
+
+    /// Il SID dalla sua forma testuale ("S-1-5-…").
+    fn from_sddl(text: &str) -> io::Result<Sid> {
+        let wide_text = wide(OsStr::new(text));
+        let mut psid: PSID = std::ptr::null_mut();
+        // SAFETY: stringa terminata da zero; il SID restituito va liberato con `LocalFree`.
+        let ok = unsafe { ConvertStringSidToSidW(wide_text.as_ptr(), &raw mut psid) };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: SID appena allocato dal sistema, valido fino al `LocalFree`.
+        let sid = unsafe { Sid::copy_from(psid) };
+        // SAFETY: memoria allocata da `ConvertStringSidToSidW`, liberata una volta.
+        unsafe { LocalFree(psid) };
+        sid
+    }
+
+    /// La forma testuale ("S-1-5-21-…").
+    pub fn to_sddl(&self) -> io::Result<String> {
+        let mut text: PWSTR = std::ptr::null_mut();
+        // SAFETY: SID valido posseduto da `self`; la stringa restituita va liberata con
+        // `LocalFree`.
+        let ok = unsafe { ConvertSidToStringSidW(self.as_psid(), &raw mut text) };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: stringa terminata da zero allocata dal sistema.
+        let result = unsafe { wide_ptr_to_string(text) };
+        // SAFETY: memoria allocata da `ConvertSidToStringSidW`, liberata una volta.
+        unsafe { LocalFree(text.cast::<c_void>()) };
+        Ok(result)
+    }
+}
+
+/// Il testo di una stringa UTF-16 terminata da zero.
+///
+/// # Safety
+///
+/// `text` deve puntare a una stringa UTF-16 terminata da zero.
+unsafe fn wide_ptr_to_string(text: *const u16) -> String {
+    let mut len = 0usize;
+    // SAFETY: stringa terminata da zero (garanzia del chiamante): si legge fino allo zero.
+    while unsafe { *text.add(len) } != 0 {
+        len += 1;
+    }
+    // SAFETY: `len` caratteri leggibili prima dello zero.
+    String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(text, len) })
+}
+
+/// L'utente del token del processo `process` (handle con `PROCESS_QUERY_LIMITED_INFORMATION`).
+fn token_user(process: HANDLE) -> io::Result<Sid> {
+    let mut token: HANDLE = std::ptr::null_mut();
+    // SAFETY: handle del processo valido preso in prestito; handle d'uscita valido.
+    if unsafe { OpenProcessToken(process, TOKEN_QUERY, &raw mut token) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let token = owned(token)?;
+    let mut needed = 0u32;
+    // SAFETY: prima chiamata senza buffer per sapere la dimensione; scrive solo `needed`.
+    unsafe {
+        GetTokenInformation(
+            token.as_raw_handle(),
+            TokenUser,
+            std::ptr::null_mut(),
+            0,
+            &raw mut needed,
+        )
+    };
+    if needed == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // `u64` per l'allineamento della struttura TOKEN_USER (puntatori).
+    let mut buffer = vec![0u64; (needed as usize).div_ceil(size_of::<u64>())];
+    // SAFETY: buffer allineato e scrivibile di almeno `needed` byte.
+    let ok = unsafe {
+        GetTokenInformation(
+            token.as_raw_handle(),
+            TokenUser,
+            buffer.as_mut_ptr().cast::<c_void>(),
+            needed,
+            &raw mut needed,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: il sistema ha scritto una TOKEN_USER all'inizio del buffer allineato.
+    let user = unsafe { &*buffer.as_ptr().cast::<TOKEN_USER>() };
+    // SAFETY: il SID punta dentro `buffer`, vivo per tutta la copia.
+    unsafe { Sid::copy_from(user.User.Sid) }
+}
+
+/// Il SID dell'utente di questo processo (dal token, `TokenUser`).
+pub fn current_user() -> io::Result<Sid> {
+    // SAFETY: pseudo-handle del processo corrente, non va chiuso.
+    token_user(unsafe { GetCurrentProcess() })
+}
+
+/// Il SID dell'utente del processo `pid`.
+pub fn process_user(pid: u32) -> io::Result<Sid> {
+    // SAFETY: nessun puntatore; l'handle restituito è posseduto da `owned`.
+    let process = owned(unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) })?;
+    token_user(process.as_raw_handle())
+}
+
+/// Un descrittore di sicurezza costruito da SDDL, liberato nel `Drop`.
+struct SecurityDescriptor {
+    pointer: PSECURITY_DESCRIPTOR,
+}
+
+impl SecurityDescriptor {
+    fn from_sddl(sddl: &str) -> io::Result<SecurityDescriptor> {
+        let text = wide(OsStr::new(sddl));
+        let mut pointer: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        // SAFETY: stringa terminata da zero; il descrittore restituito va liberato con
+        // `LocalFree` (nel `Drop`).
+        let ok = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                text.as_ptr(),
+                SDDL_REVISION_1,
+                &raw mut pointer,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 || pointer.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(SecurityDescriptor { pointer })
+    }
+
+    /// Gli attributi da passare alle funzioni `Create*` (handle non ereditabile); validi
+    /// finché vive `self`.
+    fn attributes(&self) -> SECURITY_ATTRIBUTES {
+        SECURITY_ATTRIBUTES {
+            nLength: struct_len::<SECURITY_ATTRIBUTES>(),
+            lpSecurityDescriptor: self.pointer,
+            bInheritHandle: 0,
+        }
+    }
+}
+
+impl Drop for SecurityDescriptor {
+    fn drop(&mut self) {
+        // SAFETY: descrittore allocato da `ConvertStringSecurityDescriptorToSecurityDescriptorW`,
+        // liberato una volta sola.
+        unsafe { LocalFree(self.pointer) };
+    }
+}
+
+/// Che cosa protegge un descrittore privato.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrivateObject {
+    /// Cartella: ACE ereditate da sottocartelle e file.
+    Directory,
+    /// File.
+    File,
+    /// Named pipe: solo l'utente.
+    Pipe,
+}
+
+/// Il descrittore privato in SDDL: proprietario l'utente, DACL protetta (nessuna
+/// ereditarietà dal padre) con accesso completo per l'utente e SYSTEM (solo l'utente per
+/// la pipe). Mai la DACL di default, che contiene il SID effimero della logon session.
+fn private_sddl(user: &Sid, object: PrivateObject) -> io::Result<String> {
+    let user = user.to_sddl()?;
+    Ok(match object {
+        PrivateObject::Directory => format!("O:{user}D:P(A;OICI;FA;;;{user})(A;OICI;FA;;;SY)"),
+        PrivateObject::File => format!("O:{user}D:P(A;;FA;;;{user})(A;;FA;;;SY)"),
+        PrivateObject::Pipe => format!("O:{user}D:P(A;;GA;;;{user})"),
+    })
+}
+
+fn private_descriptor(object: PrivateObject) -> io::Result<SecurityDescriptor> {
+    SecurityDescriptor::from_sddl(&private_sddl(&current_user()?, object)?)
+}
+
+/// Una voce di una DACL, copiata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ace {
+    /// Concede (vero) o nega.
+    pub allows: bool,
+    /// Vale solo per gli oggetti creati dentro (`INHERIT_ONLY_ACE`), non per questo.
+    pub inherit_only: bool,
+    /// Flag d'ereditarietà (`OBJECT_INHERIT_ACE`, `CONTAINER_INHERIT_ACE`, …).
+    pub flags: u8,
+    /// Diritti.
+    pub mask: u32,
+    /// A chi.
+    pub sid: Sid,
+}
+
+/// Proprietario e DACL di un file o di una cartella.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecurityInfo {
+    /// Il proprietario.
+    pub owner: Sid,
+    /// La DACL; `None` = DACL nulla (tutto a tutti).
+    pub dacl: Option<Vec<Ace>>,
+    /// DACL protetta: nessuna voce ereditata dal padre.
+    pub protected: bool,
+}
+
+/// Tipi di ACE che concedono diritti (normali, con oggetto, con callback).
+const ALLOWED_ACE_TYPES: [u8; 4] = [0x0, 0x5, 0x9, 0xB];
+/// Tipi di ACE che negano diritti.
+const DENIED_ACE_TYPES: [u8; 4] = [0x1, 0x6, 0xA, 0xC];
+
+/// Copia le voci di `acl`.
+///
+/// # Safety
+///
+/// `acl` deve puntare a una ACL valida, leggibile per tutta la sua dimensione.
+unsafe fn read_acl(acl: *const ACL) -> io::Result<Vec<Ace>> {
+    // SAFETY: struttura C di soli interi, lo zero è un valore valido.
+    let mut size: ACL_SIZE_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: ACL valida (garanzia del chiamante); buffer d'uscita della lunghezza dichiarata.
+    let ok = unsafe {
+        GetAclInformation(
+            acl,
+            (&raw mut size).cast::<c_void>(),
+            struct_len::<ACL_SIZE_INFORMATION>(),
+            AclSizeInformation,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut aces = Vec::with_capacity(size.AceCount as usize);
+    for index in 0..size.AceCount {
+        let mut pointer: *mut c_void = std::ptr::null_mut();
+        // SAFETY: ACL valida, indice entro il numero di voci.
+        if unsafe { GetAce(acl, index, &raw mut pointer) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: ogni ACE inizia con un ACE_HEADER.
+        let header = unsafe { &*pointer.cast::<ACE_HEADER>() };
+        let allows = ALLOWED_ACE_TYPES.contains(&header.AceType);
+        let denies = DENIED_ACE_TYPES.contains(&header.AceType);
+        if !allows && !denies {
+            // Audit, etichette d'integrità e simili: non concedono né negano accesso.
+            continue;
+        }
+        let sid = if matches!(header.AceType, 0x0 | 0x1 | 0x9 | 0xA) {
+            // SAFETY: ACE di accesso semplice: dopo l'intestazione la maschera e il SID.
+            let ace = unsafe { &*pointer.cast::<ACCESS_ALLOWED_ACE>() };
+            // SAFETY: il SID inizia a `SidStart`, dentro la voce valida.
+            unsafe { Sid::copy_from((&raw const ace.SidStart).cast_mut().cast::<c_void>()) }?
+        } else {
+            // Voci con oggetto: il SID è dopo campi di lunghezza variabile. Non servono
+            // alle cartelle dei file; per prudenza contano come voce di uno sconosciuto.
+            Sid::from_sddl("S-1-0-0")?
+        };
+        // SAFETY: come sopra, la maschera segue l'intestazione in ogni tipo di ACE.
+        let mask = unsafe { &*pointer.cast::<ACCESS_ALLOWED_ACE>() }.Mask;
+        aces.push(Ace {
+            allows,
+            inherit_only: u32::from(header.AceFlags) & INHERIT_ONLY_ACE != 0,
+            flags: header.AceFlags,
+            mask,
+            sid,
+        });
+    }
+    Ok(aces)
+}
+
+/// Apre `path` (file o cartella, senza seguire collegamenti) per leggerne la sicurezza.
+fn open_for_security(path: &Path) -> io::Result<OwnedHandle> {
+    let name = wide(path.as_os_str());
+    // SAFETY: stringa terminata da zero; attributi nulli; l'handle restituito è posseduto da
+    // `owned`.
+    let handle = unsafe {
+        CreateFileW(
+            name.as_ptr(),
+            READ_CONTROL,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+        )
+    };
+    owned(handle)
+}
+
+/// Attributi del file aperto.
+fn file_attributes(handle: &OwnedHandle) -> io::Result<u32> {
+    // SAFETY: struttura C di soli interi, lo zero è un valore valido.
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: handle valido; struttura d'uscita valida.
+    if unsafe { GetFileInformationByHandle(handle.as_raw_handle(), &raw mut info) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(info.dwFileAttributes)
+}
+
+/// Proprietario e DACL dell'oggetto aperto.
+fn security_of(handle: &OwnedHandle) -> io::Result<SecurityInfo> {
+    let mut owner: PSID = std::ptr::null_mut();
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    // SAFETY: handle valido aperto con READ_CONTROL; puntatori d'uscita validi; il
+    // descrittore restituito (in cui puntano `owner` e `dacl`) va liberato con `LocalFree`.
+    let status = unsafe {
+        GetSecurityInfo(
+            handle.as_raw_handle(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &raw mut owner,
+            std::ptr::null_mut(),
+            &raw mut dacl,
+            std::ptr::null_mut(),
+            &raw mut descriptor,
+        )
+    };
+    if status != 0 {
+        return Err(io::Error::from_raw_os_error(
+            i32::try_from(status).unwrap_or(i32::MAX),
+        ));
+    }
+    let guard = SecurityDescriptor {
+        pointer: descriptor,
+    };
+    let mut control = 0u16;
+    let mut revision = 0u32;
+    // SAFETY: descrittore valido posseduto da `guard`.
+    if unsafe { GetSecurityDescriptorControl(guard.pointer, &raw mut control, &raw mut revision) }
+        == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `owner` punta dentro il descrittore vivo.
+    let owner = unsafe { Sid::copy_from(owner) }?;
+    let dacl = if dacl.is_null() {
+        None
+    } else {
+        // SAFETY: `dacl` punta a una ACL dentro il descrittore vivo.
+        Some(unsafe { read_acl(dacl) }?)
+    };
+    Ok(SecurityInfo {
+        owner,
+        dacl,
+        protected: control & SE_DACL_PROTECTED != 0,
+    })
+}
+
+/// Proprietario e DACL di `path` (file o cartella; un collegamento si legge come tale).
+pub fn read_security(path: &Path) -> io::Result<SecurityInfo> {
+    security_of(&open_for_security(path)?)
+}
+
+/// I SID che possono avere accesso a una cartella privata dell'utente: l'utente, SYSTEM, gli
+/// amministratori (che hanno comunque il privilegio di prenderne possesso) e i segnaposto
+/// del proprietario.
+fn trusted_sids(user: &Sid) -> io::Result<Vec<Sid>> {
+    Ok(vec![
+        user.clone(),
+        Sid::well_known(KnownSid::LocalSystem)?,
+        Sid::well_known(KnownSid::Administrators)?,
+        Sid::well_known(KnownSid::CreatorOwner)?,
+        Sid::well_known(KnownSid::OwnerRights)?,
+    ])
+}
+
+/// Vero se `info` lascia accedere solo a `trusted`: proprietario fidato, DACL presente e ogni
+/// voce che concede qualcosa (anche solo agli oggetti creati dentro) per un SID fidato.
+fn is_private(info: &SecurityInfo, trusted: &[Sid]) -> bool {
+    let Some(dacl) = &info.dacl else {
+        return false;
+    };
+    trusted.contains(&info.owner)
+        && dacl
+            .iter()
+            .all(|ace| !ace.allows || ace.mask == 0 || trusted.contains(&ace.sid))
+}
+
+/// Diritti che permettono di cambiare il contenuto di una cartella o i suoi permessi.
+const WRITE_RIGHTS: u32 = 0x2 // FILE_ADD_FILE
+    | 0x4 // FILE_ADD_SUBDIRECTORY
+    | 0x40 // FILE_DELETE_CHILD
+    | 0x1_0000 // DELETE
+    | 0x4_0000 // WRITE_DAC
+    | 0x8_0000 // WRITE_OWNER
+    | GENERIC_WRITE
+    | GENERIC_ALL;
+
+/// Vero se `info` concede scrittura sulla cartella stessa a un SID fuori da `trusted`.
+fn writable_by_others(info: &SecurityInfo, trusted: &[Sid]) -> bool {
+    let Some(dacl) = &info.dacl else {
+        return true;
+    };
+    dacl.iter().any(|ace| {
+        ace.allows
+            && !ace.inherit_only
+            && ace.mask & WRITE_RIGHTS != 0
+            && !trusted.contains(&ace.sid)
+    })
+}
+
+/// Vero se la cartella `dir` è scrivibile da utenti diversi da questo, dagli
+/// amministratori, da SYSTEM e da TrustedInstaller (cartella dell'eseguibile, prima di
+/// registrare il clic destro).
+pub fn dir_writable_by_others(dir: &Path) -> io::Result<bool> {
+    let info = read_security(dir)?;
+    let mut trusted = trusted_sids(&current_user()?)?;
+    trusted.push(Sid::from_sddl(TRUSTED_INSTALLER_SDDL)?);
+    Ok(writable_by_others(&info, &trusted))
+}
+
+/// Errore di "cartella non privata" (lo stesso tipo dell'engine).
+fn not_private() -> io::Error {
+    lynkeus_engine::NotPrivate::error()
+}
+
+/// Controlla una cartella esistente: cartella vera (non un collegamento), proprietario e
+/// DACL che non lasciano accedere altri utenti.
+fn check_private_dir(dir: &Path) -> io::Result<()> {
+    let handle = open_for_security(dir)?;
+    let attributes = file_attributes(&handle)?;
+    if attributes & FILE_ATTRIBUTE_DIRECTORY == 0 || attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    {
+        return Err(not_private());
+    }
+    let info = security_of(&handle)?;
+    if is_private(&info, &trusted_sids(&current_user()?)?) {
+        Ok(())
+    } else {
+        Err(not_private())
+    }
+}
+
+/// Crea `dir` e le cartelle mancanti sopra con il descrittore privato; una cartella `dir`
+/// già esistente si controlla ([`check_private_dir`]) e non si modifica.
+pub fn create_private_dir(dir: &Path) -> io::Result<()> {
+    if !dir.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "cartella privata senza percorso assoluto",
+        ));
+    }
+    let descriptor = private_descriptor(PrivateObject::Directory)?;
+    let attributes = descriptor.attributes();
+    // Le cartelle da creare, dalla più esterna; quelle che esistono già non si toccano.
+    let missing: Vec<&Path> = dir
+        .ancestors()
+        .take_while(|path| std::fs::symlink_metadata(path).is_err())
+        .collect();
+    for path in missing.iter().rev() {
+        let name = wide(path.as_os_str());
+        // SAFETY: stringa terminata da zero; attributi con un descrittore vivo fino al
+        // ritorno.
+        if unsafe { CreateDirectoryW(name.as_ptr(), &raw const attributes) } == 0 {
+            let error = io::Error::last_os_error();
+            // Creata nel frattempo da un altro processo: per `dir` si controlla sotto.
+            if error.kind() != io::ErrorKind::AlreadyExists {
+                return Err(error);
+            }
+        }
+    }
+    // Anche se creata qui adesso si controlla: una cartella creata da altri nello stesso
+    // istante (gara sul nome) non passa.
+    check_private_dir(dir)
+}
+
+/// Crea un file nuovo con il descrittore privato, aperto in scrittura; errore
+/// `AlreadyExists` se il nome esiste (anche come collegamento, che non si segue).
+pub fn create_new_private_file(path: &Path) -> io::Result<File> {
+    let descriptor = private_descriptor(PrivateObject::File)?;
+    let attributes = descriptor.attributes();
+    let name = wide(path.as_os_str());
+    // SAFETY: stringa terminata da zero; attributi con un descrittore vivo fino al ritorno;
+    // l'handle restituito è posseduto da `owned`.
+    let handle = unsafe {
+        CreateFileW(
+            name.as_ptr(),
+            GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            &raw const attributes,
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+        )
+    };
+    Ok(File::from(owned(handle)?))
+}
+
+/// Cartelle e file privati con il descrittore esplicito, iniettati nell'engine.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WindowsPrivateFs;
+
+impl lynkeus_engine::PrivateFs for WindowsPrivateFs {
+    fn create_dir(&self, dir: &Path) -> io::Result<()> {
+        create_private_dir(dir)
+    }
+
+    fn create_new_file(&self, path: &Path) -> io::Result<File> {
+        create_new_private_file(path)
+    }
+}
+
+// --- Primo piano --------------------------------------------------------------------------
+
+/// Permette al processo `pid` (la prima istanza) di portare in primo piano la sua finestra.
+pub fn allow_set_foreground(pid: u32) -> io::Result<()> {
+    // SAFETY: nessun puntatore.
+    if unsafe { AllowSetForegroundWindow(pid) } == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+// --- Named pipe dell'istanza unica ---------------------------------------------------------
+
+/// Flag con cui il client apre la pipe: senza `SECURITY_SQOS_PRESENT` il livello
+/// d'impersonazione sarebbe ignorato e un server finto otterrebbe `Impersonation`.
+pub const PIPE_CLIENT_SQOS: u32 = SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION;
+
+/// Un evento manuale con `Drop` (per l'I/O sovrapposto e per lo stop).
+#[derive(Debug)]
+struct Event {
+    handle: OwnedHandle,
+}
+
+impl Event {
+    fn new() -> io::Result<Event> {
+        // SAFETY: attributi nulli, nessun nome; evento manuale non segnalato.
+        let handle = owned(unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) })?;
+        Ok(Event { handle })
+    }
+}
+
+/// Un segnale di stop per il server della pipe, da qualunque thread.
+#[derive(Debug)]
+pub struct StopSignal {
+    event: Event,
+}
+
+impl StopSignal {
+    /// Un segnale non ancora dato.
+    pub fn new() -> io::Result<StopSignal> {
+        Ok(StopSignal {
+            event: Event::new()?,
+        })
+    }
+
+    /// Dà il segnale: l'attesa di una connessione finisce.
+    pub fn set(&self) {
+        // SAFETY: handle dell'evento valido preso in prestito.
+        unsafe { SetEvent(self.event.handle.as_raw_handle()) };
+    }
+}
+
+/// Esegue un'operazione sovrapposta su `handle` e ne attende la fine al massimo `timeout`;
+/// allo scadere la annulla e ne aspetta la chiusura (la struttura OVERLAPPED non deve
+/// sparire con l'operazione in corso). Restituisce i byte trasferiti.
+fn overlapped_io(
+    handle: HANDLE,
+    timeout: Duration,
+    start: impl FnOnce(*mut OVERLAPPED) -> i32,
+) -> io::Result<u32> {
+    let event = Event::new()?;
+    // SAFETY: struttura C di interi e puntatori, lo zero è un valore valido.
+    let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+    overlapped.hEvent = event.handle.as_raw_handle();
+    if start(&raw mut overlapped) == 0 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != i32::try_from(ERROR_IO_PENDING).ok() {
+            return Err(error);
+        }
+    }
+    let millis = u32::try_from(timeout.as_millis())
+        .unwrap_or(INFINITE - 1)
+        .min(INFINITE - 1);
+    let mut transferred = 0u32;
+    // SAFETY: handle valido; `overlapped` vivo fino alla fine dell'operazione (anche in caso
+    // di timeout, sotto).
+    let done = unsafe {
+        GetOverlappedResultEx(
+            handle,
+            &raw const overlapped,
+            &raw mut transferred,
+            millis,
+            0,
+        )
+    };
+    if done != 0 {
+        return Ok(transferred);
+    }
+    let error = io::Error::last_os_error();
+    let timed_out = error.raw_os_error() == i32::try_from(WAIT_TIMEOUT).ok();
+    if !timed_out {
+        return Err(error);
+    }
+    // SAFETY: annulla l'operazione di questa OVERLAPPED, poi ne attende la fine.
+    unsafe {
+        CancelIoEx(handle, &raw const overlapped);
+        GetOverlappedResult(handle, &raw const overlapped, &raw mut transferred, 1);
+    }
+    Err(io::Error::from(io::ErrorKind::TimedOut))
+}
+
+/// Legge esattamente `buffer.len()` byte da una pipe sovrapposta entro `deadline`.
+fn pipe_read_exact(handle: HANDLE, buffer: &mut [u8], deadline: Instant) -> io::Result<()> {
+    let mut filled = 0usize;
+    while filled < buffer.len() {
+        let rest = buffer.get_mut(filled..).unwrap_or_default();
+        let len = u32::try_from(rest.len()).unwrap_or(u32::MAX);
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let pointer = rest.as_mut_ptr();
+        let read = overlapped_io(handle, remaining, |overlapped| {
+            // SAFETY: `rest` scrivibile per `len` byte e vivo fino alla fine dell'operazione
+            // (che `overlapped_io` attende anche in caso di timeout).
+            unsafe { ReadFile(handle, pointer, len, std::ptr::null_mut(), overlapped) }
+        })
+        .map_err(pipe_error)?;
+        if read == 0 {
+            return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+        }
+        filled += read as usize;
+    }
+    Ok(())
+}
+
+/// Scrive tutto `bytes` su una pipe sovrapposta entro `deadline`.
+fn pipe_write_all(handle: HANDLE, bytes: &[u8], deadline: Instant) -> io::Result<()> {
+    let mut sent = 0usize;
+    while sent < bytes.len() {
+        let rest = bytes.get(sent..).unwrap_or_default();
+        let len = u32::try_from(rest.len()).unwrap_or(u32::MAX);
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let pointer = rest.as_ptr();
+        let written = overlapped_io(handle, remaining, |overlapped| {
+            // SAFETY: `rest` leggibile per `len` byte e vivo fino alla fine dell'operazione.
+            unsafe { WriteFile(handle, pointer, len, std::ptr::null_mut(), overlapped) }
+        })
+        .map_err(pipe_error)?;
+        if written == 0 {
+            return Err(io::Error::from(io::ErrorKind::WriteZero));
+        }
+        sent += written as usize;
+    }
+    Ok(())
+}
+
+/// Una pipe chiusa dall'altro capo diventa una fine del flusso.
+fn pipe_error(error: io::Error) -> io::Error {
+    let closed = [ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_PIPE_NOT_CONNECTED]
+        .iter()
+        .any(|code| error.raw_os_error() == i32::try_from(*code).ok());
+    if closed {
+        io::Error::from(io::ErrorKind::UnexpectedEof)
+    } else {
+        error
+    }
+}
+
+/// Il capo server della named pipe dell'istanza unica: una sola istanza, solo client
+/// locali, DACL con il solo utente, I/O sovrapposto con tempi limite.
+#[derive(Debug)]
+pub struct PipeServer {
+    handle: OwnedHandle,
+}
+
+impl PipeServer {
+    /// Crea la pipe `name` (`\\.\pipe\…`). Errore se il nome esiste già
+    /// (`FILE_FLAG_FIRST_PIPE_INSTANCE`): non si usa mai un oggetto creato da altri.
+    pub fn create(name: &str) -> io::Result<PipeServer> {
+        let descriptor = private_descriptor(PrivateObject::Pipe)?;
+        let attributes = descriptor.attributes();
+        let wide_name = wide(OsStr::new(name));
+        // SAFETY: stringa terminata da zero; attributi con un descrittore vivo fino al
+        // ritorno; l'handle restituito è posseduto da `owned`.
+        let handle = unsafe {
+            CreateNamedPipeW(
+                wide_name.as_ptr(),
+                PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE | FILE_FLAG_OVERLAPPED,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+                1,
+                PIPE_BUFFER_BYTES,
+                PIPE_BUFFER_BYTES,
+                0,
+                &raw const attributes,
+            )
+        };
+        Ok(PipeServer {
+            handle: owned(handle)?,
+        })
+    }
+
+    /// Aspetta un client finché non arriva (vero) o finché `stop` non è dato (falso).
+    pub fn accept(&self, stop: &StopSignal) -> io::Result<bool> {
+        let handle = self.handle.as_raw_handle();
+        let event = Event::new()?;
+        // SAFETY: struttura C di interi e puntatori, lo zero è un valore valido.
+        let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+        overlapped.hEvent = event.handle.as_raw_handle();
+        // SAFETY: handle della pipe valido; `overlapped` vivo fino alla fine (sotto).
+        if unsafe { ConnectNamedPipe(handle, &raw mut overlapped) } == 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == i32::try_from(ERROR_PIPE_CONNECTED).ok() {
+                return Ok(true);
+            }
+            if error.raw_os_error() != i32::try_from(ERROR_IO_PENDING).ok() {
+                return Err(error);
+            }
+        }
+        let waited: [HANDLE; 2] = [
+            event.handle.as_raw_handle(),
+            stop.event.handle.as_raw_handle(),
+        ];
+        // SAFETY: due handle di eventi validi; attesa senza limite, ma lo stop la interrompe.
+        let which = unsafe { WaitForMultipleObjects(2, waited.as_ptr(), 0, INFINITE) };
+        let mut transferred = 0u32;
+        if which == WAIT_OBJECT_0 {
+            // SAFETY: operazione finita; si legge l'esito.
+            let ok = unsafe {
+                GetOverlappedResult(handle, &raw const overlapped, &raw mut transferred, 0)
+            };
+            return if ok == 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(true)
+            };
+        }
+        // Stop (o errore dell'attesa): si annulla l'attesa e se ne aspetta la fine.
+        // SAFETY: annulla l'operazione di questa OVERLAPPED, poi ne attende la fine.
+        unsafe {
+            CancelIoEx(handle, &raw const overlapped);
+            GetOverlappedResult(handle, &raw const overlapped, &raw mut transferred, 1);
+        }
+        Ok(false)
+    }
+
+    /// Legge esattamente `buffer.len()` byte dal client connesso entro `deadline`.
+    pub fn read_exact(&self, buffer: &mut [u8], deadline: Instant) -> io::Result<()> {
+        pipe_read_exact(self.handle.as_raw_handle(), buffer, deadline)
+    }
+
+    /// Scrive `bytes` al client connesso entro `deadline`.
+    pub fn write_all(&self, bytes: &[u8], deadline: Instant) -> io::Result<()> {
+        pipe_write_all(self.handle.as_raw_handle(), bytes, deadline)
+    }
+
+    /// Chiude la connessione corrente; la pipe resta pronta per il client successivo.
+    pub fn disconnect(&self) {
+        // SAFETY: handle della pipe valido preso in prestito.
+        unsafe { DisconnectNamedPipe(self.handle.as_raw_handle()) };
+    }
+}
+
+/// Byte del buffer della pipe in ogni direzione.
+const PIPE_BUFFER_BYTES: u32 = 64 * 1024;
+
+/// Il capo client della pipe, aperto con SQoS Identification e I/O sovrapposto.
+#[derive(Debug)]
+pub struct PipeClient {
+    file: File,
+}
+
+impl PipeClient {
+    /// Si connette alla pipe `name` entro `deadline` (se è occupata da un altro client,
+    /// aspetta che si liberi). Il server non può impersonare questo processo oltre il livello
+    /// Identification.
+    pub fn connect(name: &str, deadline: Instant) -> io::Result<PipeClient> {
+        use std::os::windows::fs::OpenOptionsExt;
+        loop {
+            let opened = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .security_qos_flags(PIPE_CLIENT_SQOS)
+                .custom_flags(FILE_FLAG_OVERLAPPED)
+                .open(name);
+            match opened {
+                Ok(file) => return Ok(PipeClient { file }),
+                Err(error) if error.raw_os_error() == i32::try_from(ERROR_PIPE_BUSY).ok() => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    let millis = u32::try_from(remaining.as_millis()).unwrap_or(u32::MAX);
+                    if millis == 0 {
+                        return Err(io::Error::from(io::ErrorKind::TimedOut));
+                    }
+                    let wide_name = wide(OsStr::new(name));
+                    // SAFETY: stringa terminata da zero; attesa limitata a `millis`.
+                    if unsafe { WaitNamedPipeW(wide_name.as_ptr(), millis) } == 0 {
+                        return Err(io::Error::from(io::ErrorKind::TimedOut));
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    /// Il processo che ha creato la pipe.
+    pub fn server_pid(&self) -> io::Result<u32> {
+        let mut pid = 0u32;
+        // SAFETY: handle della pipe valido; puntatore d'uscita valido.
+        if unsafe { GetNamedPipeServerProcessId(self.file.as_raw_handle(), &raw mut pid) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(pid)
+    }
+
+    /// Legge esattamente `buffer.len()` byte entro `deadline`.
+    pub fn read_exact(&self, buffer: &mut [u8], deadline: Instant) -> io::Result<()> {
+        pipe_read_exact(self.file.as_raw_handle(), buffer, deadline)
+    }
+
+    /// Scrive `bytes` entro `deadline`.
+    pub fn write_all(&self, bytes: &[u8], deadline: Instant) -> io::Result<()> {
+        pipe_write_all(self.file.as_raw_handle(), bytes, deadline)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Read;
@@ -668,5 +1603,243 @@ mod tests {
         );
         assert_eq!(line(&[r"fine\"]), r#""C:\Program Files\L\l.exe" fine\"#);
         assert_eq!(line(&[r"a b\"]), r#""C:\Program Files\L\l.exe" "a b\\""#);
+    }
+
+    // --- Cartelle e file privati, identità, pipe ------------------------------------------
+
+    fn system() -> Sid {
+        Sid::well_known(KnownSid::LocalSystem).expect("SID di SYSTEM")
+    }
+
+    /// Una cartella di prova sotto il profilo dell'utente (`%LOCALAPPDATA%`), come le
+    /// cartelle vere dell'app; la cartella temporanea va bene uguale.
+    fn scratch() -> tempfile::TempDir {
+        tempfile::tempdir().expect("cartella temporanea")
+    }
+
+    /// La DACL letta dopo la creazione: protetta, proprietario l'utente, solo utente e
+    /// SYSTEM con accesso completo ereditato da sottocartelle e file.
+    #[test]
+    fn private_dirs_have_an_explicit_protected_dacl() {
+        let base = scratch();
+        let dir = base.path().join("dati").join("cache");
+        create_private_dir(&dir).expect("creata");
+        let user = current_user().expect("utente");
+        for created in [base.path().join("dati"), dir.clone()] {
+            let info = read_security(&created).expect("sicurezza letta");
+            assert!(info.protected, "ereditarietà dal padre attiva");
+            assert_eq!(info.owner, user);
+            let dacl = info.dacl.expect("DACL presente");
+            let sids: Vec<&Sid> = dacl.iter().map(|ace| &ace.sid).collect();
+            assert_eq!(sids, [&user, &system()], "{dacl:?}");
+            for ace in &dacl {
+                assert!(ace.allows && !ace.inherit_only);
+                // OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE.
+                assert_eq!(ace.flags & 0x3, 0x3);
+                assert_eq!(ace.mask & 0x1F_01FF, 0x1F_01FF, "FILE_ALL_ACCESS");
+            }
+        }
+        // Una seconda volta: esiste ed è privata.
+        create_private_dir(&dir).expect("già privata");
+    }
+
+    #[test]
+    fn private_files_have_an_explicit_dacl_and_are_new_only() {
+        let base = scratch();
+        let dir = base.path().join("p");
+        create_private_dir(&dir).expect("cartella");
+        let path = dir.join("token");
+        let mut file = create_new_private_file(&path).expect("file");
+        std::io::Write::write_all(&mut file, b"x").expect("scrittura");
+        drop(file);
+        let info = read_security(&path).expect("sicurezza letta");
+        assert!(info.protected);
+        let sids: Vec<Sid> = info
+            .dacl
+            .expect("DACL")
+            .into_iter()
+            .map(|ace| ace.sid)
+            .collect();
+        assert_eq!(sids, [current_user().expect("utente"), system()]);
+        let again = create_new_private_file(&path).map(|_| ());
+        assert_eq!(
+            again.map_err(|e| e.kind()),
+            Err(io::ErrorKind::AlreadyExists)
+        );
+    }
+
+    /// Esegue `icacls` (percorso assoluto nella cartella di sistema) su `path`.
+    fn icacls(path: &Path, args: &[&str]) {
+        let root = std::env::var_os("SystemRoot").expect("SystemRoot");
+        let exe = Path::new(&root).join("System32").join("icacls.exe");
+        let status = std::process::Command::new(exe)
+            .arg(path)
+            .args(args)
+            .stdout(std::process::Stdio::null())
+            .status()
+            .expect("icacls avviato");
+        assert!(status.success(), "icacls {args:?}");
+    }
+
+    /// Una cartella preesistente con una voce per `Users` (S-1-5-32-545): rifiutata, e non
+    /// modificata.
+    #[test]
+    fn an_existing_dir_open_to_others_is_refused() {
+        let base = scratch();
+        let dir = base.path().join("aperta");
+        std::fs::create_dir(&dir).expect("cartella");
+        create_private_dir(&dir).expect("ereditata dal profilo: privata");
+        icacls(&dir, &["/grant", "*S-1-5-32-545:(OI)(CI)M"]);
+        let refused = create_private_dir(&dir).expect_err("rifiutata");
+        assert!(lynkeus_engine::NotPrivate::is(&refused), "{refused:?}");
+        assert!(dir_writable_by_others(&dir).expect("DACL letta"));
+        let users = Sid::from_sddl("S-1-5-32-545").expect("SID");
+        let info = read_security(&dir).expect("sicurezza");
+        assert!(
+            info.dacl.expect("DACL").iter().any(|ace| ace.sid == users),
+            "la voce estranea è stata tolta"
+        );
+    }
+
+    #[test]
+    fn privacy_rules_on_dacls() {
+        let user = current_user().expect("utente");
+        let trusted = trusted_sids(&user).expect("SID fidati");
+        let everyone = Sid::from_sddl("S-1-1-0").expect("Everyone");
+        let ace = |sid: &Sid, allows: bool, inherit_only: bool, mask: u32| Ace {
+            allows,
+            inherit_only,
+            flags: if inherit_only { 0xB } else { 0x3 },
+            mask,
+            sid: sid.clone(),
+        };
+        let info = |owner: &Sid, dacl: Option<Vec<Ace>>| SecurityInfo {
+            owner: owner.clone(),
+            dacl,
+            protected: true,
+        };
+        let mine = info(&user, Some(vec![ace(&user, true, false, 0x1F_01FF)]));
+        assert!(is_private(&mine, &trusted));
+        assert!(!writable_by_others(&mine, &trusted));
+        // DACL nulla: tutto a tutti.
+        assert!(!is_private(&info(&user, None), &trusted));
+        assert!(writable_by_others(&info(&user, None), &trusted));
+        // Proprietario estraneo.
+        assert!(!is_private(&info(&everyone, Some(vec![])), &trusted));
+        // Lettura per Everyone: non privata, ma non scrivibile.
+        let readable = info(&user, Some(vec![ace(&everyone, true, false, 0x1200A9)]));
+        assert!(!is_private(&readable, &trusted));
+        assert!(!writable_by_others(&readable, &trusted));
+        // Una negazione per Everyone non apre nulla.
+        let denied = info(&user, Some(vec![ace(&everyone, false, false, 0x1F_01FF)]));
+        assert!(is_private(&denied, &trusted));
+        // Scrittura solo per gli oggetti creati dentro: non conta per la cartella stessa,
+        // ma la cartella non è privata.
+        let inherited = info(&user, Some(vec![ace(&everyone, true, true, 0x2)]));
+        assert!(!writable_by_others(&inherited, &trusted));
+        assert!(!is_private(&inherited, &trusted));
+        let writable = info(&user, Some(vec![ace(&everyone, true, false, 0x2)]));
+        assert!(writable_by_others(&writable, &trusted));
+    }
+
+    #[test]
+    fn the_current_process_belongs_to_the_current_user() {
+        let user = current_user().expect("utente");
+        assert!(user.to_sddl().expect("testo").starts_with("S-1-5-"));
+        assert_eq!(process_user(std::process::id()).expect("token"), user);
+        assert_ne!(user, system());
+    }
+
+    #[test]
+    fn the_pipe_client_asks_for_identification_only() {
+        assert_eq!(
+            PIPE_CLIENT_SQOS & SECURITY_SQOS_PRESENT,
+            SECURITY_SQOS_PRESENT
+        );
+        assert_eq!(
+            PIPE_CLIENT_SQOS & SECURITY_IDENTIFICATION,
+            SECURITY_IDENTIFICATION
+        );
+        // Identification è il livello 1 (bit 16-17): non Impersonation né Delegation.
+        assert_eq!((PIPE_CLIENT_SQOS >> 16) & 0x3, 1);
+    }
+
+    fn pipe_name() -> String {
+        let mut bytes = [0u8; 16];
+        getrandom::fill(&mut bytes).expect("casuale");
+        let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        format!(r"\\.\pipe\lynkeus-test-{hex}")
+    }
+
+    #[test]
+    fn a_pipe_name_already_in_use_is_refused() {
+        let name = pipe_name();
+        let first = PipeServer::create(&name).expect("prima pipe");
+        assert!(PipeServer::create(&name).is_err(), "seconda istanza creata");
+        drop(first);
+    }
+
+    #[test]
+    fn pipe_round_trip_with_timeouts() {
+        let name = pipe_name();
+        let server = PipeServer::create(&name).expect("pipe");
+        let stop = StopSignal::new().expect("stop");
+        let client_name = name.clone();
+        let client = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let client = PipeClient::connect(&client_name, deadline).expect("connesso");
+            assert_eq!(client.server_pid().expect("pid"), std::process::id());
+            client.write_all(b"ciao", deadline).expect("scritto");
+            let mut reply = [0u8; 1];
+            client.read_exact(&mut reply, deadline).expect("risposta");
+            reply[0]
+        });
+        assert!(server.accept(&stop).expect("accettato"));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut message = [0u8; 4];
+        server.read_exact(&mut message, deadline).expect("letto");
+        assert_eq!(&message, b"ciao");
+        server.write_all(&[7], deadline).expect("risposta");
+        assert_eq!(client.join().expect("client"), 7);
+        // Il client ha chiuso: fine del flusso, poi il server si libera.
+        let mut more = [0u8; 1];
+        let end = server.read_exact(&mut more, deadline).map_err(|e| e.kind());
+        assert_eq!(end, Err(io::ErrorKind::UnexpectedEof));
+        server.disconnect();
+
+        // Un client che non scrive: il server riprende dopo il tempo limite. (Dopo
+        // `disconnect` il client aspetta il prossimo `accept`: si connette da un altro
+        // thread.)
+        let (connected_tx, connected_rx) = std::sync::mpsc::channel();
+        let silent = std::thread::spawn(move || {
+            let client = PipeClient::connect(&name, Instant::now() + Duration::from_secs(5));
+            let _ = connected_rx.recv_timeout(Duration::from_secs(5));
+            client.map(|_| ())
+        });
+        assert!(server.accept(&stop).expect("accettato"));
+        let started = Instant::now();
+        let waited = server
+            .read_exact(&mut message, started + Duration::from_millis(200))
+            .map_err(|e| e.kind());
+        assert_eq!(waited, Err(io::ErrorKind::TimedOut));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        connected_tx.send(()).expect("client vivo");
+        assert!(silent.join().expect("client").is_ok());
+        server.disconnect();
+
+        // La DACL della pipe: protetta, solo l'utente.
+        let info = security_of(&server.handle).expect("sicurezza della pipe");
+        assert!(info.protected);
+        let sids: Vec<Sid> = info
+            .dacl
+            .expect("DACL")
+            .into_iter()
+            .map(|ace| ace.sid)
+            .collect();
+        assert_eq!(sids, [current_user().expect("utente")]);
+
+        // Lo stop interrompe l'attesa di un client.
+        stop.set();
+        assert!(!server.accept(&stop).expect("attesa interrotta"));
     }
 }

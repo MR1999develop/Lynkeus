@@ -28,6 +28,7 @@ use egui::{Align2, Id, RichText, Ui};
 use lynkeus_engine::{DocPath, Notify};
 
 use crate::app::{Application, MAX_HITS_PER_FRAME, Notice, Pump, Tab};
+use crate::diagnostics::LogLevel;
 use crate::export::ExportFormat;
 use crate::form::RootKind;
 use crate::i18n::Language;
@@ -57,6 +58,8 @@ pub(crate) enum Action {
     SetLanguage(Option<Language>),
     SetCacheEnabled(bool),
     SetCacheSize(u64),
+    SetContextMenu(bool),
+    SetLogLevel(LogLevel),
     ClearCache,
     ResetFilters,
     DismissNotice,
@@ -82,10 +85,17 @@ pub fn setup_context(ctx: &egui::Context, app: &Application) {
 impl eframe::App for Application {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if !self.has_root_check_waker() {
-            let ctx = ctx.clone();
-            self.set_root_check_waker(Arc::new(move || ctx.request_repaint()));
+            self.set_root_check_waker(repaint(ctx));
+            // Anche l'istanza unica, una volta sola, con lo stesso contesto.
+            self.set_instance_waker(repaint(ctx));
         }
         self.pump_root_checks();
+        if self.pump_instance() {
+            // Percorsi da un'altra istanza: la finestra in primo piano (l'altra istanza ha
+            // chiamato AllowSetForegroundWindow).
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
         if self.pump_events(MAX_HITS_PER_FRAME) == Pump::MorePending {
             ctx.request_repaint();
         }
@@ -132,16 +142,17 @@ impl eframe::App for Application {
         // eframe ricorda la finestra; le impostazioni vanno in settings.toml. Un errore
         // non ferma l'app: riproverà al prossimo salvataggio.
         if let Err(error) = self.save_settings() {
-            eprintln!("lynkeus-searcher: impostazioni non salvate: {error}");
+            tracing::warn!(%error, "impostazioni non salvate");
         }
     }
 
     fn on_exit(&mut self) {
         if let Err(error) = self.save_settings() {
-            eprintln!("lynkeus-searcher: impostazioni non salvate: {error}");
+            tracing::warn!(%error, "impostazioni non salvate");
         }
         self.cancel_search();
         self.shutdown_extraction();
+        self.shutdown_instance();
     }
 
     fn persist_egui_memory(&self) -> bool {
@@ -357,6 +368,8 @@ fn apply(app: &mut Application, ctx: &egui::Context, frame: &eframe::Frame, acti
         Action::SetCacheEnabled(enabled) => app.set_cache_enabled(enabled),
         Action::SetCacheSize(mib) => app.set_cache_size_mib(mib),
         Action::ClearCache => app.clear_cache(&repaint(ctx)),
+        Action::SetContextMenu(enabled) => app.set_context_menu(enabled, &repaint(ctx)),
+        Action::SetLogLevel(level) => app.set_log_level(level),
         Action::ResetFilters => app.form.filters.reset(),
         Action::DismissNotice => app.dismiss_notice(),
         Action::Reveal(doc) => {

@@ -30,6 +30,9 @@ memchr.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 
+[target.'cfg(not(windows))'.dependencies]
+rustix.workspace = true
+
 [dev-dependencies]
 proptest.workspace = true
 tempfile.workspace = true

@@ -18,9 +18,13 @@ use std::time::{Duration, Instant};
 
 use lynkeus_core::{ByteSize, CompiledQuery};
 use lynkeus_engine::{
-    DocPath, DocumentSource, Hit, Limits, Notify, Outcome, ProgressSnapshot, Received, SearchEvent,
-    SearchHandle, SearchRequest, Summary, Warning, start_search,
+    DocPath, DocumentSource, Hit, Limits, Notify, Outcome, PrivateFs, ProgressSnapshot, Received,
+    SearchEvent, SearchHandle, SearchRequest, Summary, Warning, start_search,
 };
+
+use crate::context_menu::{self, ContextMenuStore, MenuEntry, MenuError};
+use crate::diagnostics::{LogControl, LogLevel};
+use crate::instance::InstanceServer;
 
 use crate::export::{self, ExportScope, ExportSettings};
 use crate::extraction::{self, ExtractionSetup, OpenedEntries, PoolDocumentUnits};
@@ -29,8 +33,10 @@ use crate::form::{
 };
 use crate::i18n::{I18n, Language};
 use crate::launch::{
-    self, ArchiveEntryExtractor, LaunchOutcome, LaunchTask, NoArchiveExtraction, OpenPlan,
+    self, ArchiveEntryExtractor, EntryFailure, LaunchOutcome, LaunchTask, NoArchiveExtraction,
+    OpenPlan,
 };
+use crate::platform;
 use crate::preview::{self, DocumentUnits, Loaded, NoDocumentUnits, PreviewError, PreviewRequest};
 use crate::results::{ResultsView, SortColumn, SortSpec, Step};
 use crate::root_check::{RootCheck, RootChecks};
@@ -215,6 +221,34 @@ pub enum Notice {
     },
     /// La cache non si è svuotata del tutto (file in uso o permessi).
     CacheClearFailed,
+    /// Una voce d'archivio non si è estratta per aprirla.
+    EntryFailed {
+        /// Il documento, come mostrato.
+        file: String,
+        /// Perché.
+        reason: EntryFailure,
+    },
+    /// La voce del clic destro non si è accesa o spenta.
+    ContextMenuFailed(MenuError),
+    /// Cartelle dell'app non private (di altri o aperte ad altri): le funzioni che le
+    /// usano sono spente per questa sessione.
+    PrivateDirsRefused {
+        /// Quante cartelle.
+        count: usize,
+    },
+}
+
+/// Una modifica della voce del clic destro in corso.
+struct ContextMenuJob {
+    /// Lo stato dell'opzione se riesce.
+    enabled: bool,
+    done: Receiver<Result<(), MenuError>>,
+}
+
+/// La voce del clic destro: dove scriverla e per quale eseguibile.
+struct ContextMenuSetup {
+    store: Arc<dyn ContextMenuStore>,
+    exe: PathBuf,
 }
 
 /// Un'esportazione in corso.
@@ -303,6 +337,13 @@ pub struct Application {
     /// Cartella privata dei file estratti dagli archivi per aprirli.
     opened_entries_dir: Option<PathBuf>,
     cache_job: Option<Receiver<io::Result<ByteSize>>>,
+    /// Cartelle e file privati (descrittore esplicito su Windows).
+    private_fs: Arc<dyn PrivateFs>,
+    /// Prima istanza degli avvii con `--add`: riceve i percorsi delle altre.
+    instance: Option<InstanceServer>,
+    context_menu: Option<ContextMenuSetup>,
+    context_menu_job: Option<ContextMenuJob>,
+    log_control: Option<LogControl>,
 }
 
 impl Application {
@@ -348,6 +389,11 @@ impl Application {
             document_source: None,
             opened_entries_dir: None,
             cache_job: None,
+            private_fs: platform::private_fs(),
+            instance: None,
+            context_menu: None,
+            context_menu_job: None,
+            log_control: None,
             settings,
             settings_file,
             saved,
@@ -865,6 +911,7 @@ impl Application {
         self.notice = match (outcome, &job.task) {
             (LaunchOutcome::Done, _) => self.notice.take(),
             (LaunchOutcome::ArchiveUnavailable, _) => Some(Notice::ArchiveEntry),
+            (LaunchOutcome::EntryFailed(reason), _) => Some(Notice::EntryFailed { file, reason }),
             (LaunchOutcome::Failed, LaunchTask::Reveal(_)) => Some(Notice::RevealFailed { file }),
             (LaunchOutcome::Failed, _) => Some(Notice::OpenFailed { file }),
         };
@@ -980,13 +1027,14 @@ impl Application {
     /// Errore se il lanciatore non si può creare (eseguibile senza percorso assoluto): l'app
     /// resta senza documenti.
     pub fn connect_extraction(&mut self, setup: &ExtractionSetup) -> io::Result<()> {
-        let source = extraction::document_source(setup, self.settings.cache)?;
+        let source = extraction::document_source(setup, self.settings.cache, &self.private_fs)?;
         self.documents = Arc::new(PoolDocumentUnits::new(Arc::clone(&source), self.limits));
         if let Some(dir) = &setup.opened_entries_dir {
             self.archive_extractor = Arc::new(OpenedEntries::new(
                 Arc::clone(&source),
                 dir.clone(),
                 self.limits,
+                Arc::clone(&self.private_fs),
             ));
             let dir = dir.clone();
             // Se il thread non parte, si ripulirà all'uscita.
@@ -1117,11 +1165,184 @@ impl Application {
         self.notice = None;
     }
 
-    /// Raccoglie, senza attendere, l'esito delle aperture e delle esportazioni finite.
+    /// Raccoglie, senza attendere, l'esito delle aperture, delle esportazioni e delle
+    /// modifiche al clic destro finite.
     pub fn pump_actions(&mut self) {
         self.poll_launch();
         self.poll_export();
         self.poll_cache();
+        self.poll_context_menu();
+    }
+
+    // --- Avvio con `--add` e istanza unica ----------------------------------------------
+
+    /// Sostituisce le radici con `paths` (avvio con `--add`, percorsi già accettati dal
+    /// guardiano unico): la finestra si apre con quei luoghi, senza avviare la ricerca.
+    pub fn open_with_roots(&mut self, paths: Vec<PathBuf>) {
+        self.form.roots.clear();
+        self.add_external_roots(paths);
+    }
+
+    /// Aggiunge `paths` (già accettati) all'elenco dei luoghi, senza avviare la ricerca e
+    /// senza aprirli; vero se ne è arrivato almeno uno.
+    pub fn add_external_roots(&mut self, paths: Vec<PathBuf>) -> bool {
+        let arrived = !paths.is_empty();
+        for path in paths {
+            self.add_root(path);
+        }
+        arrived
+    }
+
+    /// Questa è la prima istanza: riceve i percorsi degli avvii successivi.
+    pub fn attach_instance(&mut self, server: InstanceServer) {
+        self.instance = Some(server);
+    }
+
+    /// Chi avvisare (un nuovo frame) quando altre istanze mandano percorsi.
+    pub fn set_instance_waker(&self, waker: Notify) {
+        if let Some(server) = &self.instance {
+            server.set_waker(waker);
+        }
+    }
+
+    /// Aggiunge i percorsi arrivati dalle altre istanze; vero se ne è arrivato qualcuno (la
+    /// vista porta la finestra in primo piano).
+    pub fn pump_instance(&mut self) -> bool {
+        let paths = self
+            .instance
+            .as_ref()
+            .map(InstanceServer::take_paths)
+            .unwrap_or_default();
+        self.add_external_roots(paths)
+    }
+
+    /// Chiude il canale dell'istanza unica (all'uscita).
+    pub fn shutdown_instance(&mut self) {
+        self.instance = None;
+    }
+
+    // --- Clic destro --------------------------------------------------------------------
+
+    /// Collega la voce del clic destro: `store` (registro o script) per l'eseguibile `exe`.
+    pub fn connect_context_menu(&mut self, store: Arc<dyn ContextMenuStore>, exe: PathBuf) {
+        self.context_menu = Some(ContextMenuSetup { store, exe });
+    }
+
+    /// Vero se la voce del clic destro è accesa nelle impostazioni.
+    pub fn context_menu_enabled(&self) -> bool {
+        self.settings.context_menu
+    }
+
+    /// Vero se si può cambiare la voce (collegata e nessuna modifica in corso).
+    pub fn can_change_context_menu(&self) -> bool {
+        self.context_menu.is_some() && self.context_menu_job.is_none()
+    }
+
+    /// La voce per l'eseguibile collegato, con il testo nella lingua attuale.
+    fn menu_entry(&self, exe: &Path) -> Result<MenuEntry, MenuError> {
+        let label = self.i18n.tr("context-menu-label");
+        let others: Vec<String> = Language::ALL
+            .iter()
+            .map(|language| I18n::new(*language).tr("context-menu-label"))
+            .collect();
+        MenuEntry::new(exe, &label, &others)
+    }
+
+    /// Accende o spegne la voce del clic destro, in un thread. L'impostazione cambia solo
+    /// se l'operazione riesce; altrimenti un messaggio dice perché.
+    pub fn set_context_menu(&mut self, enabled: bool, notify: &Notify) {
+        self.start_context_menu_job(enabled, notify);
+    }
+
+    /// All'avvio, con l'opzione accesa: riscrive la voce se manca o è cambiata (eseguibile
+    /// spostato, altra lingua). Una voce altrui o una cartella non sicura dà un messaggio.
+    pub fn refresh_context_menu(&mut self, notify: &Notify) {
+        if self.settings.context_menu {
+            self.start_context_menu_job(true, notify);
+        }
+    }
+
+    fn start_context_menu_job(&mut self, enabled: bool, notify: &Notify) {
+        if self.context_menu_job.is_some() {
+            return;
+        }
+        let Some(setup) = &self.context_menu else {
+            return;
+        };
+        let entry = match self.menu_entry(&setup.exe) {
+            Ok(entry) => entry,
+            Err(error) => {
+                self.notice = Some(Notice::ContextMenuFailed(error));
+                return;
+            }
+        };
+        let store = Arc::clone(&setup.store);
+        let (tx, rx) = mpsc::channel();
+        let notify = Arc::clone(notify);
+        let spawned = thread::Builder::new()
+            .name("clic-destro".to_owned())
+            .spawn(move || {
+                let result = if enabled {
+                    context_menu::refresh(store.as_ref(), &entry).map(|_| ())
+                } else {
+                    context_menu::disable(store.as_ref(), &entry)
+                };
+                if tx.send(result).is_ok() {
+                    notify();
+                }
+            });
+        match spawned {
+            Ok(_) => self.context_menu_job = Some(ContextMenuJob { enabled, done: rx }),
+            Err(_) => self.notice = Some(Notice::NoThread),
+        }
+    }
+
+    /// Vero se la voce del clic destro si sta modificando.
+    pub fn is_updating_context_menu(&self) -> bool {
+        self.context_menu_job.is_some()
+    }
+
+    fn poll_context_menu(&mut self) {
+        let Some(job) = &self.context_menu_job else {
+            return;
+        };
+        let result = match job.done.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => Err(MenuError::Io(io::ErrorKind::Other)),
+        };
+        match result {
+            Ok(()) => {
+                self.settings.context_menu = job.enabled;
+                tracing::info!(enabled = job.enabled, "voce del clic destro aggiornata");
+            }
+            Err(error) => {
+                tracing::warn!(%error, enabled = job.enabled, "voce del clic destro non aggiornata");
+                self.notice = Some(Notice::ContextMenuFailed(error));
+            }
+        }
+        self.context_menu_job = None;
+    }
+
+    // --- Diagnostica --------------------------------------------------------------------
+
+    /// Collega il log installato nel `main`, per cambiarne il livello.
+    pub fn set_log_control(&mut self, control: LogControl) {
+        control.set_level(self.settings.log_level);
+        self.log_control = Some(control);
+    }
+
+    /// Il livello del log.
+    pub fn log_level(&self) -> LogLevel {
+        self.settings.log_level
+    }
+
+    /// Cambia il livello del log (subito e nelle impostazioni).
+    pub fn set_log_level(&mut self, level: LogLevel) {
+        self.settings.log_level = level;
+        if let Some(control) = &self.log_control {
+            control.set_level(level);
+        }
     }
 
     /// Salva le impostazioni se sono cambiate dall'ultimo salvataggio. Senza file (test)
@@ -1361,6 +1582,78 @@ mod tests {
         // Svuotare senza cache non fa nulla.
         app.clear_cache(&(Arc::new(|| {}) as Notify));
         assert!(!app.is_clearing_cache());
+    }
+
+    /// Un messaggio valido dell'istanza unica aggiunge luoghi senza avviare la ricerca.
+    #[test]
+    fn external_roots_are_added_without_searching() {
+        let mut app = Application::build(Settings::default()).expect("app");
+        app.open_with_roots(vec![missing_root()]);
+        assert_eq!(app.form.roots.len(), 1);
+        let other = std::env::temp_dir();
+        assert!(app.add_external_roots(vec![other.clone()]));
+        assert!(!app.add_external_roots(Vec::new()));
+        assert_eq!(app.form.roots.len(), 2);
+        assert!(!app.is_searching());
+        assert!(matches!(app.status(), SearchStatus::Idle));
+        // Senza istanza unica non arriva nulla.
+        assert!(!app.pump_instance());
+    }
+
+    /// La voce del clic destro: l'impostazione cambia solo se l'operazione riesce.
+    #[test]
+    fn the_context_menu_setting_follows_the_outcome() {
+        use std::sync::atomic::AtomicBool;
+
+        use crate::context_menu::MenuState;
+
+        struct Store {
+            writable: AtomicBool,
+        }
+        impl ContextMenuStore for Store {
+            fn state(&self, _entry: &MenuEntry) -> io::Result<MenuState> {
+                Ok(MenuState::Missing)
+            }
+            fn install(&self, _entry: &MenuEntry) -> io::Result<()> {
+                Ok(())
+            }
+            fn remove(&self, _entry: &MenuEntry) -> io::Result<()> {
+                Ok(())
+            }
+            fn exe_dir_writable_by_others(&self, _exe: &Path) -> io::Result<bool> {
+                Ok(self.writable.load(Ordering::Relaxed))
+            }
+        }
+
+        let wait = |app: &mut Application| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while app.is_updating_context_menu() && Instant::now() < deadline {
+                app.pump_actions();
+                thread::yield_now();
+            }
+        };
+        let notify: Notify = Arc::new(|| {});
+        let mut app = Application::build(Settings::default()).expect("app");
+        assert!(!app.can_change_context_menu());
+        let store = Arc::new(Store {
+            writable: AtomicBool::new(true),
+        });
+        let exe = std::env::temp_dir().join("lynkeus-searcher.exe");
+        app.connect_context_menu(Arc::clone(&store) as Arc<dyn ContextMenuStore>, exe);
+        app.set_context_menu(true, &notify);
+        wait(&mut app);
+        assert!(!app.context_menu_enabled());
+        assert_eq!(
+            app.notice(),
+            Some(&Notice::ContextMenuFailed(MenuError::ExeDirWritable))
+        );
+        store.writable.store(false, Ordering::Relaxed);
+        app.set_context_menu(true, &notify);
+        wait(&mut app);
+        assert!(app.context_menu_enabled());
+        app.set_context_menu(false, &notify);
+        wait(&mut app);
+        assert!(!app.context_menu_enabled());
     }
 
     #[test]
