@@ -1,0 +1,295 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 MR
+
+//! Misure dell'interfaccia del livello 3 del piano di test (P-06…P-09 di
+//! `docs/piano-di-test.md`), con 200.000 risultati.
+//!
+//! Sono test `#[ignore]`: li lancia `cargo xtask test-plan`, uno per processo e in release,
+//! oppure a mano:
+//!
+//! ```text
+//! cargo test --release -p lynkeus-app --test prestazioni_interfaccia <nome> -- --ignored --exact --nocapture
+//! ```
+//!
+//! Ognuno stampa la riga `MISURA` del modulo `misura` (lo stesso file delle misure del
+//! motore); le soglie le confronta xtask.
+
+#[path = "../../lynkeus-engine/tests/misura/mod.rs"]
+mod misura;
+
+use std::hint::black_box;
+use std::path::PathBuf;
+use std::sync::{Arc, mpsc};
+use std::time::{Duration, Instant};
+
+use egui::{Key, Role};
+use egui_kittest::Harness;
+use egui_kittest::kittest::Queryable;
+use lynkeus_app::form::{RootAdded, RootKind};
+use lynkeus_app::results::{ResultsView, SortColumn, SortSpec, Step};
+use lynkeus_app::{Application, Pump, Settings, setup_context};
+use lynkeus_core::{Location, Snippet, TermSet};
+use lynkeus_engine::{DocPath, Hit, Notify};
+use misura::Distribution;
+
+/// Ripetizioni a caldo dopo quella scartata (metodo comune del piano).
+const REPETITIONS: usize = 15;
+/// Righe di risultato delle misure: il limite predefinito dei risultati.
+const ROWS: usize = 200_000;
+/// Tempo massimo di una ricerca o di una copia nelle misure.
+const DEADLINE: Duration = Duration::from_secs(120);
+/// Intervallo tra due frame simulati mentre un thread lavora (circa 60 al secondo).
+const FRAME_INTERVAL: Duration = Duration::from_millis(16);
+/// Frame massimi perché la finestra si fermi dopo un tasto: lo scorrimento animato fino
+/// alla riga del cursore ne chiede alcuni in più dei 4 predefiniti di kittest.
+const MAX_SETTLE_FRAMES: u64 = 64;
+
+/// Le colonne ordinabili.
+const COLUMNS: [SortColumn; 5] = [
+    SortColumn::File,
+    SortColumn::Position,
+    SortColumn::Word,
+    SortColumn::Term,
+    SortColumn::Context,
+];
+
+/// P-06: ordinamento finale di 200.000 righe per ogni colonna (15 ripetizioni per colonna,
+/// tutte nella distribuzione); `batch_max_ms` è il lotto più lento inserito durante la
+/// ricerca, a lotti di 5000 righe.
+#[test]
+#[ignore = "misura P-06 del piano di test, lanciata da cargo xtask test-plan"]
+fn p06_sort_200k() {
+    let hits = many_hits();
+    let roots = roots();
+    let mut finish_times = Vec::new();
+    let mut slowest_batch = Duration::ZERO;
+    for column in COLUMNS {
+        finish_times.extend(misura::repeat(REPETITIONS, || {
+            let mut view = ResultsView::new(Some(SortSpec::ascending(column)));
+            let ((), took) = misura::timed(|| view.finish(&hits, &roots));
+            assert_eq!(view.len(), hits.len());
+            took
+        }));
+        let mut streaming = ResultsView::new(Some(SortSpec::ascending(column)));
+        for end in (5_000..=hits.len()).step_by(5_000) {
+            let ((), took) = misura::timed(|| streaming.extend_to(&hits[..end], &roots));
+            slowest_batch = slowest_batch.max(took);
+        }
+    }
+    misura::print_line(
+        "P-06",
+        &Distribution::new(&finish_times),
+        &[
+            ("rows", ROWS.to_string()),
+            ("columns", COLUMNS.len().to_string()),
+            ("batch_max_ms", misura::duration_ms(slowest_batch)),
+        ],
+    );
+}
+
+/// P-07: tempo per chiamata di `step_target` (i quattro passi dell'anteprima), righe per
+/// file e per parola, cursore all'inizio, a metà e in fondo.
+#[test]
+#[ignore = "misura P-07 del piano di test, lanciata da cargo xtask test-plan"]
+fn p07_step_target_200k() {
+    const CALLS: u32 = 50;
+    let steps = [
+        Step::NextInFile,
+        Step::PreviousInFile,
+        Step::NextFile,
+        Step::PreviousFile,
+    ];
+    let hits = many_hits();
+    let mut per_call = Vec::new();
+    for sort in [None, Some(SortSpec::ascending(SortColumn::Word))] {
+        let mut view = ResultsView::new(sort);
+        view.finish(&hits, &roots());
+        for position in [0, hits.len() / 2, hits.len() - 1] {
+            view.jump_to(position);
+            per_call.extend(misura::repeat(REPETITIONS, || {
+                let ((), took) = misura::timed(|| {
+                    for _ in 0..CALLS {
+                        for step in steps {
+                            black_box(view.step_target(black_box(step)));
+                        }
+                    }
+                });
+                took / (CALLS * 4)
+            }));
+        }
+    }
+    misura::print_line(
+        "P-07",
+        &Distribution::new(&per_call),
+        &[("rows", ROWS.to_string())],
+    );
+}
+
+/// P-08: Ctrl+A, Ctrl+C con 200.000 righe; per ogni copia il blocco più lungo del thread
+/// dell'interfaccia (l'avvio della copia o un frame mentre il thread di copia lavora).
+#[test]
+#[ignore = "misura P-08 del piano di test, lanciata da cargo xtask test-plan"]
+fn p08_copy_200k() {
+    let (mut app, _dir) = searched_app();
+    assert_eq!(app.results().hits.len(), ROWS);
+    let mut total = Duration::ZERO;
+    let times = misura::repeat(REPETITIONS, || {
+        let (block, took) = copy_all(&mut app);
+        total = total.max(took);
+        block
+    });
+    misura::print_line(
+        "P-08",
+        &Distribution::new(&times),
+        &[
+            ("rows", ROWS.to_string()),
+            ("copy_max_ms", misura::duration_ms(total)),
+        ],
+    );
+}
+
+/// Seleziona tutto e copia; restituisce il blocco più lungo del thread dell'interfaccia e la
+/// durata totale della copia.
+fn copy_all(app: &mut Application) -> (Duration, Duration) {
+    let (tx, rx) = mpsc::channel::<()>();
+    let notify: Notify = Arc::new(move || {
+        // La copia può essere già consegnata: un avviso perso non conta.
+        if tx.send(()).is_err() {}
+    });
+    app.view_mut().select_all();
+    let started = Instant::now();
+    let ((), mut longest) = misura::timed(|| app.copy_selection(&notify));
+    let text = loop {
+        let (text, frame) = misura::timed(|| {
+            app.pump_actions();
+            app.take_clipboard_text()
+        });
+        longest = longest.max(frame);
+        if let Some(text) = text {
+            break text;
+        }
+        assert!(started.elapsed() < DEADLINE, "copia non finita");
+        // Il prossimo frame: all'avviso del thread di copia o dopo un intervallo.
+        if rx.recv_timeout(FRAME_INTERVAL).is_err() {}
+    };
+    assert_eq!(text.lines().count(), ROWS, "una riga per risultato");
+    assert!(!app.is_copying());
+    (longest, started.elapsed())
+}
+
+/// P-09: tempo del frame che riceve la freccia giù con 200.000 risultati (la risposta a
+/// un tasto); `first_frame_ms` è l'apertura della finestra con i risultati già presenti,
+/// fino a una finestra stabile (più frame).
+#[test]
+#[ignore = "misura P-09 del piano di test, lanciata da cargo xtask test-plan"]
+fn p09_key_response_200k() {
+    let (app, _dir) = searched_app();
+    let (mut harness, first_frame) = misura::timed(|| {
+        Harness::builder()
+            .with_size(egui::vec2(1280.0, 800.0))
+            .with_max_steps(MAX_SETTLE_FRAMES)
+            .build_eframe(move |cc| {
+                setup_context(&cc.egui_ctx, &app);
+                app
+            })
+    });
+    harness
+        .query_all_by_role_and_label(Role::Label, "ar")
+        .next()
+        .expect("una riga con la parola \"ar\"")
+        .click();
+    harness.run();
+    assert!(
+        harness.state().view().cursor_position().is_some(),
+        "cursore su una riga"
+    );
+    let times = misura::repeat(REPETITIONS, || {
+        let before = harness.state().view().cursor_position();
+        harness.key_down(Key::ArrowDown);
+        let ((), took) = misura::timed(|| harness.step());
+        harness.key_up(Key::ArrowDown);
+        harness.run();
+        assert_ne!(
+            harness.state().view().cursor_position(),
+            before,
+            "la freccia sposta il cursore"
+        );
+        took
+    });
+    misura::print_line(
+        "P-09",
+        &Distribution::new(&times),
+        &[
+            ("rows", ROWS.to_string()),
+            ("first_frame_ms", misura::duration_ms(first_frame)),
+        ],
+    );
+}
+
+/// L'app dopo una ricerca di "ar" in un file di [`ROWS`] righe "ar", con tutti gli eventi
+/// letti; la cartella temporanea vive quanto il valore restituito.
+fn searched_app() -> (Application, tempfile::TempDir) {
+    let dir = tempfile::tempdir().expect("cartella temporanea");
+    let file = dir.path().join("parole.txt");
+    std::fs::write(&file, "ar\n".repeat(ROWS)).expect("file scritto");
+    let mut app = Application::build(Settings::default()).expect("app");
+    assert_eq!(app.form.add_root(file, RootKind::File), RootAdded::Added);
+    app.set_term("ar");
+    let (tx, rx) = mpsc::channel::<()>();
+    let notify: Notify = Arc::new(move || {
+        // La ricerca può essere già letta: un avviso perso non conta.
+        if tx.send(()).is_err() {}
+    });
+    app.start_search(notify).expect("ricerca avviata");
+    let deadline = Instant::now() + DEADLINE;
+    while app.pump_events(usize::MAX) != Pump::Ended {
+        let left = deadline.saturating_duration_since(Instant::now());
+        assert!(!left.is_zero(), "ricerca non finita entro {DEADLINE:?}");
+        // Il segnale può arrivare prima o dopo la lettura: si rilegge comunque.
+        if rx.recv_timeout(left).is_err() {}
+    }
+    (app, dir)
+}
+
+/// 200.000 righe su 2000 documenti in 37 cartelle, con parole diverse: come una ricerca
+/// grande su un albero vero.
+fn many_hits() -> Vec<Hit> {
+    let docs: Vec<Arc<DocPath>> = (0..2_000)
+        .map(|f| {
+            let path = PathBuf::from("radice")
+                .join(format!("cartella {}", f % 37))
+                .join("sotto cartella con un nome lungo")
+                .join(format!("Documento numero {f}.txt"));
+            Arc::new(DocPath::file(path))
+        })
+        .collect();
+    (0..ROWS)
+        .map(|i| {
+            let doc = &docs[(i * 7919) % docs.len()];
+            let line = u32::try_from(i % 5000).expect("riga entro u32");
+            hit(doc, line, &format!("parola{}", i % 977))
+        })
+        .collect()
+}
+
+fn hit(doc: &Arc<DocPath>, line: u32, word: &str) -> Hit {
+    Hit {
+        doc: Arc::clone(doc),
+        root: 0,
+        location: Location::Line(line),
+        word: word.to_owned(),
+        word_truncated_start: false,
+        word_truncated_end: false,
+        snippet: Snippet {
+            text: word.to_owned(),
+            highlights: Vec::new(),
+            truncated_start: false,
+            truncated_end: false,
+        },
+        terms: TermSet::single(0),
+    }
+}
+
+fn roots() -> Vec<PathBuf> {
+    vec![PathBuf::from("radice")]
+}

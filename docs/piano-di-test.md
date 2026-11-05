@@ -353,3 +353,31 @@ Per ogni sessione: un file di note con data, commit, ambiente, persona (sigla an
 |  |  |  |  |  |  |
 
 Regola: un test manuale che trova un problema diventa un test automatico, scritto prima della correzione (si vede fallire, poi si corregge); il problema entra in `docs/analisi-conformita.md` con un nuovo ID e nella matrice. Il registro si compila a ogni esecuzione, anche parziale, con il commit esatto.
+
+## Esecuzione automatica
+
+`cargo xtask test-plan` esegue con un solo comando la parte automatizzabile del piano e scrive un rapporto.
+
+| Opzione | Effetto |
+|---|---|
+| nessuna | tutti i livelli, da 1 a 5 |
+| `--level 1,2,3` (o `--level=1,2,3`) | solo i livelli indicati |
+| `--quick` | salta `cargo xtask check`, `cargo xtask check-linux`, le misure lunghe (P-01, P-02) e il pacchetto di `cargo xtask dist` (livello 4) |
+| `--clipboard` | esegue anche P-08, che sovrascrive gli appunti di sistema |
+| `--registry` | esegue anche la parte automatica di M-22, che scrive e toglie chiavi in una radice di prova di `HKCU\Software` |
+
+Le voci che modificano stato condiviso della macchina (appunti, registro, menu contestuale) non partono senza l'opzione esplicita: nel rapporto risultano "non eseguita: richiede --clipboard" (o `--registry`).
+
+Cosa esegue:
+
+1. `cargo xtask check` e, da Windows, `cargo xtask check-linux`; poi `cargo test --release --workspace --locked --no-fail-fast -- --list` (compilazione ed elenco dei test) e la stessa riga senza `--list` (tutte le suite in release, accettazione e interfaccia comprese), con una voce per suite.
+2. L'esito di ogni T-xx dai test indicati in `xtask/src/plan_map.rs`, l'unico posto che lega gli ID del piano ai nomi dei test. La voce MAPPA fallisce se un test della mappa non compare nell'elenco di `cargo test -- --list`; il test `every_mapped_test_is_a_function_of_its_package` lo nota già in `cargo xtask check`. T-A13 (fuzzing) resta nel workflow `fuzz.yml`; T-D03 prende l'esito di `cargo xtask dist`.
+3. Le misure P-01…P-09, un test `#[ignore]` per processo, in release: `crates/lynkeus-engine/tests/prestazioni.rs` (P-01, P-02, P-03, P-05) e `crates/lynkeus-app/tests/prestazioni_interfaccia.rs` (P-06…P-09) stampano `MISURA <ID> samples=… p50_ms=… p95_ms=… max_ms=… mem_mb=… mem_kind=…`; P-04 è il test di libreria `prepared_filter_timing` del motore (il filtro preparato è interno al crate), letto dalle sue righe `P-04 …: p50 …, p95 …, massimo …`. Il comando confronta i valori con le soglie di questo piano, scritte in `plan_map.rs`. La memoria è il picco della memoria privata su Windows e il picco RSS (`VmHWM`) su Linux. P-01 crea i 100.000 file nella cartella temporanea e li cancella alla fine; la misura a freddo non si fa, perché svuotare la cache del sistema richiede privilegi.
+4. La parte automatica di M-18 (DACL delle cartelle private con `Get-Acl`, se esistono), M-22 (chiavi del clic destro in una radice di prova di `HKCU\Software`, lette con `reg.exe`), M-24 (Linux: permessi dello script di Nautilus), M-26 (file compresso con WOF), M-30 e M-31 (hash del pacchetto con `Get-FileHash` o `sha256sum -c`), M-33 (mitigazioni dell'eseguibile estratto dallo zip), M-34 (nessun dato locale nei file dello zip); i test di sistema sono in `crates/lynkeus-app/tests/sistema.rs`. Gli altri casi M-xx compaiono come "a mano", con ciò che resta da fare.
+5. I compiti U-01…U-06, elencati come "a mano".
+
+Esiti: superata, FALLITA, sopra soglia, non eseguita (con il motivo), non applicabile, altrove, a mano. Una soglia superata è un avviso; ogni altra voce automatica è obbligatoria. Il comando esce con 1 se fallisce una voce obbligatoria e con 2 se le opzioni sono sbagliate.
+
+Rapporto: `target/test-plan/rapporto-<AAAA-MM-GG>T<hhmmss>Z.md` (ora UTC, non versionato, conservati gli ultimi 20), con data, commit, ambiente (sistema, CPU, core, RAM, dischi, antivirus se leggibile senza privilegi, toolchain, profilo) e, per ogni voce, comando, esito e durata; per le misure campioni, p50, p95, massimo, memoria di picco e soglia. Il riepilogo va su stderr. Le tabelle dei risultati del livello 3 e il registro delle esecuzioni si compilano dal rapporto.
+
+In CI il workflow pianificato `test-plan.yml` (ogni lunedì, o a richiesta) esegue `cargo xtask test-plan --level 1,2,3` su Windows e Ubuntu e pubblica il rapporto come artifact; su runner condivisi i tempi sono solo indicativi.
