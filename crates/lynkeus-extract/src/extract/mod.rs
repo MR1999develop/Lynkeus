@@ -20,6 +20,10 @@
 //! Le unità più lunghe di [`MAX_UNIT_TEXT_BYTES`] si dividono in più unità con la stessa
 //! posizione (o la riga corretta, per le righe), così nessun messaggio supera il massimo
 //! del protocollo.
+//!
+//! [`extract_entry`] attraversa gli archivi allo stesso modo (stesse etichette, stessi
+//! limiti) ma legge solo le voci sul percorso cercato e consegna i byte originali della voce
+//! cercata, a pezzi di al più [`ENTRY_CHUNK_BYTES`].
 
 pub(crate) mod archive;
 pub(crate) mod budget;
@@ -51,7 +55,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::ExtractError;
 use crate::event::{EventSink, ExtractEvent, SkipReason, Stopped, WarningKind, line_location};
 use crate::format::{self, Format, Kind, SNIFF_BYTES, Signature, Verdict};
-use crate::limits::ArchiveLimits;
+use crate::limits::{ArchiveLimits, LimitKind};
 use crate::platform;
 use crate::text::soft_cut;
 
@@ -59,6 +63,10 @@ use budget::{Budget, LimitedReader, classify_io, normalize, read_all};
 
 /// Testo massimo di un'unità: le più lunghe si dividono.
 pub const MAX_UNIT_TEXT_BYTES: usize = 1024 * 1024;
+
+/// Byte massimi di un pezzo di una voce estratta con [`extract_entry`]: con l'intestazione
+/// del messaggio resta ben sotto il massimo di un frame del protocollo.
+pub const ENTRY_CHUNK_BYTES: usize = 1024 * 1024;
 
 /// Opzioni di un'estrazione; viaggiano nella richiesta al processo estrattore.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -102,6 +110,118 @@ pub fn extract_bytes<S: EventSink + ?Sized>(
     let mut ctx = Ctx::new(&mut sink, options.limits, name.to_owned());
     let declared = Format::for_name(name).unwrap_or(Format::Text);
     read_document(&mut ctx, declared, Input::Bytes(bytes))
+}
+
+/// Destinatario dei byte di una voce estratta con [`extract_entry`].
+pub trait EntrySink {
+    /// Riceve il pezzo seguente dei byte della voce (mai vuoto, al più
+    /// [`ENTRY_CHUNK_BYTES`]); [`Stopped`] ferma l'estrazione.
+    fn bytes(&mut self, chunk: &[u8]) -> Result<(), Stopped>;
+}
+
+impl EntrySink for Vec<u8> {
+    fn bytes(&mut self, chunk: &[u8]) -> Result<(), Stopped> {
+        self.extend_from_slice(chunk);
+        Ok(())
+    }
+}
+
+/// Com'è finita l'estrazione di una voce.
+///
+/// Viaggia nel protocollo: nuove varianti solo in fondo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EntryOutcome {
+    /// Tutti i byte della voce sono stati consegnati.
+    Extracted {
+        /// Quanti.
+        bytes: u64,
+    },
+    /// La voce non si è potuta estrarre: i byte già consegnati non valgono. `NotFound` se
+    /// la voce non c'è (o non è un file regolare); altrimenti il motivo dell'avviso che la
+    /// voce, o un archivio sul suo percorso, avrebbe nella ricerca.
+    Failed(WarningKind),
+}
+
+/// Estrae i byte originali della voce `inner` (etichette dall'esterno all'interno, come in
+/// [`ExtractEvent::DocumentStart`](crate::ExtractEvent::DocumentStart)) del file `path` e li
+/// manda a `sink`.
+///
+/// Gli archivi si attraversano come in [`extract_path`], con gli stessi limiti di `options`;
+/// si leggono solo le voci sul percorso di `inner`. Oltre `max_bytes` byte la voce non si
+/// estrae ([`LimitKind::EntrySize`]). Restituisce [`Stopped`] solo se è `sink` a chiedere di
+/// fermarsi. Legge solo `path` (e nulla scrive su disco).
+pub fn extract_entry(
+    path: &Path,
+    inner: &[String],
+    max_bytes: u64,
+    options: &ExtractOptions,
+    sink: &mut dyn EntrySink,
+) -> Result<EntryOutcome, Stopped> {
+    if inner.is_empty() {
+        return Ok(EntryOutcome::Failed(WarningKind::NotFound));
+    }
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let declared = Format::for_path(path).unwrap_or(Format::Text);
+    let mut watch = PathWarnings {
+        target: inner,
+        first: None,
+    };
+    let (result, outcome) = {
+        let mut ctx = Ctx::new(&mut watch, options.limits, name);
+        ctx.target = Some(Target {
+            inner,
+            max_bytes,
+            out: sink,
+            outcome: None,
+        });
+        let result = match platform::open_for_reading(path) {
+            Ok(file) => read_document(&mut ctx, declared, Input::File(file)),
+            Err(error) => ctx.report(ExtractError::from_io(error)),
+        };
+        (result, ctx.target.and_then(|target| target.outcome))
+    };
+    match (outcome, result) {
+        (Some(outcome), _) => Ok(outcome),
+        (None, Err(Stopped)) => Err(Stopped),
+        (None, Ok(())) => Ok(EntryOutcome::Failed(
+            watch.first.unwrap_or(WarningKind::NotFound),
+        )),
+    }
+}
+
+/// Il primo avviso per la voce cercata o per un archivio sul suo percorso: il motivo per
+/// cui la voce non si è trovata.
+struct PathWarnings<'a> {
+    target: &'a [String],
+    first: Option<WarningKind>,
+}
+
+impl EventSink for PathWarnings<'_> {
+    fn emit(&mut self, event: ExtractEvent) -> Result<(), Stopped> {
+        let kind = match event {
+            ExtractEvent::Warning { inner, kind } if self.target.starts_with(&inner) => kind,
+            ExtractEvent::Skipped {
+                inner,
+                reason: SkipReason::TooLarge,
+            } if inner == self.target => WarningKind::LimitExceeded(LimitKind::EntrySize),
+            _ => return Ok(()),
+        };
+        self.first.get_or_insert(kind);
+        Ok(())
+    }
+}
+
+/// Il motivo per cui una voce non si è potuta estrarre, da un errore di lettura.
+fn entry_warning(error: ExtractError) -> WarningKind {
+    let error = normalize(error);
+    match SkipReason::from_error(&error) {
+        Some(SkipReason::TooLarge) => WarningKind::LimitExceeded(LimitKind::EntrySize),
+        Some(_) => WarningKind::Corrupt,
+        None => WarningKind::from_error(&error).unwrap_or(WarningKind::Corrupt),
+    }
 }
 
 /// Perché un estrattore si è interrotto.
@@ -236,6 +356,26 @@ enum DocState {
     Open,
 }
 
+/// Che cosa fare della voce corrente.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EntryRole {
+    /// Leggerla come documento (o archivio da attraversare).
+    Read,
+    /// Consegnarne i byte: è la voce cercata da [`extract_entry`].
+    Capture,
+    /// Non leggerla: fuori dal percorso cercato.
+    Skip,
+}
+
+/// La voce cercata da [`extract_entry`].
+struct Target<'s> {
+    inner: &'s [String],
+    max_bytes: u64,
+    out: &'s mut dyn EntrySink,
+    /// `Some` quando la voce è stata trovata (estratta o no): il resto non si legge.
+    outcome: Option<EntryOutcome>,
+}
+
 /// Contesto di un'estrazione: destinatario, limiti, percorso dentro gli archivi.
 pub(crate) struct Ctx<'s> {
     sink: &'s mut dyn EventSink,
@@ -245,6 +385,8 @@ pub(crate) struct Ctx<'s> {
     root_name: String,
     inner: Vec<String>,
     doc: DocState,
+    /// `Some` con [`extract_entry`]: si cerca una voce invece di estrarre il testo.
+    target: Option<Target<'s>>,
 }
 
 impl<'s> Ctx<'s> {
@@ -255,7 +397,54 @@ impl<'s> Ctx<'s> {
             root_name,
             inner: Vec::new(),
             doc: DocState::Idle,
+            target: None,
         }
+    }
+
+    /// Che cosa fare della voce corrente (sempre [`EntryRole::Read`] fuori da
+    /// [`extract_entry`]).
+    pub fn entry_role(&self) -> EntryRole {
+        let Some(target) = &self.target else {
+            return EntryRole::Read;
+        };
+        if target.outcome.is_some() {
+            EntryRole::Skip
+        } else if self.inner.as_slice() == target.inner {
+            EntryRole::Capture
+        } else if target.inner.starts_with(&self.inner) {
+            EntryRole::Read
+        } else {
+            EntryRole::Skip
+        }
+    }
+
+    /// Consegna i byte di `reader` (la voce cercata, già limitata come le altre voci) e
+    /// ferma l'attraversamento con [`Stopped`]: [`extract_entry`] distingue questo arresto
+    /// da quello chiesto dal destinatario perché l'esito è registrato.
+    pub fn capture(&mut self, reader: &mut dyn Read) -> Result<(), Stopped> {
+        let Some(target) = self.target.as_mut() else {
+            return Ok(());
+        };
+        let mut buf = vec![0_u8; ENTRY_CHUNK_BYTES];
+        let mut total = 0_u64;
+        let outcome = loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break EntryOutcome::Extracted { bytes: total },
+                Ok(read) => {
+                    total = total.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+                    if total > target.max_bytes {
+                        break EntryOutcome::Failed(WarningKind::LimitExceeded(
+                            LimitKind::EntrySize,
+                        ));
+                    }
+                    target.out.bytes(buf.get(..read).unwrap_or_default())?;
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => break EntryOutcome::Failed(entry_warning(classify_io(error))),
+            }
+        };
+        target.outcome = Some(outcome);
+        Err(Stopped)
     }
 
     /// Il nome del documento corrente: l'etichetta della voce, o il nome del file radice.
@@ -280,14 +469,33 @@ impl<'s> Ctx<'s> {
         self.inner.len()
     }
 
-    /// Entra nella voce `label` di un archivio.
-    pub fn enter(&mut self, label: String) {
+    /// Esegue `read` dentro la voce `label` di un archivio e ne esce comunque.
+    ///
+    /// Un panic in `read` (una libreria che legge la voce, la voce stessa) diventa l'avviso
+    /// "danneggiato" di quella voce: l'etichetta si toglie sempre, così le voci seguenti
+    /// hanno il loro percorso giusto. Quando si estrae una sola voce
+    /// ([`extract_entry`]), le voci fuori dal percorso cercato non si leggono: `read` non si
+    /// chiama e il risultato è `T::default()`.
+    pub fn within<T: Default>(
+        &mut self,
+        label: String,
+        read: impl FnOnce(&mut Ctx<'s>) -> Result<T, Stopped>,
+    ) -> Result<T, Stopped> {
+        let depth = self.inner.len();
         self.inner.push(label);
-    }
-
-    /// Esce dalla voce corrente.
-    pub fn leave(&mut self) {
-        self.inner.pop();
+        let result = if self.entry_role() == EntryRole::Skip {
+            Ok(T::default())
+        } else {
+            match catch_unwind(AssertUnwindSafe(|| read(&mut *self))) {
+                Ok(result) => result,
+                Err(_) => {
+                    self.inner.truncate(depth + 1);
+                    self.report(panic_error()).map(|()| T::default())
+                }
+            }
+        };
+        self.inner.truncate(depth);
+        result
     }
 
     /// Un'unità di testo del documento corrente; il testo vuoto o di soli spazi si ignora.
@@ -405,18 +613,47 @@ fn run_document(ctx: &mut Ctx<'_>, declared: Format, mut input: Input<'_>) -> Re
         ctx.begin(format);
     }
     // Le librerie dei formati ricevono input ostile: un loro panic non deve fermare gli altri
-    // documenti. Lo stato del contesto resta coerente (al più un documento da chiudere).
+    // documenti. Le voci rimaste aperte dal panic si tolgono: l'avviso va a questo documento.
+    let depth = ctx.inner.len();
     let extracted = catch_unwind(AssertUnwindSafe(|| (spec.extract)(ctx, input)));
     match extracted {
         Ok(result) => result?,
         Err(_) => {
-            return Err(Fail::Error(ExtractError::Corrupt {
-                reason: "panic durante l'estrazione".to_owned(),
-            }));
+            ctx.inner.truncate(depth);
+            return Err(Fail::Error(panic_error()));
         }
     }
     ctx.finish()?;
     Ok(())
+}
+
+/// Punto d'iniezione dei test: un panic forzato quando si legge la voce con un certo nome,
+/// per provare che un panic dentro un archivio non sposta le etichette delle voci seguenti.
+/// L'errore di un panic intercettato durante la lettura di un documento o di una voce.
+fn panic_error() -> ExtractError {
+    ExtractError::Corrupt {
+        reason: "panic durante l'estrazione".to_owned(),
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_hook {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static PANIC_ON: RefCell<Option<String>> = const { RefCell::new(None) };
+    }
+
+    /// Da ora, in questo thread, la lettura della voce `name` va in panic (`None` = mai).
+    pub fn panic_on(name: Option<&str>) {
+        PANIC_ON.with(|cell| *cell.borrow_mut() = name.map(str::to_owned));
+    }
+
+    /// Va in panic se `name` è la voce scelta con [`panic_on`].
+    pub fn check(name: &str) {
+        let hit = PANIC_ON.with(|cell| cell.borrow().as_deref() == Some(name));
+        assert!(!hit, "panic forzato dal test sulla voce {name}");
+    }
 }
 
 #[cfg(test)]

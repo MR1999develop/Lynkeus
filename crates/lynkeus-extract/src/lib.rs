@@ -43,7 +43,10 @@ pub use event::{
     EventSink, ExtractEvent, SequenceCheck, SequenceError, SkipReason, Stopped, WarningKind,
     line_location,
 };
-pub use extract::{ExtractOptions, MAX_UNIT_TEXT_BYTES, extract_bytes, extract_path};
+pub use extract::{
+    ENTRY_CHUNK_BYTES, EntryOutcome, EntrySink, ExtractOptions, MAX_UNIT_TEXT_BYTES, extract_bytes,
+    extract_entry, extract_path,
+};
 pub use format::{Format, Signature};
 pub use limits::{ArchiveLimits, LimitKind};
 pub use text::{DecodedText, TextChunk, TextEncoding, TextReader, open_text, read_text};

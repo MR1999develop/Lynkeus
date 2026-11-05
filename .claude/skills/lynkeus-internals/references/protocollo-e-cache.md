@@ -8,7 +8,7 @@ Fonti: `crates/lynkeus-extract` (`protocol.rs`, `event.rs`, `worker.rs`, `format
 [u32 LE lunghezza][u16 LE versione][corpo postcard]
 ```
 
-- La lunghezza conta versione + corpo: da 2 a `MAX_FRAME_BYTES` (16 MiB). `PROTOCOL_VERSION` = 1.
+- La lunghezza conta versione + corpo: da 2 a `MAX_FRAME_BYTES` (16 MiB). `PROTOCOL_VERSION` = 2 (dalla 2: richiesta di una voce ed etichette uniche).
 - Il lettore (`FrameReader`) controlla la lunghezza prima di allocare, poi la versione, poi decodifica il corpo in un tipo concreto e rifiuta i byte in più. Fine del flusso prima del primo byte di un frame = fine normale (`Ok(None)`); a metà frame = `ProtocolError::Truncated`. Ogni altra violazione chiude il canale.
 - Lo scrittore (`encode_frame`, `FrameWriter`) non scrive un messaggio oltre il massimo (`FrameTooLarge`).
 - Il percorso di `ExtractRequest` viaggia come `OsString` (anche non UTF-8).
@@ -17,9 +17,10 @@ Fonti: `crates/lynkeus-extract` (`protocol.rs`, `event.rs`, `worker.rs`, `format
 ## Messaggi e sequenza
 
 - `Request::Extract(ExtractRequest { id: u64, path, options: ExtractOptions })`; l'`id` lo sceglie il padre.
+- `Request::ExtractEntry(EntryRequest { id, path, inner, max_bytes, options })`: i byte originali di una voce d'archivio (`extract_entry`). Risposte: zero o più `EntryData { id, bytes }` (ognuno non vuoto, al più `ENTRY_CHUNK_BYTES` = 1 MiB), poi un solo `EntryEnd { id, outcome }` con `EntryOutcome::Extracted { bytes }` (totale uguale ai byte mandati) o `Failed(WarningKind)` (`NotFound` se la voce non c'è; altrimenti il primo avviso della voce o di un archivio sul suo percorso). Si attraversano solo le voci sul percorso, con gli stessi limiti degli archivi; oltre `max_bytes` = `LimitExceeded(EntrySize)`. Il pool (`ExtractorPool::extract_entry`, `EntryEnd`) controlla id, dimensione dei pezzi, totale e massimo; ogni altra risposta è una violazione.
 - `Response`: `Event { id, event }`, `Done { id }`, `Rejected { reason }` (`RejectReason`: `VersionMismatch { found }`, `FrameTooLarge`, `Malformed`; dopo un `Rejected` il figlio esce).
 - Nessun messaggio dal figlio senza una richiesta. Per ogni richiesta: zero o più `Event` con lo stesso `id`, poi `Done`. I problemi del file sono eventi, non errori del protocollo.
-- `ExtractEvent`: `DocumentStart { inner, format }`, `Unit(TextUnit)`, `DocumentEnd`, `Warning { inner, kind }`, `Skipped { inner, reason }`. `inner` = nomi delle voci d'archivio dall'esterno all'interno (vuoto per il file stesso); sono etichette con caratteri di controllo e bidi sostituiti da U+FFFD.
+- `ExtractEvent`: `DocumentStart { inner, format }`, `Unit(TextUnit)`, `DocumentEnd`, `Warning { inner, kind }`, `Skipped { inner, reason }`. `inner` = nomi delle voci d'archivio dall'esterno all'interno (vuoto per il file stesso); sono etichette con caratteri di controllo e bidi sostituiti da U+FFFD, uniche nel loro contenitore (`UniqueLabels`: le ripetute diventano "nome (2).ext", "allegato (2)", nell'ordine dell'archivio; la libreria zip tiene una sola voce per nome). Ogni voce si legge dentro `Ctx::within`, che toglie l'etichetta anche dopo un panic (avviso "danneggiato" per quella voce).
 - Sequenza (`SequenceCheck`, usata dal pool e dalla cache): ogni documento è una coppia `DocumentStart` ... `DocumentEnd` mai annidata, con solo `Unit` in mezzo; un archivio non è un documento (lo è ogni sua voce); `Warning` e `Skipped` stanno fuori dalle coppie e portano il proprio `inner`; un avviso può seguire un documento già chiuso (PDF con pagina danneggiata); un documento che fallisce prima del testo dà solo l'avviso. Errori: `NestedDocument`, `OutsideDocument`, `NoticeInsideDocument`, `Unclosed` (a `finish`).
 - Più righe in un'unità: per `Location::Line` e `PageLine` le righe seguenti hanno numeri successivi (`line_location`); per le altre posizioni la posizione è la stessa.
 - `WarningKind` (estrattore): `NotFound`, `AccessDenied`, `InUse`, `Io`, `Encrypted`, `Corrupt`, `Timeout` (lo decide solo il padre), `LimitExceeded(LimitKind)`, `ContentMismatch`, `NoText`. `SkipReason`: `Binary`, `TooLarge`, `SpecialEntry`. L'engine aggiunge `ExtractorUnavailable` ai propri avvisi.
@@ -45,7 +46,7 @@ Fonti: `crates/lynkeus-extract` (`protocol.rs`, `event.rs`, `worker.rs`, `format
 ## Cache
 
 - Cartella: `%LOCALAPPDATA%\Lynkeus Searcher\cache` su Windows, `~/.cache/lynkeus-searcher` su Linux (crate `directories`). Voci: `<chiave in esadecimale>.lkc`; temporanei `.tmp`.
-- Chiave (`CacheKey`): `blake3` di versione del formato della cache, `PROTOCOL_VERSION`, versione del programma (`CARGO_PKG_VERSION`, che fissa quella degli estrattori), percorso, dimensione, data di modifica (secondi e nanosecondi), opzioni d'estrazione (limiti, codificati come nel protocollo). Senza data di modifica il file non va in cache.
+- Chiave (`CacheKey`): `blake3` di versione del formato della cache, `PROTOCOL_VERSION`, versione del programma (`CARGO_PKG_VERSION`, che fissa quella degli estrattori), percorso (reso assoluto prima della chiave e della richiesta al pool: l'estrattore ha un'altra cartella corrente), dimensione, data di modifica (secondi e nanosecondi), opzioni d'estrazione (limiti, codificati come nel protocollo). Senza data di modifica il file non va in cache.
 - Intestazione (44 byte, `CACHE_FORMAT_VERSION` 1): magia `LKC\0` (4), formato u16 LE, protocollo u16 LE, chiave completa (32), byte originali u32 LE (al più 64 MiB), byte compressi u32 LE, CRC32 del contenuto compresso u32 LE. Contenuto: `lz4_flex` a blocchi dei frame del protocollo, uno per `ExtractEvent`.
 - Lettura, in quest'ordine: dimensione, magia, versioni, chiave, lunghezze (prima di allocare), CRC, decompressione esatta, frame, `SequenceCheck`. Qualsiasi fallimento = voce corrotta: ignorata e cancellata.
 - Scrittura: temporaneo creato nuovo (`create_new_private_file`, mai sopra un file esistente) nella stessa cartella, poi rinomina; nessun `fsync`. La cartella si crea privata al primo salvataggio.
@@ -71,7 +72,7 @@ Registrati (indice `postcard` in ordine): Text (voci d'archivio), Docx, Xlsx, Pp
 
 Dati, cache, log, rapporti di crash e temporanea delle voci degli archivi (`%LOCALAPPDATA%\Lynkeus Searcher\data\temp` su Windows, `~/.local/share/lynkeus-searcher/temp` su Linux; svuotata all'avvio e all'uscita). Obiettivo Windows: descrittore esplicito (solo utente e SYSTEM). Linux: 0700 per le cartelle, 0600 per i file. Creazione dei file che fallisce se esistono già. Stato del codice: su Linux i permessi ci sono; su Windows `create_private_dir` eredita i permessi della cartella dell'utente e il descrittore esplicito è rimandato alla fase 7.
 
-Voci d'archivio da aprire (`OpenedEntries`, app): solo le voci di testo, ricomposte dalle unità in un `.txt` con nome generato (al più 64 MiB). Per le voci in formato documento servono i byte originali, che il protocollo non porta: messaggio di non disponibilità.
+Voci d'archivio da aprire (`OpenedEntries`, app): i byte originali della voce (`DocumentSource::extract_entry`, al più il massimo per voce degli archivi) scritti in un file nuovo `voce-<16 esadecimali>.<estensione>`; l'estensione è quella della voce se di sole lettere e cifre ASCII (al più 16) e non eseguibile, altrimenti `txt` (voce senza formato) o `bin` (`launch::opened_extension`). Un file a metà si cancella. Un capitolo EPUB apre il libro (`open_plan`).
 
 ## Impostazioni
 

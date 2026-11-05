@@ -13,10 +13,12 @@
 //!   ([`LimitedReader`]); le voci cifrate danno l'avviso "protetto da password", i
 //!   collegamenti simbolici sono saltati;
 //! - i nomi delle voci diventano etichette ([`entry_label`]) e decidono solo il formato:
-//!   nulla si scrive su disco;
+//!   nulla si scrive su disco; due voci con la stessa etichetta si distinguono con un
+//!   numero ([`UniqueLabels`]);
 //! - le voci di testo si leggono in flusso, le altre in memoria entro il massimo per voce;
 //! - quando il totale dei byte o delle voci è superato, le voci seguenti non si leggono.
 
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 
 use zip::ZipArchive;
@@ -26,7 +28,7 @@ use zip::result::ZipError;
 use crate::error::ExtractError;
 use crate::event::{SkipReason, Stopped, WarningKind};
 use crate::extract::budget::{LimitedReader, check_declared, classify_io};
-use crate::extract::{Ctx, Fail, Input, Seekable, read_document};
+use crate::extract::{Ctx, EntryRole, Fail, Input, Seekable, read_document};
 use crate::format::Format;
 use crate::limits::LimitKind;
 
@@ -56,6 +58,49 @@ fn neutralize(c: char) -> char {
         char::REPLACEMENT_CHARACTER
     } else {
         c
+    }
+}
+
+/// Etichette uniche tra le voci di un contenitore, assegnate nell'ordine in cui le voci si
+/// incontrano (lo stesso in ogni lettura dello stesso file): la prima voce con un'etichetta
+/// la tiene, le seguenti diventano "nome (2).ext", "nome (3).ext" (il numero prima
+/// dell'estensione, che decide il formato) o "nome (2)" senza estensione. Un numero già
+/// usato da una voce vera si salta.
+#[derive(Debug, Default)]
+pub(crate) struct UniqueLabels {
+    used: HashSet<String>,
+    /// Prossimo numero da provare per ogni etichetta ripetuta.
+    next: HashMap<String, u32>,
+}
+
+impl UniqueLabels {
+    /// L'etichetta unica per una voce chiamata `label`.
+    pub fn unique(&mut self, label: String) -> String {
+        if self.used.insert(label.clone()) {
+            return label;
+        }
+        let mut number = self.next.get(&label).copied().unwrap_or(2);
+        loop {
+            let candidate = numbered(&label, number);
+            number = number.saturating_add(1);
+            if self.used.insert(candidate.clone()) {
+                self.next.insert(label, number);
+                return candidate;
+            }
+        }
+    }
+}
+
+/// `label` con il numero `number` prima dell'estensione dell'ultimo componente.
+fn numbered(label: &str, number: u32) -> String {
+    let file_start = label.rfind(['/', '\\']).map_or(0, |at| at + 1);
+    let file = label.get(file_start..).unwrap_or_default();
+    match file.rfind('.') {
+        Some(dot) if dot > 0 => {
+            let (stem, extension) = label.split_at(file_start + dot);
+            format!("{stem} ({number}){extension}")
+        }
+        _ => format!("{label} ({number})"),
     }
 }
 
@@ -185,12 +230,20 @@ pub(crate) fn check_depth(ctx: &Ctx<'_>) -> Result<(), ExtractError> {
 }
 
 /// Legge una voce già "entrata" nel contesto da un flusso già limitato: in flusso se è
-/// testo, altrimenti in memoria (entro il massimo per voce del flusso).
+/// testo, altrimenti in memoria (entro il massimo per voce del flusso). Se è la voce cercata
+/// da [`extract_entry`](crate::extract::extract_entry) ne consegna invece i byte.
 pub(crate) fn read_entry_stream(
     ctx: &mut Ctx<'_>,
     declared: Format,
     reader: &mut dyn Read,
 ) -> Result<(), Stopped> {
+    #[cfg(test)]
+    crate::extract::test_hook::check(ctx.current_name());
+    match ctx.entry_role() {
+        EntryRole::Read => {}
+        EntryRole::Capture => return ctx.capture(reader),
+        EntryRole::Skip => return Ok(()),
+    }
     if declared == Format::Text {
         return read_document(ctx, declared, Input::Stream(reader));
     }
@@ -209,15 +262,14 @@ pub(crate) fn extract_zip(ctx: &mut Ctx<'_>, input: Input<'_>) -> Result<(), Fai
     ctx.budget()
         .add_entries(u64::try_from(count).unwrap_or(u64::MAX))
         .map_err(ExtractError::LimitExceeded)?;
+    let mut labels = UniqueLabels::default();
     for index in 0..count {
         let info = entry_info(&container, index)?;
         if info.is_dir {
             continue;
         }
-        ctx.enter(info.label.clone());
-        let result = read_entry(ctx, &mut container, index, &info);
-        ctx.leave();
-        result?;
+        let label = labels.unique(info.label.clone());
+        ctx.within(label, |ctx| read_entry(ctx, &mut container, index, &info))?;
         if ctx.budget().exhausted() {
             break;
         }
@@ -241,7 +293,7 @@ fn read_entry(
     if let Err(kind) = check_declared(info.size, info.compressed, ctx.limits()) {
         return ctx.warn(WarningKind::LimitExceeded(kind));
     }
-    let declared = Format::for_name(&info.label).unwrap_or(Format::Text);
+    let declared = Format::for_name(ctx.current_name()).unwrap_or(Format::Text);
     let mut reader = match container.entry(ctx, index) {
         Ok(reader) => reader,
         Err(error) => return ctx.report(error),
@@ -251,7 +303,134 @@ fn read_entry(
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Cursor, Write};
+
+    use zip::ZipWriter;
+    use zip::write::SimpleFileOptions;
+
     use super::*;
+    use crate::event::{ExtractEvent, SequenceCheck};
+    use crate::extract::{ExtractOptions, extract_bytes, test_hook};
+
+    /// Uno zip con le voci `(nome, contenuto)`.
+    fn zip_of(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        for (name, data) in entries {
+            assert!(
+                writer
+                    .start_file(*name, SimpleFileOptions::default())
+                    .is_ok()
+            );
+            assert!(writer.write_all(data).is_ok());
+        }
+        writer.finish().map(Cursor::into_inner).unwrap_or_default()
+    }
+
+    fn run(name: &str, bytes: Vec<u8>) -> Vec<ExtractEvent> {
+        let mut events = Vec::new();
+        let result = extract_bytes(name, bytes, &ExtractOptions::default(), &mut events);
+        assert_eq!(result, Ok(()));
+        let mut check = SequenceCheck::new();
+        for event in &events {
+            assert_eq!(check.accept(event), Ok(()), "{events:?}");
+        }
+        assert_eq!(check.finish(), Ok(()));
+        events
+    }
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    /// Voci dei documenti e (voci, avviso) degli avvisi, nell'ordine.
+    type Paths = (Vec<Vec<String>>, Vec<(Vec<String>, WarningKind)>);
+
+    fn paths(events: &[ExtractEvent]) -> Paths {
+        let mut documents = Vec::new();
+        let mut warnings = Vec::new();
+        for event in events {
+            match event {
+                ExtractEvent::DocumentStart { inner, .. } => documents.push(inner.clone()),
+                ExtractEvent::Warning { inner, kind } => warnings.push((inner.clone(), *kind)),
+                _ => {}
+            }
+        }
+        (documents, warnings)
+    }
+
+    /// Un panic mentre si legge una voce di un archivio interno: la voce ha l'avviso
+    /// "danneggiato", le altre voci (dello stesso archivio e di quello esterno) hanno il
+    /// loro percorso giusto.
+    #[test]
+    fn panic_inside_a_nested_archive_keeps_the_labels() {
+        let nested = zip_of(&[("a.txt", b"uno"), ("b.txt", b"due"), ("c.txt", b"tre")]);
+        let outer = zip_of(&[("interno.zip", &nested), ("dopo.txt", b"quattro")]);
+        test_hook::panic_on(Some("b.txt"));
+        let events = run("esterno.zip", outer);
+        test_hook::panic_on(None);
+        let (documents, warnings) = paths(&events);
+        assert_eq!(
+            documents,
+            [
+                names(&["interno.zip", "a.txt"]),
+                names(&["interno.zip", "c.txt"]),
+                names(&["dopo.txt"]),
+            ]
+        );
+        assert_eq!(
+            warnings,
+            [(names(&["interno.zip", "b.txt"]), WarningKind::Corrupt)]
+        );
+    }
+
+    /// Un panic sulla voce di primo livello: le voci seguenti si leggono lo stesso.
+    #[test]
+    fn panic_on_a_top_level_entry_does_not_stop_the_others() {
+        let outer = zip_of(&[("rotto.pdf", b"%PDF-1.4"), ("dopo.txt", b"quattro")]);
+        test_hook::panic_on(Some("rotto.pdf"));
+        let events = run("esterno.zip", outer);
+        test_hook::panic_on(None);
+        let (documents, warnings) = paths(&events);
+        assert_eq!(documents, [names(&["dopo.txt"])]);
+        assert_eq!(warnings, [(names(&["rotto.pdf"]), WarningKind::Corrupt)]);
+    }
+
+    #[test]
+    fn repeated_labels_get_a_number_before_the_extension() {
+        let mut labels = UniqueLabels::default();
+        let got: Vec<String> = [
+            "doc.docx",
+            "doc.docx",
+            "cartella/doc.docx",
+            "doc (2).docx",
+            "doc.docx",
+            "allegato",
+            "allegato",
+            ".bashrc",
+            ".bashrc",
+            "dir.v2/leggimi",
+            "dir.v2/leggimi",
+        ]
+        .into_iter()
+        .map(|label| labels.unique(label.to_owned()))
+        .collect();
+        assert_eq!(
+            got,
+            [
+                "doc.docx",
+                "doc (2).docx",
+                "cartella/doc.docx",
+                "doc (2) (2).docx",
+                "doc (3).docx",
+                "allegato",
+                "allegato (2)",
+                ".bashrc",
+                ".bashrc (2)",
+                "dir.v2/leggimi",
+                "dir.v2/leggimi (2)",
+            ]
+        );
+    }
 
     #[test]
     fn labels_are_neutralized_and_bounded() {

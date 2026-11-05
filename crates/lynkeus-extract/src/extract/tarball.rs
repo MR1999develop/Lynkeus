@@ -24,7 +24,7 @@ use flate2::read::MultiGzDecoder;
 
 use crate::error::ExtractError;
 use crate::event::{SkipReason, Stopped, WarningKind};
-use crate::extract::archive::{check_depth, entry_label, read_entry_stream};
+use crate::extract::archive::{UniqueLabels, check_depth, entry_label, read_entry_stream};
 use crate::extract::budget::{LimitedReader, check_declared, classify_io};
 use crate::extract::{Ctx, Fail, Input};
 use crate::format::{Format, SNIFF_BYTES, Signature};
@@ -65,10 +65,9 @@ pub(crate) fn extract_gz(ctx: &mut Ctx<'_>, input: Input<'_>) -> Result<(), Fail
         .add_entries(1)
         .map_err(ExtractError::LimitExceeded)?;
     let declared = Format::for_name(&name).unwrap_or(Format::Text);
-    ctx.enter(entry_label(&name));
-    let result = read_entry_stream(ctx, declared, &mut whole);
-    ctx.leave();
-    result?;
+    ctx.within(entry_label(&name), |ctx| {
+        read_entry_stream(ctx, declared, &mut whole)
+    })?;
     Ok(())
 }
 
@@ -91,6 +90,7 @@ fn content_name(name: &str) -> String {
 fn read_tar(ctx: &mut Ctx<'_>, reader: impl Read) -> Result<(), Fail> {
     let mut archive = tar::Archive::new(reader);
     let entries = archive.entries().map_err(tar_error)?;
+    let mut labels = UniqueLabels::default();
     for entry in entries {
         let mut entry = entry.map_err(tar_error)?;
         let kind = entry.header().entry_type();
@@ -100,17 +100,16 @@ fn read_tar(ctx: &mut Ctx<'_>, reader: impl Read) -> Result<(), Fail> {
         ctx.budget()
             .add_entries(1)
             .map_err(ExtractError::LimitExceeded)?;
-        let label = entry_label(&String::from_utf8_lossy(&entry.path_bytes()));
+        let label = labels.unique(entry_label(&String::from_utf8_lossy(&entry.path_bytes())));
         let regular = kind.is_file() || kind.is_contiguous();
         let size = entry.size();
-        ctx.enter(label);
-        let result = if regular {
-            read_tar_entry(ctx, &mut entry, size)
-        } else {
-            ctx.skip(SkipReason::SpecialEntry)
-        };
-        ctx.leave();
-        result?;
+        ctx.within(label, |ctx| {
+            if regular {
+                read_tar_entry(ctx, &mut entry, size)
+            } else {
+                ctx.skip(SkipReason::SpecialEntry)
+            }
+        })?;
         if ctx.budget().exhausted() {
             break;
         }
@@ -167,6 +166,42 @@ mod tests {
         assert_eq!(content_name("cartella/log.gz"), "log");
         assert_eq!(content_name(".gz"), UNNAMED_CONTENT);
         assert_eq!(content_name("senza-estensione"), UNNAMED_CONTENT);
+    }
+
+    /// Due voci con lo stesso nome in un tar (la libreria zip invece ne tiene una sola):
+    /// documenti distinti, con le stesse etichette a ogni lettura.
+    #[test]
+    fn duplicate_tar_entries_are_distinct_documents() {
+        let mut builder = tar::Builder::new(Vec::new());
+        for data in [&b"uno"[..], b"due"] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(u64::try_from(data.len()).unwrap_or(0));
+            header.set_mode(0o644);
+            header.set_cksum();
+            assert!(builder.append_data(&mut header, "nota.txt", data).is_ok());
+        }
+        let bytes = builder.into_inner().unwrap_or_default();
+        for _ in 0..2 {
+            let mut events = Vec::new();
+            let result = crate::extract::extract_bytes(
+                "doppio.tar",
+                bytes.clone(),
+                &crate::extract::ExtractOptions::default(),
+                &mut events,
+            );
+            assert_eq!(result, Ok(()));
+            let documents: Vec<Vec<String>> = events
+                .iter()
+                .filter_map(|event| match event {
+                    crate::event::ExtractEvent::DocumentStart { inner, .. } => Some(inner.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                documents,
+                [vec!["nota.txt".to_owned()], vec!["nota (2).txt".to_owned()]]
+            );
+        }
     }
 
     #[test]

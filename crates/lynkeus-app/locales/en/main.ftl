@@ -285,7 +285,7 @@ preview-no-thread = Preview not available: the system has no free resources. Clo
 ## Messages above the table
 
 notice-executable = For safety, programs and scripts are not opened from here: use "Show in folder" and open it from there if you trust it.
-notice-archive-entry = Documents inside archives (PDF, Office) cannot be opened from here yet: use "Show in folder" to open the archive.
+notice-archive-entry = Archive entries cannot be opened right now because the process that extracts them is not running: use "Show in folder" to open the archive.
 # $file (text): file path.
 notice-open-failed = Error: { $file } did not open. Check that it still exists and that there is a program to open it.
 # $file (text): file path.

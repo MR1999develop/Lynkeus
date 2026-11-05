@@ -46,10 +46,19 @@ impl RootKind {
     }
 }
 
+/// `path` reso assoluto rispetto alla cartella corrente, senza accedere al disco (`.` e
+/// `..` restano come li ha scritti l'utente su Linux; su Windows si risolvono). Una radice
+/// assoluta vale lo stesso file per la ricerca, la cache e il processo estrattore, che ha
+/// un'altra cartella corrente. Un percorso che non si può rendere assoluto (vuoto) resta
+/// com'è: la verifica lo segnalerà come mancante.
+pub fn absolute_root(path: PathBuf) -> PathBuf {
+    std::path::absolute(&path).unwrap_or(path)
+}
+
 /// Una radice nell'elenco.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RootEntry {
-    /// Il percorso, come scelto dall'utente.
+    /// Il percorso scelto dall'utente, reso assoluto ([`absolute_root`]).
     pub path: PathBuf,
     /// Cartella, file o non trovata.
     pub kind: RootKind,
@@ -364,8 +373,9 @@ impl SearchForm {
         settings.filters = self.filters.to_settings();
     }
 
-    /// Aggiunge una radice in fondo; falso se c'era già.
+    /// Aggiunge una radice in fondo, resa assoluta ([`absolute_root`]); falso se c'era già.
     pub fn add_root(&mut self, path: PathBuf, kind: RootKind) -> bool {
+        let path = absolute_root(path);
         if self.roots.iter().any(|r| r.path == path) {
             return false;
         }
@@ -587,7 +597,7 @@ mod tests {
     fn valid_form_becomes_a_search() {
         let form = form_with(&["dati"], &["ar"]);
         let search = form.validate().expect("valido");
-        assert_eq!(search.roots, [PathBuf::from("dati")]);
+        assert_eq!(search.roots, [absolute_root(PathBuf::from("dati"))]);
         assert_eq!(search.terms, ["ar"]);
         assert_eq!(search.filters, Filters::default());
     }
@@ -680,7 +690,7 @@ mod tests {
         form.remove_root(0);
         form.remove_root(7);
         let paths: Vec<&Path> = form.roots.iter().map(|r| r.path.as_path()).collect();
-        assert_eq!(paths, [Path::new("b")]);
+        assert_eq!(paths, [absolute_root(PathBuf::from("b")).as_path()]);
     }
 
     #[test]
@@ -717,7 +727,7 @@ mod tests {
     #[test]
     fn settings_round_trip_through_the_form() {
         let settings = Settings {
-            roots: vec![PathBuf::from("a")],
+            roots: vec![std::env::temp_dir().join("a")],
             terms: vec!["ar".to_owned(), "c?rt*".to_owned()],
             combine: Combine::All,
             options: MatchOptions {

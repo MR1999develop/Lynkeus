@@ -8,6 +8,10 @@
 //! dell'app lo usano allo stesso modo. Una voce si salva solo se l'estrazione è finita
 //! normalmente e non contiene avvisi passeggeri (file in uso, accesso negato, errori di
 //! lettura), che alla prossima lettura potrebbero non esserci.
+//!
+//! I percorsi si rendono assoluti prima della chiave della cache e della richiesta al
+//! processo estrattore: lo stesso file ha una sola chiave, e l'estrattore (con un'altra
+//! cartella corrente) legge proprio quel file.
 
 use std::collections::VecDeque;
 use std::path::Path;
@@ -15,12 +19,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use lynkeus_core::{Location, TextUnit};
-use lynkeus_extract::{EventSink, ExtractEvent, ExtractOptions, Stopped, line_location};
+use lynkeus_extract::{EntrySink, EventSink, ExtractEvent, ExtractOptions, Stopped, line_location};
 
 use crate::cache::{CacheKey, MAX_ENTRY_BYTES, TextCache};
 use crate::doc::DocPath;
 use crate::event::WarningKind;
-use crate::pool::{ExtractEnd, ExtractorPool};
+use crate::pool::{EntryEnd, ExtractEnd, ExtractorPool, absolute_path};
 
 /// Da dove vengono gli eventi di un file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,6 +94,8 @@ impl DocumentSource {
         stop: &dyn Fn() -> bool,
         sink: &mut dyn EventSink,
     ) -> (ExtractEnd, Origin) {
+        let path = absolute_path(path);
+        let path = path.as_path();
         let cache = self.active_cache();
         let key = cache.and_then(|_| CacheKey::for_file(path, options));
         if let (Some(cache), Some(key)) = (cache, &key)
@@ -116,6 +122,23 @@ impl DocumentSource {
             let _saved = cache.put(key, &events);
         }
         (end, Origin::Extractor)
+    }
+
+    /// I byte originali della voce d'archivio `doc` (al più `max_bytes`), mandati a `sink`
+    /// man mano: sempre dal processo estrattore, mai dalla cache, che ha solo il testo. Come
+    /// [`ExtractorPool::extract_entry`].
+    pub fn extract_entry(
+        &self,
+        doc: &DocPath,
+        max_bytes: u64,
+        options: &ExtractOptions,
+        timeout: Duration,
+        stop: &dyn Fn() -> bool,
+        sink: &mut dyn EntrySink,
+    ) -> EntryEnd {
+        self.pool.extract_entry(
+            &doc.path, &doc.inner, max_bytes, options, timeout, stop, sink,
+        )
     }
 
     /// Le unità del documento `doc` vicine a `location`: al più `radius` prima e `radius`

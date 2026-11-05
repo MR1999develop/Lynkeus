@@ -18,7 +18,8 @@ use common::{
 };
 use lynkeus_core::{Combine, Location};
 use lynkeus_engine::{
-    DocPath, ExtractEnd, LaunchedWorker, LimitKind, Limits, Outcome, WarningKind, WorkerLauncher,
+    DocPath, EntryEnd, ExtractEnd, LaunchedWorker, LimitKind, Limits, Origin, Outcome, WarningKind,
+    WorkerLauncher,
 };
 use lynkeus_extract::{ExtractEvent, ExtractOptions};
 
@@ -430,4 +431,139 @@ fn the_pool_streams_events_directly() {
         Some(ExtractEvent::DocumentStart { .. })
     ));
     assert_eq!(events.last(), Some(&ExtractEvent::DocumentEnd));
+}
+
+/// I byte della voce `inner` letti direttamente con la libreria zip, livello per livello.
+fn zip_entry(path: &Path, inner: &[&str]) -> Vec<u8> {
+    use std::io::Read;
+    let mut bytes = std::fs::read(path).expect("fixture");
+    for name in inner {
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).expect("zip");
+        let mut entry = archive.by_name(name).expect("voce");
+        let mut out = Vec::new();
+        entry.read_to_end(&mut out).expect("lettura");
+        bytes = out;
+    }
+    bytes
+}
+
+/// Estrae una voce con il pool dei test e restituisce esito e byte.
+fn pool_entry(path: PathBuf, inner: &[&str], max_bytes: u64) -> (EntryEnd, Vec<u8>) {
+    let source = documents();
+    let doc = DocPath {
+        path,
+        inner: inner.iter().map(|s| (*s).to_owned()).collect(),
+    };
+    let mut bytes = Vec::new();
+    let never = || false;
+    let end = source.extract_entry(
+        &doc,
+        max_bytes,
+        &ExtractOptions::default(),
+        Duration::from_secs(30),
+        &never,
+        &mut bytes,
+    );
+    (end, bytes)
+}
+
+#[test]
+fn archive_entries_come_back_byte_identical() {
+    let cases: [(&str, &[&str]); 2] = [
+        (
+            "formati/annidato.zip",
+            &["livello2.zip", "livello3.zip", "interno.docx"],
+        ),
+        ("demo/musica/archivio.zip", &["elenco.pdf"]),
+    ];
+    for (archive, inner) in cases {
+        let expected = zip_entry(&fixtures(archive), inner);
+        let (end, bytes) = pool_entry(fixtures(archive), inner, u64::MAX);
+        assert_eq!(
+            end,
+            EntryEnd::Extracted {
+                bytes: u64::try_from(expected.len()).unwrap_or(0)
+            },
+            "{archive}"
+        );
+        assert_eq!(bytes, expected, "{archive}");
+    }
+}
+
+#[test]
+fn entry_partitions_through_the_pool() {
+    let (end, _) = pool_entry(
+        fixtures("demo/musica/archivio.zip"),
+        &["manca.pdf"],
+        u64::MAX,
+    );
+    assert_eq!(
+        end,
+        EntryEnd::NotExtracted(lynkeus_extract::WarningKind::NotFound)
+    );
+    let (end, _) = pool_entry(fixtures("demo/musica/archivio.zip"), &["elenco.pdf"], 10);
+    assert_eq!(
+        end,
+        EntryEnd::NotExtracted(lynkeus_extract::WarningKind::LimitExceeded(
+            LimitKind::EntrySize
+        ))
+    );
+}
+
+/// Un percorso relativo alla cartella corrente di questo processo (quella del pacchetto,
+/// nei test di cargo): il processo estrattore ha un'altra cartella corrente (quella del
+/// suo eseguibile), quindi il percorso deve arrivargli assoluto. La cache usa la stessa
+/// chiave per il percorso relativo e per quello assoluto.
+#[test]
+fn relative_paths_are_resolved_in_this_process() {
+    let here = tempfile::tempdir_in(".").expect("cartella nella cartella corrente");
+    let name = here
+        .path()
+        .file_name()
+        .map(PathBuf::from)
+        .expect("nome della cartella");
+    std::fs::copy(
+        fixtures("demo/ufficio/note.docx"),
+        here.path().join("note.docx"),
+    )
+    .expect("copia");
+    std::fs::copy(
+        fixtures("demo/musica/archivio.zip"),
+        here.path().join("archivio.zip"),
+    )
+    .expect("copia");
+    let relative = name.join("note.docx");
+    assert!(relative.is_relative());
+
+    let cache = tempfile::tempdir().expect("cartella della cache");
+    let source = documents_with(launcher(), 1, Some(&cache.path().join("cache")));
+    let never = || false;
+    let mut events: Vec<ExtractEvent> = Vec::new();
+    let (end, _) = source.extract(
+        &relative,
+        &ExtractOptions::default(),
+        Duration::from_secs(30),
+        &never,
+        &mut events,
+    );
+    assert_eq!(end, ExtractEnd::Completed);
+    assert!(
+        matches!(events.first(), Some(ExtractEvent::DocumentStart { .. })),
+        "{events:?}"
+    );
+    let absolute = std::path::absolute(&relative).expect("assoluto");
+    let mut again: Vec<ExtractEvent> = Vec::new();
+    let (end, origin) = source.extract(
+        &absolute,
+        &ExtractOptions::default(),
+        Duration::from_secs(30),
+        &never,
+        &mut again,
+    );
+    assert_eq!((end, origin), (ExtractEnd::Completed, Origin::Cache));
+    assert_eq!(again, events);
+
+    let (end, bytes) = pool_entry(name.join("archivio.zip"), &["elenco.pdf"], u64::MAX);
+    assert!(matches!(end, EntryEnd::Extracted { .. }), "{end:?}");
+    assert!(bytes.starts_with(b"%PDF"));
 }

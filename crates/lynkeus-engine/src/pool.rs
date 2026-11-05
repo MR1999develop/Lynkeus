@@ -23,12 +23,20 @@
 //!   superata" compresa dove il sistema la riconosce;
 //! - un processo libero con messaggi in sospeso, o già morto, non si riusa.
 //!
+//! [`ExtractorPool::extract_entry`] chiede invece i byte di una voce d'archivio
+//! ([`Request::ExtractEntry`]), con le stesse regole: i pezzi devono avere l'`id` giusto,
+//! stare entro [`ENTRY_CHUNK_BYTES`] e, sommati, entro il massimo chiesto e il totale
+//! dichiarato alla fine.
+//!
+//! I percorsi si rendono assoluti prima di mandarli: il processo estrattore ha come cartella
+//! corrente quella del suo eseguibile.
+//!
 //! Il pool non sa nulla della ricerca né della cache: riceve un percorso e restituisce
 //! eventi (`documents` li usa entrambi).
 
 use std::io::{BufReader, BufWriter, Write};
 use std::num::NonZeroUsize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread;
@@ -36,9 +44,12 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use lynkeus_extract::protocol::{
-    ExtractRequest, FrameReader, FrameWriter, ProtocolError, Request, RequestId, Response,
+    EntryRequest, ExtractRequest, FrameReader, FrameWriter, ProtocolError, Request, RequestId,
+    Response,
 };
-use lynkeus_extract::{EventSink, ExtractOptions, LimitKind, SequenceCheck};
+use lynkeus_extract::{
+    ENTRY_CHUNK_BYTES, EntryOutcome, EntrySink, EventSink, ExtractOptions, LimitKind, SequenceCheck,
+};
 
 use crate::event::WarningKind;
 use crate::launcher::{LaunchedWorker, WorkerExit, WorkerLauncher, WorkerProcess};
@@ -73,6 +84,23 @@ pub enum ExtractEnd {
     /// Chi chiama ha chiesto di fermarsi (annullamento o destinatario fermato).
     Stopped,
     /// Il processo non ha finito il file.
+    Failed(WorkerFailure),
+}
+
+/// Come è finita l'estrazione dei byte di una voce d'archivio.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryEnd {
+    /// Tutti i byte della voce sono arrivati.
+    Extracted {
+        /// Quanti.
+        bytes: u64,
+    },
+    /// Il processo estrattore non ha potuto estrarre la voce (assente, cifrata, oltre i
+    /// limiti, …): i byte già consegnati non valgono.
+    NotExtracted(lynkeus_extract::WarningKind),
+    /// Chi chiama ha chiesto di fermarsi.
+    Stopped,
+    /// Il processo non ha finito la richiesta.
     Failed(WorkerFailure),
 }
 
@@ -151,15 +179,12 @@ impl Worker {
         !self.messages.is_empty()
     }
 
-    /// Manda la richiesta; l'id usato, o `None` se il canale è chiuso.
-    fn send(&mut self, path: &Path, options: &ExtractOptions) -> Option<RequestId> {
+    /// Manda la richiesta costruita da `request` con un id nuovo; l'id usato, o `None` se
+    /// il canale è chiuso.
+    fn send(&mut self, request: impl FnOnce(RequestId) -> Request) -> Option<RequestId> {
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
-        let request = Request::Extract(ExtractRequest {
-            id,
-            path: path.to_owned(),
-            options: *options,
-        });
+        let request = request(id);
         let writer = self.stdin.as_mut()?;
         writer
             .write(&request)
@@ -215,6 +240,26 @@ fn read_messages(stdout: Box<dyn std::io::Read + Send>, tx: &Sender<FromWorker>)
             return;
         }
     }
+}
+
+/// Perché l'attesa di una risposta è finita senza un messaggio.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Halt {
+    /// Chi chiama ha chiesto di fermarsi.
+    Stopped,
+    /// Oltre la scadenza.
+    Timeout,
+    /// Frame non valido o messaggio fuori protocollo.
+    Violation,
+    /// Stdout chiuso: il processo è uscito o sta uscendo.
+    Closed,
+}
+
+/// Il percorso assoluto di `path`, senza accedere al disco: il processo estrattore ha
+/// un'altra cartella corrente e risolverebbe un percorso relativo altrove. Un percorso che
+/// non si può rendere assoluto (vuoto) resta com'è: l'estrattore risponderà "non trovato".
+pub(crate) fn absolute_path(path: &Path) -> PathBuf {
+    std::path::absolute(path).unwrap_or_else(|_| path.to_owned())
 }
 
 /// Stato condiviso del pool.
@@ -292,18 +337,77 @@ impl ExtractorPool {
         stop: &dyn Fn() -> bool,
         sink: &mut dyn EventSink,
     ) -> ExtractEnd {
+        let path = absolute_path(path);
+        let request = |id| {
+            Request::Extract(ExtractRequest {
+                id,
+                path: path.clone(),
+                options: *options,
+            })
+        };
+        match self.send_to_worker(request, stop) {
+            Ok((worker, id)) => self.serve(worker, id, timeout, stop, sink),
+            Err(end) => end,
+        }
+    }
+
+    /// Estrae i byte della voce d'archivio `inner` del file `path` in un processo del pool
+    /// e li manda a `sink` man mano che arrivano, con i limiti di `options` e al più
+    /// `max_bytes` byte.
+    ///
+    /// Tempo, annullamento e processi che si comportano male come in
+    /// [`ExtractorPool::extract`]. Con un esito diverso da [`EntryEnd::Extracted`] i byte già
+    /// consegnati non valgono.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "gli stessi parametri di `extract` più la voce e il massimo"
+    )]
+    pub fn extract_entry(
+        &self,
+        path: &Path,
+        inner: &[String],
+        max_bytes: u64,
+        options: &ExtractOptions,
+        timeout: Duration,
+        stop: &dyn Fn() -> bool,
+        sink: &mut dyn EntrySink,
+    ) -> EntryEnd {
+        let path = absolute_path(path);
+        let request = |id| {
+            Request::ExtractEntry(EntryRequest {
+                id,
+                path: path.clone(),
+                inner: inner.to_vec(),
+                max_bytes,
+                options: *options,
+            })
+        };
+        match self.send_to_worker(request, stop) {
+            Ok((worker, id)) => self.serve_entry(worker, id, max_bytes, timeout, stop, sink),
+            Err(ExtractEnd::Stopped) => EntryEnd::Stopped,
+            Err(ExtractEnd::Failed(failure)) => EntryEnd::Failed(failure),
+            Err(ExtractEnd::Completed) => EntryEnd::Failed(WorkerFailure::Unavailable),
+        }
+    }
+
+    /// Prende un processo e gli manda la richiesta; se il processo è morto da libero ne
+    /// prova un altro (al più [`SEND_ATTEMPTS`] volte).
+    fn send_to_worker(
+        &self,
+        request: impl Fn(RequestId) -> Request,
+        stop: &dyn Fn() -> bool,
+    ) -> Result<(Worker, RequestId), ExtractEnd> {
         for _ in 0..SEND_ATTEMPTS {
             let mut worker = match self.checkout(stop) {
                 Checkout::Ready(worker) => worker,
-                Checkout::End(end) => return end,
+                Checkout::End(end) => return Err(end),
             };
-            if let Some(id) = worker.send(path, options) {
-                return self.serve(worker, id, timeout, stop, sink);
+            if let Some(id) = worker.send(&request) {
+                return Ok((worker, id));
             }
-            // Il processo è morto da libero: se ne prova un altro.
             self.discard(worker);
         }
-        ExtractEnd::Failed(WorkerFailure::Unavailable)
+        Err(ExtractEnd::Failed(WorkerFailure::Unavailable))
     }
 
     /// Chiude il pool: i processi liberi ricevono la richiesta di fermarsi e sono terminati
@@ -406,10 +510,59 @@ impl ExtractorPool {
         self.freed.notify_one();
     }
 
+    /// La prossima risposta del processo, o perché non arriva (fermati, scadenza, frame
+    /// non valido, processo uscito).
+    fn next_response(
+        worker: &Worker,
+        deadline: Instant,
+        stop: &dyn Fn() -> bool,
+    ) -> Result<Response, Halt> {
+        loop {
+            if stop() {
+                return Err(Halt::Stopped);
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(Halt::Timeout);
+            }
+            match worker.messages.recv_timeout(left.min(STOP_RECHECK)) {
+                Ok(FromWorker::Response(response)) => return Ok(response),
+                Ok(FromWorker::Violation) => return Err(Halt::Violation),
+                Ok(FromWorker::Closed) | Err(RecvTimeoutError::Disconnected) => {
+                    return Err(Halt::Closed);
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+            }
+        }
+    }
+
+    /// Toglie dal pool un processo la cui richiesta finisce per `halt`.
+    fn end_by(&self, mut worker: Worker, halt: Halt) -> ExtractEnd {
+        match halt {
+            Halt::Stopped => {
+                self.stop(worker);
+                ExtractEnd::Stopped
+            }
+            Halt::Timeout => {
+                self.discard(worker);
+                ExtractEnd::Failed(WorkerFailure::Timeout)
+            }
+            Halt::Violation => {
+                self.discard(worker);
+                ExtractEnd::Failed(WorkerFailure::ProtocolViolation)
+            }
+            Halt::Closed => {
+                let failure = worker.exit_after_close();
+                self.discard(worker);
+                ExtractEnd::Failed(failure)
+            }
+        }
+    }
+
     /// Riceve le risposte alla richiesta `id` fino alla fine del file.
     fn serve(
         &self,
-        mut worker: Worker,
+        worker: Worker,
         id: RequestId,
         timeout: Duration,
         stop: &dyn Fn() -> bool,
@@ -418,48 +571,80 @@ impl ExtractorPool {
         let deadline = Instant::now() + timeout;
         let mut sequence = SequenceCheck::new();
         loop {
-            if stop() {
-                self.stop(worker);
-                return ExtractEnd::Stopped;
-            }
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                self.discard(worker);
-                return ExtractEnd::Failed(WorkerFailure::Timeout);
-            }
-            let message = match worker.messages.recv_timeout(left.min(STOP_RECHECK)) {
-                Ok(message) => message,
-                Err(RecvTimeoutError::Timeout) => continue,
-                Err(RecvTimeoutError::Disconnected) => FromWorker::Closed,
+            let response = match Self::next_response(&worker, deadline, stop) {
+                Ok(response) => response,
+                Err(halt) => return self.end_by(worker, halt),
             };
-            match message {
-                FromWorker::Response(Response::Event { id: got, event }) if got == id => {
+            match response {
+                Response::Event { id: got, event } if got == id => {
                     if sequence.accept(&event).is_err() {
-                        self.discard(worker);
-                        return ExtractEnd::Failed(WorkerFailure::ProtocolViolation);
+                        return self.end_by(worker, Halt::Violation);
                     }
                     if sink.emit(event).is_err() {
-                        self.stop(worker);
-                        return ExtractEnd::Stopped;
+                        return self.end_by(worker, Halt::Stopped);
                     }
                 }
-                FromWorker::Response(Response::Done { id: got }) if got == id => {
+                Response::Done { id: got } if got == id => {
                     if sequence.finish().is_err() {
-                        self.discard(worker);
-                        return ExtractEnd::Failed(WorkerFailure::ProtocolViolation);
+                        return self.end_by(worker, Halt::Violation);
                     }
                     self.give_back(worker);
                     return ExtractEnd::Completed;
                 }
-                FromWorker::Response(_) | FromWorker::Violation => {
-                    self.discard(worker);
-                    return ExtractEnd::Failed(WorkerFailure::ProtocolViolation);
+                _ => return self.end_by(worker, Halt::Violation),
+            }
+        }
+    }
+
+    /// Riceve i byte della voce chiesta con `id` fino all'esito.
+    fn serve_entry(
+        &self,
+        worker: Worker,
+        id: RequestId,
+        max_bytes: u64,
+        timeout: Duration,
+        stop: &dyn Fn() -> bool,
+        sink: &mut dyn EntrySink,
+    ) -> EntryEnd {
+        let deadline = Instant::now() + timeout;
+        let mut received = 0_u64;
+        let halted =
+            |pool: &ExtractorPool, worker: Worker, halt: Halt| match pool.end_by(worker, halt) {
+                ExtractEnd::Failed(failure) => EntryEnd::Failed(failure),
+                ExtractEnd::Stopped | ExtractEnd::Completed => EntryEnd::Stopped,
+            };
+        loop {
+            let response = match Self::next_response(&worker, deadline, stop) {
+                Ok(response) => response,
+                Err(halt) => return halted(self, worker, halt),
+            };
+            match response {
+                Response::EntryData { id: got, bytes }
+                    if got == id && !bytes.is_empty() && bytes.len() <= ENTRY_CHUNK_BYTES =>
+                {
+                    received =
+                        received.saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+                    if received > max_bytes {
+                        return halted(self, worker, Halt::Violation);
+                    }
+                    if sink.bytes(&bytes).is_err() {
+                        return halted(self, worker, Halt::Stopped);
+                    }
                 }
-                FromWorker::Closed => {
-                    let failure = worker.exit_after_close();
-                    self.discard(worker);
-                    return ExtractEnd::Failed(failure);
+                Response::EntryEnd { id: got, outcome } if got == id => {
+                    let end = match outcome {
+                        EntryOutcome::Extracted { bytes } if bytes == received => {
+                            EntryEnd::Extracted { bytes }
+                        }
+                        EntryOutcome::Extracted { .. } => {
+                            return halted(self, worker, Halt::Violation);
+                        }
+                        EntryOutcome::Failed(kind) => EntryEnd::NotExtracted(kind),
+                    };
+                    self.give_back(worker);
+                    return end;
                 }
+                _ => return halted(self, worker, Halt::Violation),
             }
         }
     }
@@ -487,6 +672,16 @@ fn retire_all(workers: Vec<Worker>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relative_paths_become_absolute() {
+        let relative = Path::new("cartella/nota.txt");
+        let absolute = absolute_path(relative);
+        assert!(absolute.is_absolute());
+        assert!(absolute.ends_with(relative));
+        let already = std::env::temp_dir().join("x.pdf");
+        assert_eq!(absolute_path(&already), already);
+    }
 
     #[test]
     fn pool_size_is_half_the_cores_within_bounds() {

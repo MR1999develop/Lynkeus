@@ -8,8 +8,9 @@
 //!   unità per riga non vuota, righe numerate da 1 su tutte le parti del corpo). Il corpo è
 //!   quello di testo; se manca, l'HTML ridotto a testo (`mail_parser::html_to_text`).
 //! - Gli allegati vengono dopo la fine del messaggio, come archivi: ognuno è un documento
-//!   con `inner` = nome dell'allegato reso etichetta (`allegato` se senza nome) e formato
-//!   dal nome; un messaggio allegato (`message/rfc822`) si legge come .eml. Valgono i limiti
+//!   con `inner` = nome dell'allegato reso etichetta (`allegato` se senza nome; i nomi
+//!   ripetuti diventano "allegato (2)", "foto (2).jpg") e formato dal nome; un messaggio
+//!   allegato (`message/rfc822`) si legge come .eml. Valgono i limiti
 //!   degli archivi: profondità (gli allegati sono un livello in più), voci, byte per voce e
 //!   totali (sui byte decodificati, controllati prima di decodificare).
 //!
@@ -20,8 +21,8 @@ use mail_parser::{Address, AddressList, MessageParser, MessagePart, PartKind};
 
 use crate::error::ExtractError;
 use crate::event::{Stopped, WarningKind};
-use crate::extract::archive::{check_depth, entry_label};
-use crate::extract::{Ctx, Fail, Input, read_document};
+use crate::extract::archive::{UniqueLabels, check_depth, entry_label};
+use crate::extract::{Ctx, EntryRole, Fail, Input, read_document};
 use crate::format::Format;
 use crate::limits::LimitKind;
 
@@ -66,12 +67,10 @@ pub(crate) fn extract(ctx: &mut Ctx<'_>, input: Input<'_>) -> Result<(), Fail> {
         ctx.warn(WarningKind::LimitExceeded(kind))?;
         return Ok(());
     }
+    let mut labels = UniqueLabels::default();
     for part in attachments {
-        let label = entry_label(part.attachment_name().unwrap_or(UNNAMED));
-        ctx.enter(label);
-        let result = read_attachment(ctx, &part);
-        ctx.leave();
-        result?;
+        let label = labels.unique(entry_label(part.attachment_name().unwrap_or(UNNAMED)));
+        ctx.within(label, |ctx| read_attachment(ctx, &part))?;
         if ctx.budget().exhausted() {
             break;
         }
@@ -124,6 +123,61 @@ fn read_attachment(ctx: &mut Ctx<'_>, part: &MessagePart<'_>) -> Result<(), Stop
     if let Err(kind) = ctx.budget().add_bytes(size) {
         return ctx.warn(WarningKind::LimitExceeded(kind));
     }
-    let bytes = part.decoded().into_owned();
-    read_document(ctx, declared, Input::Bytes(bytes))
+    if ctx.entry_role() == EntryRole::Capture {
+        return ctx.capture(&mut part.decoded().as_ref());
+    }
+    read_document(ctx, declared, Input::Bytes(part.decoded().into_owned()))
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::event::ExtractEvent;
+    use crate::extract::{ExtractOptions, extract_bytes};
+
+    /// Due allegati senza nome e due con lo stesso nome: quattro documenti distinti.
+    #[test]
+    fn repeated_attachment_names_are_numbered() {
+        let attachment = |name: &str| {
+            let disposition = if name.is_empty() {
+                "attachment".to_owned()
+            } else {
+                format!("attachment; filename=\"{name}\"")
+            };
+            format!(
+                "--confine\r\nContent-Type: text/plain\r\nContent-Disposition: {disposition}\r\n\r\naragosta\r\n"
+            )
+        };
+        let message = format!(
+            "From: a@esempio.it\r\nSubject: prova\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"confine\"\r\n\r\n--confine\r\nContent-Type: text/plain\r\n\r\ncorpo\r\n{}{}{}{}--confine--\r\n",
+            attachment(""),
+            attachment(""),
+            attachment("nota.txt"),
+            attachment("nota.txt"),
+        );
+        let mut events = Vec::new();
+        let result = extract_bytes(
+            "posta.eml",
+            message.into_bytes(),
+            &ExtractOptions::default(),
+            &mut events,
+        );
+        assert_eq!(result, Ok(()));
+        let documents: Vec<Vec<String>> = events
+            .iter()
+            .filter_map(|event| match event {
+                ExtractEvent::DocumentStart { inner, .. } => Some(inner.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            documents,
+            [
+                Vec::new(),
+                vec!["allegato".to_owned()],
+                vec!["allegato (2)".to_owned()],
+                vec!["nota.txt".to_owned()],
+                vec!["nota (2).txt".to_owned()],
+            ]
+        );
+    }
 }

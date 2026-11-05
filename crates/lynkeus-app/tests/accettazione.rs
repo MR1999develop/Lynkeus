@@ -183,8 +183,22 @@ fn preview_of_a_pdf_inside_a_zip_shows_the_nearby_units() {
     assert!(!focus.highlights.is_empty());
 }
 
+/// I byte della voce `inner` letti direttamente con la libreria zip, livello per livello.
+fn zip_entry(path: &Path, inner: &[&str]) -> Vec<u8> {
+    use std::io::Read;
+    let mut bytes = std::fs::read(path).expect("fixture");
+    for name in inner {
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).expect("zip");
+        let mut entry = archive.by_name(name).expect("voce");
+        let mut out = Vec::new();
+        entry.read_to_end(&mut out).expect("lettura");
+        bytes = out;
+    }
+    bytes
+}
+
 #[test]
-fn text_entries_inside_archives_open_from_a_private_copy() {
+fn archive_entries_open_from_a_private_copy() {
     let dir = tempfile::tempdir().expect("cartella temporanea");
     let app = connected_app(dir.path());
     let source = Arc::clone(app.document_source().expect("fonte collegata"));
@@ -192,7 +206,7 @@ fn text_entries_inside_archives_open_from_a_private_copy() {
     let entries = OpenedEntries::new(source, opened_dir.clone(), Limits::default());
 
     // Una voce di testo con un nome pericoloso: il file ha un nome generato, nella cartella
-    // privata.
+    // privata, con i byte originali.
     let entry = DocPath {
         path: fixtures("malevoli/percorsi.zip"),
         inner: vec!["../../evil.txt".to_owned()],
@@ -200,7 +214,7 @@ fn text_entries_inside_archives_open_from_a_private_copy() {
     let path = entries
         .extract_to_private_temp(&entry)
         .expect("voce leggibile")
-        .expect("voce di testo estratta");
+        .expect("voce estratta");
     assert_eq!(path.parent(), Some(opened_dir.as_path()));
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
     assert!(
@@ -210,12 +224,49 @@ fn text_entries_inside_archives_open_from_a_private_copy() {
     let text = std::fs::read_to_string(&path).expect("file scritto");
     assert!(text.contains("aragosta"), "{text}");
 
-    // Un documento dentro un archivio non si ricompone dal testo.
-    let pdf = DocPath {
+    // Documenti dentro gli archivi, anche a tre livelli: byte identici all'originale, con
+    // l'estensione della voce.
+    let cases: [(PathBuf, &[&str], &str); 2] = [
+        (
+            demo_dir().join("musica/archivio.zip"),
+            &["elenco.pdf"],
+            ".pdf",
+        ),
+        (
+            fixtures("formati/annidato.zip"),
+            &["livello2.zip", "livello3.zip", "interno.docx"],
+            ".docx",
+        ),
+    ];
+    for (archive, inner, extension) in cases {
+        let doc = DocPath {
+            path: archive.clone(),
+            inner: inner.iter().map(|s| (*s).to_owned()).collect(),
+        };
+        let opened = entries
+            .extract_to_private_temp(&doc)
+            .expect("voce leggibile")
+            .expect("voce estratta");
+        let name = opened.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        assert!(name.ends_with(extension), "{name}");
+        assert_eq!(opened.parent(), Some(opened_dir.as_path()));
+        assert_eq!(
+            std::fs::read(&opened).ok(),
+            Some(zip_entry(&archive, inner))
+        );
+    }
+
+    // Una voce che non c'è: errore, e nessun file lasciato a metà.
+    let before = std::fs::read_dir(&opened_dir).map_or(0, Iterator::count);
+    let missing = DocPath {
         path: demo_dir().join("musica/archivio.zip"),
-        inner: vec!["elenco.pdf".to_owned()],
+        inner: vec!["manca.pdf".to_owned()],
     };
-    assert!(matches!(entries.extract_to_private_temp(&pdf), Ok(None)));
+    assert!(entries.extract_to_private_temp(&missing).is_err());
+    assert_eq!(
+        std::fs::read_dir(&opened_dir).map_or(0, Iterator::count),
+        before
+    );
 
     let mut app = app;
     app.shutdown_extraction();

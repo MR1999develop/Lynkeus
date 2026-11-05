@@ -50,7 +50,8 @@ pub use launcher::{
 /// dell'app.
 pub use platform::{create_new_private_file, create_private_dir};
 pub use pool::{
-    ExtractEnd, ExtractorPool, MAX_POOL_SIZE, STOP_GRACE, WorkerFailure, default_pool_size,
+    EntryEnd, ExtractEnd, ExtractorPool, MAX_POOL_SIZE, STOP_GRACE, WorkerFailure,
+    default_pool_size,
 };
 pub use progress::{Progress, ProgressSnapshot};
 pub use request::{

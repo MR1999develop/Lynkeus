@@ -286,22 +286,33 @@ enum FieldPart {
 struct Paragraphs {
     current: String,
     fields: Vec<FieldPart>,
+    /// Campi aperti ancora nella parte del codice: il testo si esclude se è più di zero.
+    /// Tenuto aggiornato a ogni cambio di `fields`, così ogni carattere costa O(1).
+    code_fields: usize,
 }
 
 impl Paragraphs {
     /// Aggiunge un carattere; restituisce il paragrafo appena finito.
     fn push(&mut self, c: char) -> Option<String> {
         match c {
-            '\u{13}' => self.fields.push(FieldPart::Code),
+            '\u{13}' => {
+                self.fields.push(FieldPart::Code);
+                self.code_fields += 1;
+            }
             '\u{14}' => {
-                if let Some(top) = self.fields.last_mut() {
+                if let Some(top) = self.fields.last_mut()
+                    && *top == FieldPart::Code
+                {
                     *top = FieldPart::Result;
+                    self.code_fields -= 1;
                 }
             }
             '\u{15}' => {
-                self.fields.pop();
+                if self.fields.pop() == Some(FieldPart::Code) {
+                    self.code_fields -= 1;
+                }
             }
-            _ if self.fields.contains(&FieldPart::Code) => {}
+            _ if self.code_fields > 0 => {}
             '\r' | '\u{7}' | '\u{c}' => return Some(std::mem::take(&mut self.current)),
             '\u{b}' => self.current.push('\n'),
             '\t' => self.current.push('\t'),
@@ -425,6 +436,36 @@ mod tests {
         })
         .map_err(|e| format!("{e:?}"))?;
         Ok(out)
+    }
+
+    /// Molti campi aperti e mai chiusi (già nella parte del risultato): ogni carattere costa
+    /// O(1), non O(campi aperti).
+    #[test]
+    fn many_open_fields_stay_linear() {
+        const FIELDS: usize = 100_000;
+        let started = std::time::Instant::now();
+        let mut paragraphs = Paragraphs::default();
+        for _ in 0..FIELDS {
+            assert_eq!(paragraphs.push('\u{13}'), None);
+            assert_eq!(paragraphs.push('\u{14}'), None);
+        }
+        for _ in 0..FIELDS {
+            assert_eq!(paragraphs.push('a'), None);
+        }
+        // Il risultato dei campi fa parte del testo.
+        assert_eq!(paragraphs.finish().map(|text| text.len()), Some(FIELDS));
+        let elapsed = started.elapsed();
+        assert!(elapsed < std::time::Duration::from_secs(2), "{elapsed:?}");
+    }
+
+    /// Campi annidati: codice escluso, risultato incluso, anche dentro un altro campo.
+    #[test]
+    fn nested_fields_keep_only_results() {
+        let mut paragraphs = Paragraphs::default();
+        for c in "a\u{13}X\u{13}Y\u{14}r1\u{15}Z\u{14}r2\u{15}b".chars() {
+            assert_eq!(paragraphs.push(c), None);
+        }
+        assert_eq!(paragraphs.finish().as_deref(), Some("ar2b"));
     }
 
     #[test]

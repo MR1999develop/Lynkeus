@@ -119,10 +119,10 @@ pub(crate) fn extract(ctx: &mut Ctx<'_>, input: Input<'_>) -> Result<(), Fail> {
         if !seen.insert(path.clone()) {
             continue;
         }
-        ctx.enter(entry_label(&path));
-        let result = read_chapter(ctx, &mut container, &path, encrypted.contains(&path));
-        ctx.leave();
-        result?;
+        let is_encrypted = encrypted.contains(&path);
+        ctx.within(entry_label(&path), |ctx| {
+            read_chapter(ctx, &mut container, &path, is_encrypted)
+        })?;
         if ctx.budget().exhausted() {
             break;
         }

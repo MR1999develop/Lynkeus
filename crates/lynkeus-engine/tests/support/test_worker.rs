@@ -22,10 +22,13 @@ use std::time::Duration;
 
 use lynkeus_core::{Location, TextUnit};
 use lynkeus_extract::protocol::{
-    ExtractRequest, FrameReader, FrameWriter, ProtocolError, Request, RequestId, Response,
+    EntryRequest, ExtractRequest, FrameReader, FrameWriter, ProtocolError, Request, RequestId,
+    Response,
 };
 use lynkeus_extract::worker::WorkerConfig;
-use lynkeus_extract::{EventSink, ExtractEvent, Format, Stopped, extract_path};
+use lynkeus_extract::{
+    EntrySink, EventSink, ExtractEvent, Format, Stopped, extract_entry, extract_path,
+};
 
 fn main() -> ExitCode {
     let mut args = std::env::args_os().skip(1);
@@ -46,7 +49,14 @@ fn main() -> ExitCode {
 fn serve(input: impl io::Read, output: impl Write) -> Result<(), ProtocolError> {
     let mut reader = FrameReader::new(BufReader::new(input));
     let mut writer = FrameWriter::new(BufWriter::new(output));
-    while let Some(Request::Extract(request)) = reader.read::<Request>()? {
+    while let Some(request) = reader.read::<Request>()? {
+        let request = match request {
+            Request::Extract(request) => request,
+            Request::ExtractEntry(request) => {
+                entry(&mut writer, &request)?;
+                continue;
+            }
+        };
         let stem = request
             .path
             .file_stem()
@@ -98,6 +108,56 @@ fn normal<W: Write>(
     }
     writer.write(&Response::Done { id: request.id })?;
     writer.flush()
+}
+
+/// I byte di una voce, come il processo estrattore vero.
+fn entry<W: Write>(
+    writer: &mut FrameWriter<W>,
+    request: &EntryRequest,
+) -> Result<(), ProtocolError> {
+    let mut sink = Chunks {
+        writer: &mut *writer,
+        id: request.id,
+        error: None,
+    };
+    let outcome = extract_entry(
+        &request.path,
+        &request.inner,
+        request.max_bytes,
+        &request.options,
+        &mut sink,
+    );
+    if let Some(error) = sink.error {
+        return Err(error);
+    }
+    let Ok(outcome) = outcome else {
+        return Err(ProtocolError::Malformed);
+    };
+    writer.write(&Response::EntryEnd {
+        id: request.id,
+        outcome,
+    })?;
+    writer.flush()
+}
+
+struct Chunks<'w, W: Write> {
+    writer: &'w mut FrameWriter<W>,
+    id: RequestId,
+    error: Option<ProtocolError>,
+}
+
+impl<W: Write> EntrySink for Chunks<'_, W> {
+    fn bytes(&mut self, chunk: &[u8]) -> Result<(), Stopped> {
+        self.writer
+            .write(&Response::EntryData {
+                id: self.id,
+                bytes: chunk.to_vec(),
+            })
+            .map_err(|error| {
+                self.error = Some(error);
+                Stopped
+            })
+    }
 }
 
 struct Sink<'w, W: Write> {

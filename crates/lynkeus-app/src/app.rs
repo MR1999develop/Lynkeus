@@ -25,7 +25,7 @@ use lynkeus_engine::{
 use crate::export::{self, ExportScope, ExportSettings};
 use crate::extraction::{self, ExtractionSetup, OpenedEntries, PoolDocumentUnits};
 use crate::form::{
-    FormErrors, PathInputError, PathInputStatus, RootKind, SearchForm, TermRowError,
+    FormErrors, PathInputError, PathInputStatus, RootKind, SearchForm, TermRowError, absolute_root,
 };
 use crate::i18n::{I18n, Language};
 use crate::launch::{
@@ -413,6 +413,7 @@ impl Application {
     /// Aggiunge una radice "da verificare" e ne avvia la verifica sul disco; falso se
     /// c'era già.
     pub fn add_root(&mut self, root: PathBuf) -> bool {
+        let root = absolute_root(root);
         let added = self.form.add_root(root.clone(), RootKind::Pending);
         if added {
             self.root_checks.request(root);
@@ -430,7 +431,7 @@ impl Application {
             self.form.path_status = PathInputStatus::Idle;
             return;
         }
-        let path = PathBuf::from(typed);
+        let path = absolute_root(PathBuf::from(typed));
         if self.form.roots.iter().any(|r| r.path == path) {
             self.form.path_input.clear();
             self.form.path_status = PathInputStatus::Idle;
@@ -806,7 +807,7 @@ impl Application {
                 self.notice = Some(Notice::Executable { doc });
                 return;
             }
-            OpenPlan::ArchiveEntry => LaunchTask::OpenArchiveEntry((*doc).clone()),
+            OpenPlan::ArchiveEntry(entry) => LaunchTask::OpenArchiveEntry(entry),
             OpenPlan::File(path) => LaunchTask::Open(path),
         };
         self.start_launch(task, doc.to_string(), notify);
@@ -1204,6 +1205,33 @@ mod tests {
             assert!(Instant::now() < deadline, "ricerca non finita");
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    /// Un percorso relativo diventa assoluto appena entra nell'elenco delle radici: le
+    /// ricerche, la cache e il processo estrattore (con un'altra cartella corrente) vedono
+    /// tutti lo stesso file.
+    #[test]
+    fn relative_roots_become_absolute() {
+        let mut app = Application::build(Settings::default()).expect("app");
+        let absolute_src = std::path::absolute("src").expect("assoluto");
+        app.form.path_input = "src".to_owned();
+        app.add_typed_path();
+        assert_eq!(
+            app.form.path_status,
+            PathInputStatus::Checking(absolute_src.clone())
+        );
+        settle_root_checks(&mut app);
+        assert_eq!(app.form.roots.len(), 1);
+        assert_eq!(app.form.roots[0].path, absolute_src);
+        assert_eq!(app.form.roots[0].kind, RootKind::Folder);
+
+        assert!(app.add_root(PathBuf::from("Cargo.toml")));
+        let absolute_file = std::path::absolute("Cargo.toml").expect("assoluto");
+        assert_eq!(app.form.roots[1].path, absolute_file);
+        // Lo stesso percorso scritto in modo diverso non si aggiunge due volte.
+        assert!(!app.add_root(absolute_file));
+        settle_root_checks(&mut app);
+        assert_eq!(app.form.roots[1].kind, RootKind::File);
     }
 
     #[test]

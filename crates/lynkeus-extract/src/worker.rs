@@ -11,7 +11,9 @@
 //!    configurato (`RLIMIT_AS` su Linux; su Windows lo impone il Job Object del padre). Se
 //!    non ci riesce esce con errore: un estrattore senza limite non parte;
 //! 2. per ogni [`Request::Extract`] chiama [`extract_path`] e manda gli eventi man mano
-//!    (il buffer si svuota a ogni fine documento e alla fine della richiesta);
+//!    (il buffer si svuota a ogni fine documento e alla fine della richiesta); per ogni
+//!    [`Request::ExtractEntry`] chiama [`extract_entry`] e manda i byte della voce a pezzi,
+//!    poi l'esito;
 //! 3. esce con `Ok` quando stdin finisce tra una richiesta e l'altra (il padre lo chiude per
 //!    fermarlo), con errore su un frame non valido (dopo aver mandato
 //!    [`Response::Rejected`]) o se stdout non si scrive più.
@@ -26,10 +28,11 @@ use std::io::{self, BufReader, BufWriter, Read, Write};
 use lynkeus_core::ByteSize;
 
 use crate::event::{EventSink, ExtractEvent, Stopped};
-use crate::extract::extract_path;
+use crate::extract::{EntrySink, extract_entry, extract_path};
 use crate::platform;
 use crate::protocol::{
-    ExtractRequest, FrameReader, FrameWriter, ProtocolError, Request, RequestId, Response,
+    EntryRequest, ExtractRequest, FrameReader, FrameWriter, ProtocolError, Request, RequestId,
+    Response,
 };
 
 pub use crate::platform::MemoryLimitOwner;
@@ -126,6 +129,7 @@ pub fn run<R: Read, W: Write>(
         match reader.read::<Request>() {
             Ok(None) => return Ok(()),
             Ok(Some(Request::Extract(request))) => serve(&mut writer, &request)?,
+            Ok(Some(Request::ExtractEntry(request))) => serve_entry(&mut writer, &request)?,
             Err(error) => {
                 if let Some(reason) = error.reject_reason() {
                     // Il padre vede comunque l'uscita: se nemmeno il rifiuto si scrive,
@@ -160,6 +164,61 @@ fn serve<W: Write>(
         .write(&Response::Done { id: request.id })
         .and_then(|()| writer.flush())
         .map_err(WorkerError::Protocol)
+}
+
+/// Esegue una richiesta di voce: i byte come [`Response::EntryData`], poi
+/// [`Response::EntryEnd`].
+fn serve_entry<W: Write>(
+    writer: &mut FrameWriter<W>,
+    request: &EntryRequest,
+) -> Result<(), WorkerError> {
+    let mut sink = EntryDataSink {
+        writer: &mut *writer,
+        id: request.id,
+        error: None,
+    };
+    let outcome = extract_entry(
+        &request.path,
+        &request.inner,
+        request.max_bytes,
+        &request.options,
+        &mut sink,
+    );
+    if let Some(error) = sink.error {
+        return Err(WorkerError::Protocol(error));
+    }
+    let Ok(outcome) = outcome else {
+        // Solo questo destinatario può fermare, e lo fa solo con un errore già restituito.
+        return Err(WorkerError::Protocol(ProtocolError::Malformed));
+    };
+    writer
+        .write(&Response::EntryEnd {
+            id: request.id,
+            outcome,
+        })
+        .and_then(|()| writer.flush())
+        .map_err(WorkerError::Protocol)
+}
+
+/// Destinatario che scrive ogni pezzo di una voce come [`Response::EntryData`].
+struct EntryDataSink<'w, W: Write> {
+    writer: &'w mut FrameWriter<W>,
+    id: RequestId,
+    error: Option<ProtocolError>,
+}
+
+impl<W: Write> EntrySink for EntryDataSink<'_, W> {
+    fn bytes(&mut self, chunk: &[u8]) -> Result<(), Stopped> {
+        self.writer
+            .write(&Response::EntryData {
+                id: self.id,
+                bytes: chunk.to_vec(),
+            })
+            .map_err(|error| {
+                self.error = Some(error);
+                Stopped
+            })
+    }
 }
 
 /// Destinatario che scrive ogni evento come [`Response::Event`].
@@ -255,6 +314,57 @@ mod tests {
                     }
                 },
                 Response::Done { id: 2 }
+            ]
+        );
+    }
+
+    #[test]
+    fn serves_an_archive_entry() {
+        let path = fixture("demo/musica/archivio.zip");
+        let mut input = Vec::new();
+        let entry = Request::ExtractEntry(EntryRequest {
+            id: 5,
+            path: path.clone(),
+            inner: vec!["elenco.pdf".to_owned()],
+            max_bytes: u64::MAX,
+            options: ExtractOptions::default(),
+        });
+        let missing = Request::ExtractEntry(EntryRequest {
+            id: 6,
+            path,
+            inner: vec!["manca.pdf".to_owned()],
+            max_bytes: u64::MAX,
+            options: ExtractOptions::default(),
+        });
+        assert!(encode_frame(&entry, &mut input).is_ok());
+        assert!(encode_frame(&missing, &mut input).is_ok());
+        let mut output = Vec::new();
+        let result = run(input.as_slice(), &mut output, &WorkerConfig::default());
+        assert!(result.is_ok(), "{result:?}");
+        let got = responses(&output);
+        let mut bytes = Vec::new();
+        for response in &got[..got.len() - 2] {
+            match response {
+                Response::EntryData {
+                    id: 5,
+                    bytes: chunk,
+                } => bytes.extend_from_slice(chunk),
+                other => panic!("risposta inattesa: {other:?}"),
+            }
+        }
+        assert!(bytes.starts_with(b"%PDF"));
+        let size = u64::try_from(bytes.len()).unwrap_or(0);
+        assert_eq!(
+            &got[got.len() - 2..],
+            &[
+                Response::EntryEnd {
+                    id: 5,
+                    outcome: crate::extract::EntryOutcome::Extracted { bytes: size }
+                },
+                Response::EntryEnd {
+                    id: 6,
+                    outcome: crate::extract::EntryOutcome::Failed(WarningKind::NotFound)
+                }
             ]
         );
     }

@@ -5,15 +5,15 @@
 //! (pool e cache), unità dei documenti per l'anteprima ([`PoolDocumentUnits`]) e apertura
 //! delle voci d'archivio ([`OpenedEntries`]).
 //!
-//! **Voci d'archivio da aprire.** Il protocollo del processo estrattore porta solo testo:
-//! una voce di testo (formato non riconosciuto, come `note.txt` dentro uno zip) si ricompone
-//! dalle sue unità in un file `.txt` nuovo, con nome generato dal programma, nella cartella
-//! privata dei file aperti; la cartella si svuota all'avvio e all'uscita. Per i documenti
-//! dentro gli archivi (PDF, Office) servono i byte originali della voce, che il protocollo
-//! non porta ancora: l'utente riceve il messaggio di sempre.
+//! **Voci d'archivio da aprire.** Il processo estrattore manda i byte originali della voce
+//! (con gli stessi limiti degli archivi nella ricerca, e al più il massimo per voce); l'app
+//! li scrive in un file nuovo, con nome generato dal programma ed estensione della voce resa
+//! innocua ([`opened_extension`]), nella cartella privata dei file aperti, che si svuota
+//! all'avvio e all'uscita. Un file scritto a metà si cancella.
 
 use std::fs;
-use std::io::{self, Write};
+use std::fs::File;
+use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -21,14 +21,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use lynkeus_core::{ByteSize, Location, TextUnit};
 use lynkeus_engine::{
-    DocPath, DocumentSource, ExtractEnd, ExtractorPool, Limits, TextCache, WarningKind,
+    DocPath, DocumentSource, EntryEnd, ExtractorPool, Limits, TextCache, WarningKind,
     create_new_private_file, create_private_dir, default_pool_size,
 };
 use lynkeus_extract::text::soft_cut;
-use lynkeus_extract::{EventSink, ExtractError, ExtractEvent, ExtractOptions, Format, Stopped};
+use lynkeus_extract::{EntrySink, ExtractError, ExtractOptions, Stopped};
 
 use crate::format::ELLIPSIS;
-use crate::launch::ArchiveEntryExtractor;
+use crate::launch::{ArchiveEntryExtractor, opened_extension};
 use crate::platform;
 use crate::preview::{DocumentUnits, MAX_UNIT_BYTES};
 use crate::settings::CacheSettings;
@@ -37,9 +37,6 @@ use crate::settings::CacheSettings;
 /// (la libreria ne copia i byte) e le sue strutture, ben sotto la memoria di un computer
 /// d'ufficio. Su Windows lo impone il Job Object, su Linux `RLIMIT_AS`.
 pub const WORKER_MEMORY_LIMIT: ByteSize = lynkeus_extract::worker::DEFAULT_MEMORY_LIMIT;
-
-/// Byte massimi del testo di una voce d'archivio ricomposta per aprirla.
-pub const MAX_OPENED_ENTRY_BYTES: usize = 64 * 1024 * 1024;
 
 /// Dove sono il processo estrattore e le cartelle che usa.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -161,7 +158,7 @@ fn shorten(unit: TextUnit) -> TextUnit {
     }
 }
 
-/// Apre le voci d'archivio di testo ricomponendole in un file della cartella privata.
+/// Apre le voci d'archivio estraendone i byte in un file della cartella privata.
 #[derive(Debug, Clone)]
 pub struct OpenedEntries {
     source: Arc<DocumentSource>,
@@ -170,7 +167,7 @@ pub struct OpenedEntries {
 }
 
 impl OpenedEntries {
-    /// Voci ricomposte in `dir` (creata privata al primo uso).
+    /// Voci estratte in `dir` (creata privata al primo uso), con i limiti delle ricerche.
     pub fn new(source: Arc<DocumentSource>, dir: PathBuf, limits: Limits) -> OpenedEntries {
         OpenedEntries {
             source,
@@ -185,97 +182,81 @@ impl ArchiveEntryExtractor for OpenedEntries {
         let Some(name) = doc.inner.last() else {
             return Ok(None);
         };
-        // Solo le voci di testo: per gli altri formati servirebbero i byte originali.
-        if Format::for_name(name).is_some() {
-            return Ok(None);
-        }
-        let mut collector = EntryText {
-            inner: &doc.inner,
-            open: false,
-            text: String::new(),
-            warning: None,
-            too_large: false,
+        let (path, file) = create_new_entry_file(&self.dir, &opened_extension(name))
+            .map_err(ExtractError::from_io)?;
+        let mut sink = FileSink {
+            file: BufWriter::new(file),
+            error: None,
         };
         let never = || false;
-        let (end, _) = self.source.extract(
-            &doc.path,
+        let end = self.source.extract_entry(
+            doc,
+            self.limits.archive.max_entry_size.bytes(),
             &options(&self.limits),
             self.limits.extract_timeout,
             &never,
-            &mut collector,
+            &mut sink,
         );
-        match end {
-            ExtractEnd::Completed => {}
-            ExtractEnd::Stopped => return Ok(None),
-            ExtractEnd::Failed(failure) => return Err(extract_error(failure.warning_kind())),
+        let result = match end {
+            EntryEnd::Extracted { .. } => sink.finish().map_err(ExtractError::from_io),
+            EntryEnd::NotExtracted(kind) => Err(extract_error(WarningKind::from_extract(kind))),
+            EntryEnd::Failed(failure) => Err(extract_error(failure.warning_kind())),
+            // Solo la scrittura del file ferma l'estrazione.
+            EntryEnd::Stopped => Err(sink.error.map_or_else(
+                || ExtractError::Io(io::Error::other("scrittura del file interrotta")),
+                ExtractError::from_io,
+            )),
+        };
+        match result {
+            Ok(()) => Ok(Some(path)),
+            Err(error) => {
+                // Un file a metà non resta nella cartella.
+                let _removed = fs::remove_file(&path);
+                Err(error)
+            }
         }
-        if collector.too_large {
-            return Err(ExtractError::TooLarge {
-                size: u64::try_from(MAX_OPENED_ENTRY_BYTES).unwrap_or(u64::MAX),
-                max: u64::try_from(MAX_OPENED_ENTRY_BYTES).unwrap_or(u64::MAX),
-            });
-        }
-        if let Some(kind) = collector.warning {
-            return Err(extract_error(WarningKind::from_extract(kind)));
-        }
-        let path = write_new_entry_file(&self.dir, collector.text.as_bytes())
-            .map_err(ExtractError::from_io)?;
-        Ok(Some(path))
     }
 }
 
-/// Raccoglie il testo di una voce.
-struct EntryText<'a> {
-    inner: &'a [String],
-    open: bool,
-    text: String,
-    warning: Option<lynkeus_extract::WarningKind>,
-    too_large: bool,
+/// Scrive i byte di una voce nel file aperto; il primo errore di scrittura ferma
+/// l'estrazione.
+struct FileSink {
+    file: BufWriter<File>,
+    error: Option<io::Error>,
 }
 
-impl EventSink for EntryText<'_> {
-    fn emit(&mut self, event: ExtractEvent) -> Result<(), Stopped> {
-        match event {
-            ExtractEvent::DocumentStart { inner, .. } => self.open = inner == self.inner,
-            ExtractEvent::DocumentEnd => self.open = false,
-            ExtractEvent::Unit(unit) if self.open && !self.too_large => {
-                if self.text.len().saturating_add(unit.text.len()) > MAX_OPENED_ENTRY_BYTES {
-                    self.too_large = true;
-                    self.text.clear();
-                } else {
-                    // Le unità di testo sono blocchi di righe intere.
-                    self.text.push_str(&unit.text);
-                }
-            }
-            ExtractEvent::Warning { inner, kind } if inner == self.inner => {
-                self.warning.get_or_insert(kind);
-            }
-            ExtractEvent::Unit(_) | ExtractEvent::Warning { .. } | ExtractEvent::Skipped { .. } => {
-            }
+impl FileSink {
+    /// Svuota il buffer; errore se una scrittura è fallita.
+    fn finish(self) -> io::Result<()> {
+        if let Some(error) = self.error {
+            return Err(error);
         }
-        Ok(())
+        let mut file = self.file;
+        file.flush()
+    }
+}
+
+impl EntrySink for FileSink {
+    fn bytes(&mut self, chunk: &[u8]) -> Result<(), Stopped> {
+        self.file.write_all(chunk).map_err(|error| {
+            self.error = Some(error);
+            Stopped
+        })
     }
 }
 
 /// Contatore per i nomi dei file aperti.
 static OPENED_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Scrive `bytes` in un file nuovo `voce-<16 cifre esadecimali>.txt` di `dir` (creata
-/// privata se manca); il nome non dipende mai dal nome della voce.
-fn write_new_entry_file(dir: &Path, bytes: &[u8]) -> io::Result<PathBuf> {
+/// Crea un file nuovo `voce-<16 cifre esadecimali>.<extension>` in `dir` (creata privata se
+/// manca); il nome non dipende mai dal nome della voce, l'estensione è già resa innocua da
+/// chi chiama.
+fn create_new_entry_file(dir: &Path, extension: &str) -> io::Result<(PathBuf, File)> {
     create_private_dir(dir)?;
     for _ in 0..16 {
-        let path = dir.join(format!("voce-{:016x}.txt", unique_number()));
+        let path = dir.join(format!("voce-{:016x}.{extension}", unique_number()));
         match create_new_private_file(&path) {
-            Ok(mut file) => {
-                let written = file.write_all(bytes).and_then(|()| file.flush());
-                drop(file);
-                if let Err(error) = written {
-                    let _removed = fs::remove_file(&path);
-                    return Err(error);
-                }
-                return Ok(path);
-            }
+            Ok(file) => return Ok((path, file)),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error),
         }
@@ -283,7 +264,7 @@ fn write_new_entry_file(dir: &Path, bytes: &[u8]) -> io::Result<PathBuf> {
     Err(io::Error::from(io::ErrorKind::AlreadyExists))
 }
 
-/// Un numero diverso a ogni chiamata e tra istanze del programma (tempo, processo,
+// Un numero diverso a ogni chiamata e tra istanze del programma (tempo, processo,
 /// contatore, mescolati con `blake3`). Non serve imprevedibile: il file si crea solo se non
 /// esiste.
 fn unique_number() -> u64 {
@@ -321,18 +302,20 @@ mod tests {
     fn entry_files_have_generated_names_and_are_new() {
         let dir = tempfile::tempdir().expect("cartella");
         let target = dir.path().join("aperti");
-        let first = write_new_entry_file(&target, b"aragosta\n").expect("scritto");
-        let second = write_new_entry_file(&target, b"carta\n").expect("scritto");
+        let (first, mut file) = create_new_entry_file(&target, "pdf").expect("creato");
+        assert!(file.write_all(b"%PDF").is_ok());
+        drop(file);
+        let (second, _) = create_new_entry_file(&target, "txt").expect("creato");
         assert_ne!(first, second);
-        for path in [&first, &second] {
+        for (path, extension) in [(&first, ".pdf"), (&second, ".txt")] {
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             assert!(
-                name.starts_with("voce-") && name.ends_with(".txt"),
+                name.starts_with("voce-") && name.ends_with(extension),
                 "{name}"
             );
             assert_eq!(path.parent(), Some(target.as_path()));
         }
-        assert_eq!(fs::read(&first).ok(), Some(b"aragosta\n".to_vec()));
+        assert_eq!(fs::read(&first).ok(), Some(b"%PDF".to_vec()));
         clean_opened_entries(&target);
         assert!(!first.exists() && !second.exists());
         // Una cartella che non c'è non è un errore.

@@ -285,7 +285,7 @@ preview-no-thread = Anteprima non disponibile: il sistema non ha risorse libere.
 ## Messaggi sopra la tabella
 
 notice-executable = Per sicurezza i programmi e gli script non si aprono da qui: usa "Mostra nella cartella" e aprilo da lì se ti fidi.
-notice-archive-entry = I documenti dentro gli archivi (PDF, Office) non si possono ancora aprire da qui: usa "Mostra nella cartella" per aprire l'archivio.
+notice-archive-entry = Le voci degli archivi non si possono aprire ora, perché il processo che le estrae non è attivo: usa "Mostra nella cartella" per aprire l'archivio.
 # $file (testo): percorso del file.
 notice-open-failed = Errore: { $file } non si è aperto. Controlla che esista ancora e che ci sia un programma per aprirlo.
 # $file (testo): percorso del file.

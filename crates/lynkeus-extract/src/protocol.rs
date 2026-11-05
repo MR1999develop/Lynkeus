@@ -29,6 +29,11 @@
 //!    l'estrattore esce.
 //! 4. Per fermare l'estrattore il padre chiude il suo stdin: l'estrattore esce alla
 //!    richiesta successiva (o viene terminato dopo 500 ms).
+//! 5. Per aprire una voce d'archivio il padre manda [`Request::ExtractEntry`]: l'estrattore
+//!    risponde con zero o più [`Response::EntryData`] (i byte della voce, in ordine, ognuno
+//!    al più [`ENTRY_CHUNK_BYTES`](crate::ENTRY_CHUNK_BYTES)) e poi un solo
+//!    [`Response::EntryEnd`] con l'esito; se l'esito non è "estratta" i byte già mandati non
+//!    valgono.
 //!
 //! Nessun messaggio va dall'estrattore al padre se non in risposta a una richiesta. I tipi
 //! dei messaggi (e quelli degli eventi) si cambiano solo aggiungendo varianti in fondo agli
@@ -42,10 +47,13 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::event::ExtractEvent;
-use crate::extract::ExtractOptions;
+use crate::extract::{EntryOutcome, ExtractOptions};
 
 /// Versione del protocollo (e del formato degli eventi nella cache).
-pub const PROTOCOL_VERSION: u16 = 1;
+///
+/// 2: richiesta di una voce d'archivio ([`Request::ExtractEntry`]) ed etichette uniche per
+/// le voci con lo stesso nome (cambiano gli `inner` degli eventi già in cache).
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// Byte massimi di un frame dopo la lunghezza (16 MiB): ben oltre un'unità di testo
 /// ([`MAX_UNIT_TEXT_BYTES`](crate::MAX_UNIT_TEXT_BYTES)) con la sua posizione.
@@ -62,6 +70,24 @@ pub type RequestId = u64;
 pub enum Request {
     /// Estrai il testo di un file.
     Extract(ExtractRequest),
+    /// Estrai i byte di una voce d'archivio.
+    ExtractEntry(EntryRequest),
+}
+
+/// Richiesta dei byte di una voce d'archivio, per aprirla.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EntryRequest {
+    /// Identificatore, ripetuto in ogni risposta.
+    pub id: RequestId,
+    /// L'archivio più esterno (anche con caratteri non UTF-8).
+    #[serde(with = "os_path")]
+    pub path: PathBuf,
+    /// Etichette delle voci dall'esterno all'interno, come negli eventi.
+    pub inner: Vec<String>,
+    /// Byte massimi della voce; oltre, l'esito è "limite superato".
+    pub max_bytes: u64,
+    /// Limiti degli archivi attraversati.
+    pub options: ExtractOptions,
 }
 
 /// Richiesta di estrazione di un file.
@@ -95,6 +121,20 @@ pub enum Response {
     Rejected {
         /// Perché.
         reason: RejectReason,
+    },
+    /// Un pezzo dei byte della voce chiesta con `id`.
+    EntryData {
+        /// La richiesta.
+        id: RequestId,
+        /// I byte, al più [`ENTRY_CHUNK_BYTES`](crate::ENTRY_CHUNK_BYTES).
+        bytes: Vec<u8>,
+    },
+    /// Fine della richiesta di una voce `id`, con l'esito.
+    EntryEnd {
+        /// La richiesta.
+        id: RequestId,
+        /// Com'è finita.
+        outcome: EntryOutcome,
     },
 }
 
@@ -373,14 +413,34 @@ mod tests {
             Response::Rejected {
                 reason: RejectReason::VersionMismatch { found: 9 },
             },
+            Response::EntryData {
+                id: 8,
+                bytes: vec![0, 1, 2, 255],
+            },
+            Response::EntryEnd {
+                id: 8,
+                outcome: EntryOutcome::Extracted { bytes: 4 },
+            },
+            Response::EntryEnd {
+                id: 9,
+                outcome: EntryOutcome::Failed(WarningKind::Encrypted),
+            },
         ]
     }
 
     #[test]
     fn round_trip_of_every_message() {
-        let request = sample_request();
-        let decoded: Option<Request> = read_one(&frame(&request)).ok().flatten();
-        assert_eq!(decoded, Some(request));
+        let entry = Request::ExtractEntry(EntryRequest {
+            id: 8,
+            path: PathBuf::from("musica/archivio.zip"),
+            inner: vec!["livello2.zip".to_owned(), "elenco.pdf".to_owned()],
+            max_bytes: 1 << 30,
+            options: ExtractOptions::default(),
+        });
+        for request in [sample_request(), entry] {
+            let decoded: Option<Request> = read_one(&frame(&request)).ok().flatten();
+            assert_eq!(decoded, Some(request));
+        }
 
         let responses = sample_responses();
         let mut stream = Vec::new();
@@ -458,6 +518,16 @@ mod tests {
             read_one::<Response>(&trailing),
             Err(ProtocolError::Malformed)
         ));
+    }
+
+    #[test]
+    fn largest_entry_chunk_fits_in_a_frame() {
+        let chunk = Response::EntryData {
+            id: u64::MAX,
+            bytes: vec![0xFF; crate::ENTRY_CHUNK_BYTES],
+        };
+        let mut out = Vec::new();
+        assert!(encode_frame(&chunk, &mut out).is_ok());
     }
 
     #[test]

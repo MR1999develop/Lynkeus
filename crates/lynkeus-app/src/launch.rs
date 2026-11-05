@@ -11,23 +11,27 @@
 //! - un file che il sistema eseguirebbe invece di aprire (programmi, script, collegamenti:
 //!   [`is_executable_name`]) non si apre: i risultati vengono da cartelle qualsiasi, e un
 //!   doppio clic su "pulisci.bat" non deve eseguirlo; resta "Mostra nella cartella";
-//! - una voce dentro un archivio va prima estratta in una cartella temporanea privata
-//!   ([`ArchiveEntryExtractor`]: [`OpenedEntries`](crate::extraction::OpenedEntries) per le
-//!   voci di testo); quando non si può, l'utente riceve un messaggio chiaro;
+//! - una voce dentro un archivio va prima estratta, con i suoi byte originali, in un file
+//!   con nome generato dal programma nella cartella temporanea privata
+//!   ([`ArchiveEntryExtractor`]: [`OpenedEntries`](crate::extraction::OpenedEntries)); l'estensione
+//!   del file è quella della voce resa innocua ([`opened_extension`]); quando non si può,
+//!   l'utente riceve un messaggio chiaro;
+//! - un capitolo di un EPUB non è un file: "Apri" apre il libro (o lo estrae, se il libro
+//!   sta in un archivio);
 //! - "Mostra nella cartella" di una voce d'archivio mostra l'archivio.
 
 use std::io;
 use std::path::{Path, PathBuf};
 
 use lynkeus_engine::DocPath;
-use lynkeus_extract::ExtractError;
+use lynkeus_extract::{ExtractError, Format};
 
 use crate::platform;
 
 /// Estensioni che il sistema eseguirebbe (programmi, script, collegamenti, installatori,
 /// file di registro), in minuscolo. Elenco largo di proposito: un file in più mostrato
 /// nella cartella invece che aperto è un fastidio piccolo.
-const EXECUTABLE_EXTENSIONS: [&str; 40] = [
+const EXECUTABLE_EXTENSIONS: &[&str] = &[
     "exe",
     "com",
     "bat",
@@ -68,7 +72,32 @@ const EXECUTABLE_EXTENSIONS: [&str; 40] = [
     "appimage",
     "py",
     "pyw",
+    // Guida compilata, componente aggiuntivo di Excel, pacchetti e installatori delle app.
+    "chm",
+    "xll",
+    "msix",
+    "msixbundle",
+    "appx",
+    "appxbundle",
+    "appinstaller",
+    // Risoluzione dei problemi, script, connessioni remote, sandbox.
+    "diagcab",
+    "ws",
+    "rdp",
+    "wsb",
+    // Ricerche e connettori salvati, siti aggiunti, gadget.
+    "search-ms",
+    "searchconnector-ms",
+    "website",
+    "gadget",
 ];
+
+/// Estensione di un file estratto che non ha un'estensione ammessa ma è testo.
+const TEXT_EXTENSION: &str = "txt";
+/// Estensione di un file estratto che il sistema non deve poter eseguire né riconoscere.
+const NEUTRAL_EXTENSION: &str = "bin";
+/// Lunghezza massima di un'estensione ammessa.
+const MAX_EXTENSION_CHARS: usize = 16;
 
 /// Che cosa fare quando l'utente chiede di aprire un risultato.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,18 +107,65 @@ pub enum OpenPlan {
     /// Non aprire: il sistema eseguirebbe il file. Si propone "Mostra nella cartella".
     Executable,
     /// Voce dentro un archivio: va estratta prima.
-    ArchiveEntry,
+    ArchiveEntry(DocPath),
 }
 
 /// Il piano per aprire `doc`.
 pub fn open_plan(doc: &DocPath) -> OpenPlan {
+    let doc = openable(doc);
     let shown_name = doc.inner.last().map_or(doc.path.as_path(), Path::new);
     if is_executable_name(shown_name) {
         OpenPlan::Executable
     } else if doc.is_inside_archive() {
-        OpenPlan::ArchiveEntry
+        OpenPlan::ArchiveEntry(doc)
     } else {
         OpenPlan::File(doc.path.clone())
+    }
+}
+
+/// Il documento che "Apri" apre per `doc`: per un capitolo di un EPUB il libro, che è il
+/// file che l'utente conosce; per gli altri documenti `doc` stesso.
+fn openable(doc: &DocPath) -> DocPath {
+    let Some((_, parents)) = doc.inner.split_last() else {
+        return doc.clone();
+    };
+    let parent_is_epub = match parents.last() {
+        Some(name) => Format::for_name(name) == Some(Format::Epub),
+        None => Format::for_path(&doc.path) == Some(Format::Epub),
+    };
+    if parent_is_epub {
+        DocPath {
+            path: doc.path.clone(),
+            inner: parents.to_vec(),
+        }
+    } else {
+        doc.clone()
+    }
+}
+
+/// L'estensione del file in cui si estrae la voce chiamata `entry_name`, senza punto.
+///
+/// Quella della voce, in minuscolo, se fatta solo di lettere e cifre ASCII (al più 16) e se
+/// il sistema non la eseguirebbe; altrimenti `txt` per una voce senza formato riconosciuto
+/// (che la ricerca legge come testo) e `bin` per le altre. Un programma o uno script dentro
+/// un archivio non diventa mai un file che il sistema eseguirebbe.
+pub fn opened_extension(entry_name: &str) -> String {
+    if is_executable_name(Path::new(entry_name)) {
+        return NEUTRAL_EXTENSION.to_owned();
+    }
+    let file = entry_name.rsplit(['/', '\\']).next().unwrap_or(entry_name);
+    let trimmed = file.trim_end_matches(['.', ' ']);
+    let extension = trimmed.rsplit_once('.').map(|(_, extension)| extension);
+    match extension {
+        Some(extension)
+            if !extension.is_empty()
+                && extension.len() <= MAX_EXTENSION_CHARS
+                && extension.chars().all(|c| c.is_ascii_alphanumeric()) =>
+        {
+            extension.to_ascii_lowercase()
+        }
+        _ if Format::for_name(entry_name).is_none() => TEXT_EXTENSION.to_owned(),
+        _ => NEUTRAL_EXTENSION.to_owned(),
     }
 }
 
@@ -147,7 +223,8 @@ pub enum LaunchTask {
 pub enum LaunchOutcome {
     /// Il sistema ha accettato la richiesta.
     Done,
-    /// L'apertura delle voci d'archivio non è ancora disponibile.
+    /// L'apertura delle voci d'archivio non è disponibile (processo estrattore non
+    /// collegato).
     ArchiveUnavailable,
     /// Il sistema ha rifiutato (file sparito, nessun programma associato, …).
     Failed,
@@ -161,6 +238,9 @@ pub fn run(task: &LaunchTask, extractor: &dyn ArchiveEntryExtractor) -> LaunchOu
         }
         LaunchTask::Reveal(path) => absolute(path).and_then(|p| platform::reveal_in_folder(&p)),
         LaunchTask::OpenArchiveEntry(doc) => match extractor.extract_to_private_temp(doc) {
+            // Stessa regola dei file sul disco: un file che il sistema eseguirebbe non si
+            // apre (l'estrattore non dovrebbe mai crearlo).
+            Ok(Some(path)) if is_executable_name(&path) => return LaunchOutcome::Failed,
             Ok(Some(path)) => platform::open_with_default_program(&path),
             Ok(None) => return LaunchOutcome::ArchiveUnavailable,
             Err(_) => return LaunchOutcome::Failed,
@@ -207,6 +287,122 @@ mod tests {
         }
     }
 
+    /// Ogni estensione che Windows esegue o interpreta invece di aprire come documento
+    /// (guida, componenti aggiuntivi, pacchetti, script, collegamenti, ricerche salvate,
+    /// connessioni remote, sandbox, pannello di controllo, registro).
+    #[test]
+    fn windows_launchers_are_executable() {
+        for extension in [
+            "chm",
+            "xll",
+            "msix",
+            "msixbundle",
+            "appx",
+            "appxbundle",
+            "appinstaller",
+            "diagcab",
+            "ws",
+            "wsf",
+            "rdp",
+            "wsb",
+            "search-ms",
+            "searchconnector-ms",
+            "library-ms",
+            "settingcontent-ms",
+            "url",
+            "website",
+            "cpl",
+            "inf",
+            "reg",
+            "scf",
+            "hta",
+            "jse",
+            "vbe",
+            "vbs",
+            "msc",
+            "gadget",
+            "application",
+            "appref-ms",
+        ] {
+            let name = format!("file.{extension}");
+            assert!(is_executable_name(Path::new(&name)), "{name}");
+            let upper = format!("FILE.{}", extension.to_uppercase());
+            assert!(is_executable_name(Path::new(&upper)), "{upper}");
+        }
+        // Estensioni vicine ma innocue.
+        for name in [
+            "guida.chmx",
+            "foglio.xlsx",
+            "x.wsx",
+            "a.rdpx",
+            "nota.url.txt",
+        ] {
+            assert!(!is_executable_name(Path::new(name)), "{name}");
+        }
+    }
+
+    /// Un capitolo di un EPUB non è un file: si apre il libro.
+    #[test]
+    fn epub_chapters_open_the_book() {
+        let chapter = DocPath {
+            path: "libri/romanzo.epub".into(),
+            inner: vec!["OEBPS/cap1.xhtml".to_owned()],
+        };
+        assert_eq!(
+            open_plan(&chapter),
+            OpenPlan::File(PathBuf::from("libri/romanzo.epub"))
+        );
+        // Un EPUB dentro uno zip: si estrae il libro.
+        let nested = DocPath {
+            path: "a.zip".into(),
+            inner: vec!["Libro.EPUB".to_owned(), "testo/cap2.xhtml".to_owned()],
+        };
+        assert_eq!(
+            open_plan(&nested),
+            OpenPlan::ArchiveEntry(DocPath {
+                path: "a.zip".into(),
+                inner: vec!["Libro.EPUB".to_owned()],
+            })
+        );
+    }
+
+    #[test]
+    fn opened_extension_partitions() {
+        assert_eq!(opened_extension("cartella/Elenco.PDF"), "pdf");
+        assert_eq!(opened_extension("interno.docx"), "docx");
+        assert_eq!(opened_extension("note (2).txt"), "txt");
+        // Senza estensione, o con caratteri non ammessi: testo se non è un formato noto.
+        assert_eq!(opened_extension("LEGGIMI"), "txt");
+        assert_eq!(opened_extension("strano.t\u{FFFD}t"), "txt");
+        assert_eq!(opened_extension("dati.a b"), "txt");
+        assert_eq!(opened_extension(&format!("x.{}", "a".repeat(40))), "txt");
+        // Un programma o uno script non diventa mai un file eseguibile.
+        assert_eq!(opened_extension("installa.exe"), "bin");
+        assert_eq!(opened_extension("pulisci.bat. "), "bin");
+        assert_eq!(opened_extension("x.search-ms"), "bin");
+    }
+
+    /// Un estrattore che restituisce un file eseguibile: non si apre.
+    struct ExecutableExtractor;
+
+    impl ArchiveEntryExtractor for ExecutableExtractor {
+        fn extract_to_private_temp(&self, _doc: &DocPath) -> Result<Option<PathBuf>, ExtractError> {
+            Ok(Some(PathBuf::from("voce-0123.exe")))
+        }
+    }
+
+    #[test]
+    fn an_extracted_executable_is_never_opened() {
+        let entry = DocPath {
+            path: "a.zip".into(),
+            inner: vec!["b.pdf".to_owned()],
+        };
+        assert_eq!(
+            run(&LaunchTask::OpenArchiveEntry(entry), &ExecutableExtractor),
+            LaunchOutcome::Failed
+        );
+    }
+
     #[test]
     fn plan_partitions() {
         let file = DocPath::file("ricette/mare.txt");
@@ -219,7 +415,7 @@ mod tests {
             path: "musica/archivio.zip".into(),
             inner: vec!["elenco.pdf".to_owned()],
         };
-        assert_eq!(open_plan(&entry), OpenPlan::ArchiveEntry);
+        assert_eq!(open_plan(&entry), OpenPlan::ArchiveEntry(entry.clone()));
         // Si guarda il nome della voce, non quello dell'archivio.
         let script = DocPath {
             path: "musica/archivio.zip".into(),

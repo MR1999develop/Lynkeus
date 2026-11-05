@@ -14,18 +14,20 @@
 //!   sua voce senza decomprimere nulla; un'intestazione cifrata, per l'archivio intero.
 //! - Cartelle e voci "anti" si ignorano; collegamenti simbolici e reparse point sono
 //!   "saltati". Le voci senza dati sono documenti vuoti.
-//! - Un blocco danneggiato (CRC, dati) dà l'avviso "danneggiato" all'archivio e si passa al
-//!   blocco seguente.
+//! - Un blocco che non si legge (CRC, dati, memoria) non ferma i seguenti; alla fine
+//!   l'archivio ha l'avviso del primo errore ("danneggiato", "memoria", …).
+//! - Le etichette si assegnano a tutte le voci nell'ordine dell'archivio
+//!   ([`UniqueLabels`]): le voci di un blocco sono consecutive.
 
-use std::io::{Read, Seek};
+use std::io::{self, Read, Seek};
 
 use sevenz_rust2::{Archive, ArchiveEntry, BlockDecoder, EncoderMethod, Error, Password};
 
 use crate::error::ExtractError;
 use crate::event::{SkipReason, Stopped, WarningKind};
-use crate::extract::archive::{check_depth, entry_label, read_entry_stream};
+use crate::extract::archive::{UniqueLabels, check_depth, entry_label, read_entry_stream};
 use crate::extract::budget::{LimitedReader, check_declared, classify_io};
-use crate::extract::{Ctx, Fail, Input, read_document};
+use crate::extract::{Ctx, Fail, Input};
 use crate::format::Format;
 use crate::limits::LimitKind;
 
@@ -46,16 +48,13 @@ pub(crate) fn extract(ctx: &mut Ctx<'_>, input: Input<'_>) -> Result<(), Fail> {
     ctx.budget()
         .add_entries(count)
         .map_err(ExtractError::LimitExceeded)?;
-    let mut damaged = false;
-    for block in 0..archive.blocks.len() {
-        if ctx.budget().exhausted() {
-            break;
-        }
-        match read_block(ctx, &archive, &password, &mut source, block, len) {
-            Ok(()) => {}
-            Err(Fail::Stopped) => return Err(Fail::Stopped),
-            Err(Fail::Error(_)) => damaged = true,
-        }
+    let labels = labels(&archive);
+    let blocks = archive.blocks.len();
+    let damage = read_blocks(ctx, blocks, |ctx, block| {
+        read_block(ctx, &archive, &labels, &password, &mut source, block, len)
+    });
+    if matches!(damage, Err(Fail::Stopped)) {
+        return damage;
     }
     // Le voci senza dati non stanno in nessun blocco.
     for (index, entry) in archive.files.iter().enumerate() {
@@ -66,26 +65,63 @@ pub(crate) fn extract(ctx: &mut Ctx<'_>, input: Input<'_>) -> Result<(), Fail> {
             .copied()
             .flatten()
             .is_some();
-        if in_block || entry.is_directory || entry.is_anti_item || ctx.budget().exhausted() {
+        let Some(Some(label)) = labels.get(index) else {
+            continue;
+        };
+        if in_block || ctx.budget().exhausted() {
             continue;
         }
-        ctx.enter(entry_label(&entry.name));
-        let result = if is_special(entry) {
-            ctx.skip(SkipReason::SpecialEntry)
-        } else {
-            let declared = Format::for_name(ctx.current_name()).unwrap_or(Format::Text);
-            read_document(ctx, declared, Input::Bytes(Vec::new()))
-        };
-        ctx.leave();
-        result?;
+        ctx.within(label.clone(), |ctx| {
+            if is_special(entry) {
+                ctx.skip(SkipReason::SpecialEntry)
+            } else {
+                let declared = Format::for_name(ctx.current_name()).unwrap_or(Format::Text);
+                read_entry_stream(ctx, declared, &mut io::empty())
+            }
+        })?;
     }
-    if damaged {
-        return Err(ExtractError::Corrupt {
-            reason: "blocco 7z non valido".to_owned(),
+    damage
+}
+
+/// Le etichette uniche delle voci, per indice in `archive.files`; `None` per cartelle e
+/// voci "anti", che non sono documenti.
+fn labels(archive: &Archive) -> Vec<Option<String>> {
+    let mut unique = UniqueLabels::default();
+    archive
+        .files
+        .iter()
+        .map(|entry| {
+            (!entry.is_directory && !entry.is_anti_item)
+                .then(|| unique.unique(entry_label(&entry.name)))
+        })
+        .collect()
+}
+
+/// Legge i blocchi da 0 a `count` con `read`, finché il totale dei limiti non è esaurito.
+/// Un blocco che fallisce non ferma i seguenti; l'esito è il primo errore (memoria,
+/// cifratura, dati non validi), da segnalare per l'archivio.
+fn read_blocks(
+    ctx: &mut Ctx<'_>,
+    count: usize,
+    mut read: impl FnMut(&mut Ctx<'_>, usize) -> Result<(), Fail>,
+) -> Result<(), Fail> {
+    let mut first_error = None;
+    for block in 0..count {
+        if ctx.budget().exhausted() {
+            break;
         }
-        .into());
+        match read(ctx, block) {
+            Ok(()) => {}
+            Err(Fail::Stopped) => return Err(Fail::Stopped),
+            Err(Fail::Error(error)) => {
+                first_error.get_or_insert(error);
+            }
+        }
     }
-    Ok(())
+    match first_error {
+        Some(error) => Err(Fail::Error(error)),
+        None => Ok(()),
+    }
 }
 
 /// Come si è fermata la lettura di un blocco.
@@ -96,26 +132,38 @@ enum Halt {
     Limit(usize, LimitKind),
 }
 
-/// Legge le voci del blocco `block`.
+/// Legge le voci del blocco `block`; `labels` sono quelle di [`labels`].
 fn read_block<R: Read + Seek>(
     ctx: &mut Ctx<'_>,
     archive: &Archive,
+    labels: &[Option<String>],
     password: &Password,
     source: &mut R,
     block: usize,
     archive_len: u64,
 ) -> Result<(), Fail> {
     let decoder = BlockDecoder::new(1, block, archive, password, source);
-    // Copia per gli avvisi dopo la decompressione (il decodificatore si consuma).
-    let entries: Vec<ArchiveEntry> = decoder.entries().to_vec();
+    // Le voci di un blocco sono consecutive in `archive.files`, a partire da questa.
+    let first = archive
+        .stream_map
+        .block_first_file_index
+        .get(block)
+        .copied()
+        .unwrap_or_default();
+    let block_label = |position: usize| -> Option<&String> {
+        labels
+            .get(first.saturating_add(position))
+            .and_then(Option::as_ref)
+    };
+    let entry_count = decoder.entry_count();
     let encrypted = archive.blocks.get(block).is_some_and(|b| {
         b.coders
             .iter()
             .any(|coder| coder.encoder_method_id() == EncoderMethod::ID_AES256_SHA256)
     });
     if encrypted {
-        for entry in &entries {
-            warn_entry(ctx, entry, WarningKind::Encrypted)?;
+        for position in 0..entry_count {
+            warn_entry(ctx, block_label(position), WarningKind::Encrypted)?;
         }
         return Ok(());
     }
@@ -124,7 +172,13 @@ fn read_block<R: Read + Seek>(
     let outcome = decoder.for_each_entries(&mut |entry, reader| {
         let index = position;
         position += 1;
-        match read_block_entry(ctx, entry, reader, archive_len) {
+        let Some(label) = block_label(index) else {
+            return Ok(true);
+        };
+        let read = ctx.within(label.clone(), |ctx| {
+            read_entered(ctx, entry, reader, archive_len)
+        });
+        match read {
             Ok(None) => Ok(!ctx.budget().exhausted()),
             Ok(Some(kind)) => {
                 halt = Some(Halt::Limit(index, kind));
@@ -139,8 +193,8 @@ fn read_block<R: Read + Seek>(
     match halt {
         Some(Halt::Stopped) => return Err(Fail::Stopped),
         Some(Halt::Limit(index, kind)) => {
-            for entry in entries.iter().skip(index + 1) {
-                warn_entry(ctx, entry, WarningKind::LimitExceeded(kind))?;
+            for position in index + 1..entry_count {
+                warn_entry(ctx, block_label(position), WarningKind::LimitExceeded(kind))?;
             }
         }
         None => {}
@@ -149,34 +203,16 @@ fn read_block<R: Read + Seek>(
     Ok(())
 }
 
-/// Un avviso per una voce non letta (cartelle e voci "anti" escluse).
-fn warn_entry(ctx: &mut Ctx<'_>, entry: &ArchiveEntry, kind: WarningKind) -> Result<(), Stopped> {
-    if entry.is_directory || entry.is_anti_item {
-        return Ok(());
+/// Un avviso per una voce non letta (cartelle e voci "anti", senza etichetta, escluse).
+fn warn_entry(ctx: &mut Ctx<'_>, label: Option<&String>, kind: WarningKind) -> Result<(), Stopped> {
+    match label {
+        Some(label) => ctx.within(label.clone(), |ctx| ctx.warn(kind)),
+        None => Ok(()),
     }
-    ctx.enter(entry_label(&entry.name));
-    let result = ctx.warn(kind);
-    ctx.leave();
-    result
 }
 
-/// Legge una voce di un blocco; `Some` se la voce supera i limiti dichiarati (e il blocco va
-/// abbandonato).
-fn read_block_entry(
-    ctx: &mut Ctx<'_>,
-    entry: &ArchiveEntry,
-    reader: &mut dyn Read,
-    archive_len: u64,
-) -> Result<Option<LimitKind>, Stopped> {
-    if entry.is_directory || entry.is_anti_item {
-        return Ok(None);
-    }
-    ctx.enter(entry_label(&entry.name));
-    let result = read_entered(ctx, entry, reader, archive_len);
-    ctx.leave();
-    result
-}
-
+/// Legge una voce già "entrata" nel contesto; `Some` se la voce supera i limiti dichiarati
+/// (e il blocco va abbandonato).
 fn read_entered(
     ctx: &mut Ctx<'_>,
     entry: &ArchiveEntry,
@@ -197,7 +233,7 @@ fn read_entered(
     Ok(None)
 }
 
-/// Vero per i collegamenti simbolici (modo Unix) e i reparse point (Windows).
+// Vero per i collegamenti simbolici (modo Unix) e i reparse point (Windows).
 fn is_special(entry: &ArchiveEntry) -> bool {
     if !entry.has_windows_attributes {
         return false;
@@ -234,6 +270,32 @@ fn corrupt() -> ExtractError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Il primo errore dei blocchi resta quello dell'archivio, anche se poi ne arrivano
+    /// altri; i blocchi seguenti si leggono comunque.
+    #[test]
+    fn first_block_error_is_kept() {
+        let mut events: Vec<crate::event::ExtractEvent> = Vec::new();
+        let mut ctx = Ctx::new(
+            &mut events,
+            crate::limits::ArchiveLimits::default(),
+            String::new(),
+        );
+        let mut read = Vec::new();
+        let result = read_blocks(&mut ctx, 3, |_, block| {
+            read.push(block);
+            match block {
+                0 => Err(ExtractError::LimitExceeded(LimitKind::Memory).into()),
+                1 => Err(corrupt().into()),
+                _ => Ok(()),
+            }
+        });
+        assert!(matches!(
+            result,
+            Err(Fail::Error(ExtractError::LimitExceeded(LimitKind::Memory)))
+        ));
+        assert_eq!(read, [0, 1, 2]);
+    }
 
     #[test]
     fn special_entries() {
