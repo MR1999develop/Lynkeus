@@ -5,8 +5,8 @@
 
 use anyhow::{Context, Result};
 
-use crate::nospawn;
 use crate::process::{cargo, run_inherited, workspace_root};
+use crate::{deny_review, nospawn};
 
 /// Un passo del controllo: nome mostrato e argomenti di cargo.
 struct Step {
@@ -58,12 +58,15 @@ const LINUX_STEP: Step = Step {
     ],
 };
 
-/// Esegue il controllo "nessun avvio di processi nei decoder", poi fmt, clippy, test e
-/// cargo-deny; si ferma al primo passo che fallisce.
+/// Esegue il controllo "nessun avvio di processi nei decoder" e quello delle date delle
+/// eccezioni di `deny.toml`, poi fmt, clippy, test e cargo-deny; si ferma al primo passo
+/// che fallisce.
 pub fn run_all() -> Result<()> {
     let root = workspace_root()?;
     eprintln!("xtask: ── nospawn ── {}", nospawn::CHECKED_DIR);
     nospawn::run(&root).context("passo «nospawn» fallito")?;
+    eprintln!("xtask: ── deny-review ── date delle eccezioni di deny.toml");
+    deny_review::run().context("passo «deny-review» fallito")?;
     for step in CHECK_STEPS {
         run_step(step, &root).with_context(|| format!("passo «{}» fallito", step.name))?;
     }

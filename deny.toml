@@ -7,19 +7,23 @@ targets = ["x86_64-pc-windows-msvc", "x86_64-unknown-linux-gnu"]
 all-features = true
 
 [advisories]
-# Ogni eccezione va in `ignore` con l'ID dell'advisory e il motivo:
-# ignore = [{ id = "RUSTSEC-AAAA-NNNN", reason = "..." }]
+# Ogni eccezione va in `ignore` con l'ID dell'advisory e un motivo che finisce con la data di
+# revisione; dopo quella data `cargo xtask check` (passo `deny-review`) fallisce finché
+# l'eccezione non si toglie o si rinnova con un motivo aggiornato:
+# ignore = [{ id = "RUSTSEC-AAAA-NNNN", reason = "...; rivedere entro AAAA-MM-GG" }]
+# Le stesse regole valgono per `bans.skip` e `bans.skip-tree`.
 ignore = [
     # zbus 5 su Linux: eframe 0.37 → accesskit_unix 0.24.1 (ultima versione) e portale XDG di lynkeus-app.
-    # Solo "unmaintained", nessuna vulnerabilità nota. Da rivedere quando accesskit passa a zbus 6
-    # o a ogni aggiornamento di eframe.
-    { id = "RUSTSEC-2026-0370", reason = "zvariant non mantenuto, arriva da zbus 5 (AccessKit su Linux e portale XDG di lynkeus-app) senza alternative" },
-    { id = "RUSTSEC-2026-0371", reason = "zbus_names non mantenuto, arriva da zbus 5 (AccessKit su Linux e portale XDG di lynkeus-app) senza alternative" },
-    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive non mantenuto, arriva da zbus 5 (AccessKit su Linux e portale XDG di lynkeus-app) senza alternative" },
+    # Solo "unmaintained", nessuna vulnerabilità nota. Da rivedere prima della data, quando
+    # accesskit passa a zbus 6 o a ogni aggiornamento di eframe.
+    { id = "RUSTSEC-2026-0370", reason = "zvariant non mantenuto, arriva da zbus 5 (AccessKit su Linux e portale XDG di lynkeus-app) senza alternative; rivedere entro 2027-05-01" },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names non mantenuto, arriva da zbus 5 (AccessKit su Linux e portale XDG di lynkeus-app) senza alternative; rivedere entro 2027-05-01" },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive non mantenuto, arriva da zbus 5 (AccessKit su Linux e portale XDG di lynkeus-app) senza alternative; rivedere entro 2027-05-01" },
     # PDF (ADR 0002): pdf_oxide 0.3.78 (versione bloccata) → ttf-parser per i font incorporati.
     # Solo "unmaintained", nessuna vulnerabilità nota; il decoder gira nel processo estrattore
-    # isolato. Da rivedere quando pdf_oxide passa a skrifa o a ogni aggiornamento di pdf_oxide.
-    { id = "RUSTSEC-2026-0192", reason = "ttf-parser non mantenuto, arriva da pdf_oxide (ADR 0002) senza alternative" },
+    # isolato. Da rivedere prima della data, quando pdf_oxide passa a skrifa o a ogni
+    # aggiornamento di pdf_oxide.
+    { id = "RUSTSEC-2026-0192", reason = "ttf-parser non mantenuto, arriva da pdf_oxide (ADR 0002) senza alternative; rivedere entro 2027-05-01" },
 ]
 unmaintained = "all"
 unsound = "all"
@@ -48,7 +52,8 @@ allow = [
 confidence-threshold = 0.93
 # L'allowlist è decisa per tutto il progetto: le voci non ancora usate non sono un avviso.
 unused-allowed-license = "allow"
-# Le eccezioni per un singolo crate vanno in `exceptions`, con il motivo in un commento.
+# Le eccezioni per un singolo crate vanno in `exceptions`, con il motivo in un commento
+# (cargo-deny non ha `reason` qui; una licenza compatibile non scade).
 exceptions = []
 
 [licenses.private]

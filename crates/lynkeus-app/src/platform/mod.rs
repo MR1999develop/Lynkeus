@@ -9,9 +9,12 @@
 //!   copre i caratteri mancanti (CJK e altri alfabeti).
 //! - Cartella di configurazione (`settings.toml` e posizione della finestra).
 //! - Flush della cartella dopo una rinomina durevole.
-//! - Apertura di un file con il programma predefinito e "Mostra nella cartella".
-//! - Ordine dei bottoni nei dialoghi.
-//! - Ricerca delle DLL ristretta alla cartella di sistema (Windows).
+//! - Apertura di un file con il programma predefinito e "Mostra nella cartella"; i tipi di
+//!   file che il sistema considera pericolosi ([`is_dangerous_file_type`]); la zona
+//!   d'origine (Mark-of-the-Web) copiata sulle voci estratte ([`copy_mark_of_the_web`]).
+//! - Ordine dei bottoni nei dialoghi; contrasto elevato attivo ([`high_contrast_active`]).
+//! - Ricerca delle DLL caricate dopo l'avvio ristretta alla cartella di sistema (Windows;
+//!   per le DLL importate dall'eseguibile vale `/DEPENDENTLOADFLAG` in `.cargo/config.toml`).
 //! - Avvio del processo estrattore: su Windows nel Job Object con `CreateProcessW`
 //!   (`windows_ffi`), altrove con il lanciatore portabile dell'engine.
 //! - Cartelle dell'app ([`AppDirs`]) e cartelle e file privati ([`private_fs`]: descrittore
@@ -23,6 +26,8 @@
 
 #[cfg(windows)]
 mod windows_ffi;
+#[cfg(windows)]
+mod zone;
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -34,9 +39,11 @@ use lynkeus_engine::{PrivateFs, WorkerLauncher};
 
 use crate::theme::SEMIBOLD;
 
-/// Limita la ricerca delle DLL alla cartella di sistema (Windows,
+/// Limita la ricerca delle DLL caricate da qui in poi alla cartella di sistema (Windows,
 /// `SetDefaultDllDirectories`): va chiamata come prima istruzione di `main`, prima che una
-/// libreria ne carichi. Altrove non fa nulla.
+/// libreria ne carichi. Le DLL importate dall'eseguibile si caricano prima di `main`: per
+/// loro vale `/DEPENDENTLOADFLAG:0x800`, verificato da `cargo xtask dist`. Altrove non fa
+/// nulla.
 #[cfg(windows)]
 pub fn restrict_dll_search() -> io::Result<()> {
     windows_ffi::restrict_dll_search()
@@ -46,6 +53,51 @@ pub fn restrict_dll_search() -> io::Result<()> {
 #[cfg(not(windows))]
 pub fn restrict_dll_search() -> io::Result<()> {
     Ok(())
+}
+
+/// Vero se il sistema considera pericoloso il tipo di file con estensione `extension`
+/// (senza punto): un tipo che esegue codice o cambia il sistema quando si "apre".
+///
+/// Windows: `AssocIsDangerous`, cioè l'elenco di Windows più i tipi registrati come
+/// "sempre pericolosi" (`FTA_AlwaysUnsafe`); un'estensione con NUL o troppo lunga conta
+/// come pericolosa. Linux: nessun elenco del sistema (falso; l'elenco dell'app resta).
+#[cfg(windows)]
+pub fn is_dangerous_file_type(extension: &str) -> bool {
+    windows_ffi::assoc_is_dangerous(extension)
+}
+
+/// Vedi la versione per Windows.
+#[cfg(not(windows))]
+pub fn is_dangerous_file_type(_extension: &str) -> bool {
+    false
+}
+
+/// Copia la zona d'origine (Mark-of-the-Web) dell'archivio `source` sul file `target`
+/// appena estratto, perché il programma che lo apre lo tratti come scaricato (vista
+/// protetta, macro bloccate). Senza zona sull'archivio non fa nulla; errore se la zona non
+/// si scrive (il file allora non va aperto). Linux: nessuna zona, nulla da fare.
+#[cfg(windows)]
+pub fn copy_mark_of_the_web(source: &Path, target: &Path) -> io::Result<()> {
+    zone::copy_mark_of_the_web(source, target)
+}
+
+/// Vedi la versione per Windows.
+#[cfg(not(windows))]
+pub fn copy_mark_of_the_web(_source: &Path, _target: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+/// Vero se è attivo un tema a contrasto elevato del sistema (Windows,
+/// `SPI_GETHIGHCONTRAST`); falso se non si sa o altrove.
+#[cfg(windows)]
+pub fn high_contrast_active() -> bool {
+    windows_ffi::high_contrast_active()
+}
+
+/// Vedi la versione per Windows.
+#[cfg(not(windows))]
+pub fn high_contrast_active() -> bool {
+    false
 }
 
 /// Il lanciatore del processo estrattore `exe` (percorso assoluto) con limite di memoria

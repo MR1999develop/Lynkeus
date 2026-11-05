@@ -1,6 +1,7 @@
 # Controllo quotidiano di advisory, licenze e sorgenti delle dipendenze:
-# un advisory nuovo fa fallire il job anche senza modifiche al codice,
-# e GitHub notifica il fallimento del workflow pianificato.
+# un advisory nuovo, o un'eccezione di deny.toml oltre la sua data di revisione, fa fallire
+# il job anche senza modifiche al codice, e GitHub notifica il fallimento del workflow
+# pianificato.
 name: cargo deny (giornaliero)
 
 on:
@@ -29,3 +30,7 @@ jobs:
 
       - name: cargo deny check
         run: cargo deny check
+
+      # La toolchain la installa rustup da rust-toolchain.toml.
+      - name: cargo xtask deny-review
+        run: cargo xtask deny-review
