@@ -184,7 +184,7 @@ Totale livello 2: 14 (A) + 10 (B) + 13 (C) + 13 (D) = 50 test, di cui 9 derivati
 | P-05 | Cache contro estrazione sui documenti demo | p50 e p95 della seconda ricerca contro la prima | la seconda più veloce, p95 riportato | B-12 |
 | P-06 | `sort_200k_timing` | `cargo test --release -p lynkeus-app --lib sort_200k_timing -- --ignored --nocapture` | < 50 ms per colonna (obiettivo del codice) | regola 31 |
 | P-07 | `step_target_200k` | Test `#[ignore]` da scrivere, 200.000 righe, release | < 1 ms per chiamata | C-08 |
-| P-08 | `copy_200k` | Ctrl+A, Ctrl+C con 200.000 righe; durata del blocco del thread UI e picco di memoria | thread UI libero (nessun frame oltre 100 ms) | C-07 |
+| P-08 | `p08_copy_200k` | Con 200.000 risultati: copia delle righe che stanno in 8 MiB (`MAX_CLIPBOARD_BYTES`), fino alla scrittura negli appunti di sistema, e copia di tutte le righe, che va rifiutata; blocco più lungo del thread UI, durata del rifiuto, picco di memoria. Il testo che c'era negli appunti torna lì alla fine, anche se la misura fallisce | thread UI libero (nessun blocco oltre 100 ms); rifiuto entro 1 s, senza toccare gli appunti | C-07 |
 | P-09 | Primo frame e risposta a un tasto | Tempo dal tasto al ridisegno con 200.000 risultati | < 100 ms (regola 40) | C-07, C-08 |
 
 ### Risultati
@@ -363,7 +363,7 @@ Regola: un test manuale che trova un problema diventa un test automatico, scritt
 | nessuna | tutti i livelli, da 1 a 5 |
 | `--level 1,2,3` (o `--level=1,2,3`) | solo i livelli indicati |
 | `--quick` | salta `cargo xtask check`, `cargo xtask check-linux`, le misure lunghe (P-01, P-02) e il pacchetto di `cargo xtask dist` (livello 4) |
-| `--clipboard` | esegue anche P-08, che sovrascrive gli appunti di sistema |
+| `--clipboard` | esegue anche P-08, che scrive negli appunti di sistema (alla fine rimette il testo che c'era, o li svuota se non c'era testo) |
 | `--registry` | esegue anche la parte automatica di M-22, che scrive e toglie chiavi in una radice di prova di `HKCU\Software` |
 
 Le voci che modificano stato condiviso della macchina (appunti, registro, menu contestuale) non partono senza l'opzione esplicita: nel rapporto risultano "non eseguita: richiede --clipboard" (o `--registry`).

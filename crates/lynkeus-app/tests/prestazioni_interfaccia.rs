@@ -25,9 +25,10 @@ use std::time::{Duration, Instant};
 use egui::{Key, Role};
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
+use lynkeus_app::export;
 use lynkeus_app::form::{RootAdded, RootKind};
-use lynkeus_app::results::{ResultsView, SortColumn, SortSpec, Step};
-use lynkeus_app::{Application, Pump, Settings, setup_context};
+use lynkeus_app::results::{ClickKind, ResultsView, SortColumn, SortSpec, Step};
+use lynkeus_app::{Application, MAX_CLIPBOARD_BYTES, Notice, Pump, Settings, setup_context};
 use lynkeus_core::{Location, Snippet, TermSet};
 use lynkeus_engine::{DocPath, Hit, Notify};
 use misura::Distribution;
@@ -125,56 +126,205 @@ fn p07_step_target_200k() {
     );
 }
 
-/// P-08: Ctrl+A, Ctrl+C con 200.000 righe; per ogni copia il blocco più lungo del thread
-/// dell'interfaccia (l'avvio della copia o un frame mentre il thread di copia lavora).
+/// P-08: copia negli appunti di sistema con 200.000 risultati. Ogni ripetizione:
+///
+/// 1. copia le prime righe, tante quante ne stanno in [`MAX_CLIPBOARD_BYTES`]: il testo
+///    arriva alla vista, che lo consegna a egui e agli appunti di sistema (come eframe, con
+///    arboard, sul thread dell'interfaccia). Il valore misurato è il blocco più lungo del
+///    thread dell'interfaccia: l'avvio della copia, un frame mentre il thread di copia
+///    lavora o la consegna agli appunti; `copy_max_ms` è la copia completa;
+/// 2. copia tutte le 200.000 righe, troppe per gli appunti: il rifiuto arriva con il
+///    messaggio che propone Esporta e gli appunti restano com'erano
+///    (`reject_block_max_ms`: blocco più lungo del thread dell'interfaccia; `reject_max_ms`:
+///    dall'avvio al messaggio).
+///
+/// Scrive negli appunti di chi la esegue: `cargo xtask test-plan` la lancia solo con
+/// `--clipboard`. Il testo che c'era prima torna negli appunti alla fine, anche se la misura
+/// fallisce ([`SavedClipboard`]).
 #[test]
-#[ignore = "misura P-08 del piano di test, lanciata da cargo xtask test-plan"]
+#[ignore = "misura P-08 del piano di test, lanciata da cargo xtask test-plan --clipboard"]
 fn p08_copy_200k() {
+    // Per primo: il suo `Drop` viene per ultimo, dopo ogni altro valore della misura.
+    let mut clipboard = SavedClipboard::save();
     let (mut app, _dir) = searched_app();
     assert_eq!(app.results().hits.len(), ROWS);
-    let mut total = Duration::ZERO;
+    let expected = text_up_to_the_limit(&app);
+    let rows_at_limit = expected.lines().count();
+    let mut copy_max = Duration::ZERO;
+    let mut reject_block_max = Duration::ZERO;
+    let mut reject_max = Duration::ZERO;
     let times = misura::repeat(REPETITIONS, || {
-        let (block, took) = copy_all(&mut app);
-        total = total.max(took);
-        block
+        app.view_mut().click_hit(0, ClickKind::Replace);
+        app.view_mut()
+            .click_hit(rows_at_limit - 1, ClickKind::Range);
+        let (copy, text) = copy_and_wait(&mut app);
+        let text = text.expect("il testo al limite va negli appunti");
+        assert!(text == expected, "testo copiato diverso dalle righe scelte");
+        assert_eq!(
+            app.notice(),
+            Some(&Notice::Copied {
+                rows: rows_at_limit
+            })
+        );
+        let handed = clipboard.hand_over(&text);
+        assert_eq!(
+            clipboard.text_len(),
+            Some(expected.len()),
+            "testo negli appunti"
+        );
+        copy_max = copy_max.max(copy.total);
+
+        clipboard.put(UNTOUCHED);
+        app.view_mut().select_all();
+        let (reject, text) = copy_and_wait(&mut app);
+        assert!(text.is_none(), "troppo per gli appunti");
+        assert_eq!(app.notice(), Some(&Notice::CopyTooLarge { rows: ROWS }));
+        assert!(
+            clipboard.holds(UNTOUCHED),
+            "il rifiuto ha toccato gli appunti"
+        );
+        reject_block_max = reject_block_max.max(reject.longest_block);
+        reject_max = reject_max.max(reject.total);
+
+        copy.longest_block.max(handed)
     });
     misura::print_line(
         "P-08",
         &Distribution::new(&times),
         &[
             ("rows", ROWS.to_string()),
-            ("copy_max_ms", misura::duration_ms(total)),
+            ("limit_rows", rows_at_limit.to_string()),
+            ("limit_bytes", expected.len().to_string()),
+            ("copy_max_ms", misura::duration_ms(copy_max)),
+            ("reject_block_max_ms", misura::duration_ms(reject_block_max)),
+            ("reject_max_ms", misura::duration_ms(reject_max)),
         ],
     );
 }
 
-/// Seleziona tutto e copia; restituisce il blocco più lungo del thread dell'interfaccia e la
-/// durata totale della copia.
-fn copy_all(app: &mut Application) -> (Duration, Duration) {
+/// Il testo che P-08 mette negli appunti mentre prova il rifiuto: deve restare lì.
+const UNTOUCHED: &str = "P-08: appunti non toccati dal rifiuto";
+
+/// Il testo TSV delle prime righe della tabella che stanno in [`MAX_CLIPBOARD_BYTES`]
+/// (righe intere, nell'ordine di arrivo come nella vista senza ordinamento).
+fn text_up_to_the_limit(app: &Application) -> String {
+    let hits = &app.results().hits;
+    let table = export::results_table(app.i18n(), hits, &app.results().terms, 0..hits.len());
+    let mut all = export::to_tsv(&table.rows);
+    assert!(
+        all.len() > MAX_CLIPBOARD_BYTES,
+        "le 200.000 righe superano il limite"
+    );
+    let cut = all.as_bytes()[..=MAX_CLIPBOARD_BYTES]
+        .iter()
+        .rposition(|&byte| byte == b'\n')
+        .map_or(0, |newline| newline + 1);
+    all.truncate(cut);
+    all
+}
+
+/// I tempi di una copia sul thread dell'interfaccia.
+struct CopyTimes {
+    /// Il blocco più lungo: l'avvio o un frame.
+    longest_block: Duration,
+    /// Dall'avvio all'esito (testo pronto o rifiuto).
+    total: Duration,
+}
+
+/// Copia la selezione come la finestra: l'avvio, poi un frame all'avviso del thread di
+/// copia o dopo un intervallo, finché la copia non finisce. Il testo pronto per gli
+/// appunti, se c'è.
+fn copy_and_wait(app: &mut Application) -> (CopyTimes, Option<String>) {
     let (tx, rx) = mpsc::channel::<()>();
     let notify: Notify = Arc::new(move || {
         // La copia può essere già consegnata: un avviso perso non conta.
         if tx.send(()).is_err() {}
     });
-    app.view_mut().select_all();
     let started = Instant::now();
     let ((), mut longest) = misura::timed(|| app.copy_selection(&notify));
-    let text = loop {
-        let (text, frame) = misura::timed(|| {
-            app.pump_actions();
-            app.take_clipboard_text()
-        });
+    assert!(app.is_copying(), "copia avviata");
+    loop {
+        let ((), frame) = misura::timed(|| app.pump_actions());
         longest = longest.max(frame);
-        if let Some(text) = text {
-            break text;
+        if !app.is_copying() {
+            break;
         }
         assert!(started.elapsed() < DEADLINE, "copia non finita");
         // Il prossimo frame: all'avviso del thread di copia o dopo un intervallo.
         if rx.recv_timeout(FRAME_INTERVAL).is_err() {}
+    }
+    let total = started.elapsed();
+    let times = CopyTimes {
+        longest_block: longest,
+        total,
     };
-    assert_eq!(text.lines().count(), ROWS, "una riga per risultato");
-    assert!(!app.is_copying());
-    (longest, started.elapsed())
+    (times, app.take_clipboard_text())
+}
+
+/// Gli appunti di sistema durante P-08. Ricorda il testo che c'era prima e lo rimette nel
+/// `Drop`, anche se la misura fallisce; se prima non c'era testo, alla fine li svuota. Il
+/// testo dell'utente resta in memoria e basta: non si stampa mai.
+struct SavedClipboard {
+    clipboard: arboard::Clipboard,
+    before: Option<String>,
+}
+
+impl SavedClipboard {
+    /// Legge gli appunti; se non si possono aprire o leggere la misura si ferma prima di
+    /// toccarli.
+    fn save() -> SavedClipboard {
+        let mut clipboard = match arboard::Clipboard::new() {
+            Ok(clipboard) => clipboard,
+            Err(error) => panic!("appunti di sistema non disponibili: {error}"),
+        };
+        let before = match clipboard.get_text() {
+            Ok(text) => Some(text),
+            Err(arboard::Error::ContentNotAvailable) => None,
+            Err(error) => panic!("appunti non leggibili, misura non eseguita: {error}"),
+        };
+        SavedClipboard { clipboard, before }
+    }
+
+    /// Consegna `text` come la finestra: a egui, poi (eframe, a fine frame) agli appunti di
+    /// sistema con arboard. Il tempo sul thread dell'interfaccia.
+    fn hand_over(&mut self, text: &str) -> Duration {
+        let ctx = egui::Context::default();
+        let for_egui = text.to_owned();
+        let started = Instant::now();
+        ctx.copy_text(for_egui);
+        let written = self.clipboard.set_text(text);
+        let took = started.elapsed();
+        assert!(written.is_ok(), "scrittura negli appunti: {written:?}");
+        took
+    }
+
+    /// Mette negli appunti un testo breve.
+    fn put(&mut self, text: &str) {
+        let written = self.clipboard.set_text(text);
+        assert!(written.is_ok(), "scrittura negli appunti: {written:?}");
+    }
+
+    /// La lunghezza del testo negli appunti, se c'è testo.
+    fn text_len(&mut self) -> Option<usize> {
+        self.clipboard.get_text().ok().map(|text| text.len())
+    }
+
+    /// Vero se negli appunti c'è proprio `text`.
+    fn holds(&mut self, text: &str) -> bool {
+        self.clipboard.get_text().is_ok_and(|now| now == text)
+    }
+}
+
+impl Drop for SavedClipboard {
+    fn drop(&mut self) {
+        let restored = match self.before.take() {
+            Some(text) => self.clipboard.set_text(text),
+            None => self.clipboard.clear(),
+        };
+        if let Err(error) = restored {
+            eprintln!("P-08: appunti non ripristinati: {error}");
+        }
+    }
 }
 
 /// P-09: tempo del frame che riceve la freccia giù con 200.000 risultati (la risposta a

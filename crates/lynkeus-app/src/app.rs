@@ -334,7 +334,7 @@ struct CopyJob {
 
 /// Il testo più lungo che si copia negli appunti, in byte. eframe lo scrive negli appunti
 /// del sistema sul thread dell'interfaccia, che si ferma circa 1–2 ms per MB (la sola
-/// conversione in UTF-16 costa 1 ms per MB; misura in `copy_200k`): oltre questa soglia la
+/// conversione in UTF-16 costa 1 ms per MB; misura P-08, `p08_copy_200k`): oltre questa soglia la
 /// finestra resterebbe ferma per più di un frame, quindi si propone Esporta. Sono circa
 /// 30.000–40.000 righe di risultato.
 pub const MAX_CLIPBOARD_BYTES: usize = 8 << 20;
@@ -2465,93 +2465,6 @@ mod tests {
         let copied = app.take_clipboard_text().map(|text| text.len());
         assert_eq!(copied, None, "niente negli appunti");
         assert_eq!(app.notice(), Some(&Notice::CopyTooLarge { rows: 45_000 }));
-    }
-
-    /// Misura P-08 (C-07, R-05): `cargo test --release -p lynkeus-app --lib copy_200k --
-    /// --ignored --nocapture`. Con 200 000 righe selezionate, la copia occupa il thread
-    /// dell'interfaccia per meno di 50 ms (il resto è nel thread di copia) e finisce con il
-    /// messaggio che propone Esporta; il testo più lungo ammesso negli appunti
-    /// ([`MAX_CLIPBOARD_BYTES`]) ferma il thread dell'interfaccia meno di 16 ms, dalla
-    /// consegna a egui alla scrittura negli appunti del sistema.
-    #[test]
-    #[ignore = "misura di prestazioni, da eseguire in release"]
-    fn copy_200k() {
-        let dir = tempfile::tempdir().expect("cartella");
-        realistic_rows_file(dir.path(), 200_000);
-        let mut app = Application::build(Settings::default()).expect("app");
-        app.form.add_root(dir.path().to_owned(), RootKind::Folder);
-        app.set_term("ar");
-        run_to_end(&mut app);
-        assert_eq!(app.results().hits.len(), 200_000);
-        app.view_mut().select_all();
-        let notify: Notify = Arc::new(|| {});
-        let started = Instant::now();
-        app.copy_selection(&notify);
-        let on_ui_thread = started.elapsed();
-        let mut longest_pump = Duration::ZERO;
-        while app.is_copying() {
-            let pump = Instant::now();
-            app.pump_actions();
-            longest_pump = longest_pump.max(pump.elapsed());
-            assert!(
-                started.elapsed() < Duration::from_secs(60),
-                "copia non finita"
-            );
-            thread::sleep(Duration::from_millis(1));
-        }
-        println!(
-            "copy_200k: thread dell'interfaccia {on_ui_thread:?} all'avvio, \
-             {longest_pump:?} al massimo per frame, totale {:?}",
-            started.elapsed()
-        );
-        assert!(on_ui_thread < Duration::from_millis(50), "{on_ui_thread:?}");
-        assert!(longest_pump < Duration::from_millis(50), "{longest_pump:?}");
-        assert!(
-            app.take_clipboard_text().is_none(),
-            "troppo per gli appunti"
-        );
-        assert_eq!(app.notice(), Some(&Notice::CopyTooLarge { rows: 200_000 }));
-
-        // Il resto del percorso, sul thread dell'interfaccia, per testi di righe vere fino a
-        // tutte le 200 000: la vista consegna il testo a egui, eframe lo scrive negli
-        // appunti del sistema con arboard (scrive davvero negli appunti di chi esegue la
-        // misura, se sono accessibili).
-        let table = export::results_table(app.i18n(), &app.results().hits, &[], 0..200_000);
-        let all = export::to_tsv(&table.rows);
-        for limit in [1 << 20, 4 << 20, MAX_CLIPBOARD_BYTES, 16 << 20, all.len()] {
-            let text = &all[..all.floor_char_boundary(limit)];
-            let ctx = egui::Context::default();
-            let handed_text = text.to_owned();
-            let handed = Instant::now();
-            ctx.copy_text(handed_text);
-            let to_egui = handed.elapsed();
-            let (utf16, system) = clipboard_write(text);
-            println!(
-                "copy_200k: {} byte, copy_text {to_egui:?}, UTF-16 {utf16:?}, \
-                 appunti {system:?}",
-                text.len()
-            );
-            if limit == MAX_CLIPBOARD_BYTES {
-                let on_ui_thread = to_egui + system.unwrap_or(utf16);
-                assert!(on_ui_thread < Duration::from_millis(16), "{on_ui_thread:?}");
-            }
-        }
-    }
-
-    /// Il costo di scrivere `text` negli appunti del sistema sul thread dell'interfaccia,
-    /// come fa eframe: la conversione in UTF-16 che arboard fa sempre (un limite inferiore)
-    /// e la scrittura vera, se gli appunti sono accessibili (in un ambiente isolato no).
-    fn clipboard_write(text: &str) -> (Duration, Option<Duration>) {
-        let started = Instant::now();
-        let utf16: Vec<u16> = std::hint::black_box(text).encode_utf16().collect();
-        std::hint::black_box(&utf16);
-        let utf16 = started.elapsed();
-        let Ok(mut clipboard) = arboard::Clipboard::new() else {
-            return (utf16, None);
-        };
-        let started = Instant::now();
-        let system = clipboard.set_text(text).ok().map(|()| started.elapsed());
-        (utf16, system)
     }
 
     /// Una radice che non esiste: la ricerca finisce subito con un avviso.

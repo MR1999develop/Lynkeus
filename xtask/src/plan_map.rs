@@ -723,16 +723,29 @@ pub const MEASURES: &[Measure] = &[
     },
     Measure {
         id: "P-08",
-        title: "copia di 200.000 righe (Ctrl+A, Ctrl+C)",
+        title: "copia negli appunti al limite di 8 MiB e rifiuto con 200.000 righe",
         test: app_measure("p08_copy_200k"),
         output: Output::Line,
-        thresholds: &[Threshold::AtMost {
-            key: "max_ms",
-            limit: 100.0,
-        }],
+        thresholds: &[
+            Threshold::AtMost {
+                key: "max_ms",
+                limit: 100.0,
+            },
+            Threshold::AtMost {
+                key: "reject_block_max_ms",
+                limit: 100.0,
+            },
+            Threshold::Below {
+                key: "reject_max_ms",
+                limit: 1_000.0,
+            },
+        ],
         length: Length::Short,
         touches: Some(SharedState::Clipboard),
-        note: "blocco più lungo del thread dell'interfaccia per copia; copy_max_ms = copia completa",
+        note: "blocco più lungo del thread dell'interfaccia nella copia al limite, consegna \
+               agli appunti compresa; copy_max_ms = copia completa al limite; reject_* = \
+               rifiuto delle 200.000 righe (blocco e tempo fino al messaggio), appunti non \
+               toccati; il testo di prima torna negli appunti alla fine",
     },
     Measure {
         id: "P-09",
