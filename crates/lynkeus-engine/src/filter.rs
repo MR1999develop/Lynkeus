@@ -143,7 +143,13 @@ impl FileFilter {
     }
 
     fn accepts_extension(&self, path: &Path) -> bool {
-        let listed = |list: &[String]| list.iter().any(|lower| platform::extension_is(path, lower));
+        // L'estensione si ricava una volta, poi si confronta con ogni voce dell'elenco.
+        let listed = |list: &[String]| {
+            path.extension().is_some_and(|ext| {
+                let ext = ext.to_string_lossy();
+                list.iter().any(|lower| platform::lowercase_eq(&ext, lower))
+            })
+        };
         match &self.extensions {
             Extensions::All => true,
             Extensions::Include(list) => listed(list),
