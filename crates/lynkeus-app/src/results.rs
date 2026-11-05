@@ -726,8 +726,8 @@ fn insert_sorted(
 /// stessa relazione di [`compare`], con le chiavi calcolate una volta per riga.
 ///
 /// Per File e Posizione la chiave del file si calcola una volta per documento, non per
-/// riga: con 200 000 righe l'ordinamento resta sotto i 50 ms (misura in
-/// `sort_200k_timing`).
+/// riga: con 200 000 righe l'ordinamento resta sotto i 50 ms (misura P-06,
+/// `p06_sort_200k`).
 fn sort_order(order: &mut [usize], spec: SortSpec, hits: &[Hit], docs: &DocIndex) {
     let descending = spec.order == SortOrder::Descending;
     macro_rules! by_key {
@@ -986,28 +986,6 @@ mod tests {
         assert_eq!(view.step_target(Step::NextFile), Some(1));
         view.jump_to(3);
         assert_eq!(view.step_target(Step::PreviousFile), Some(1));
-    }
-
-    /// 200 000 righe da 2 000 file (100 righe per file, file condivisi come nel motore),
-    /// in ordine d'arrivo mescolato.
-    fn many_hits() -> Vec<Hit> {
-        let docs: Vec<Arc<DocPath>> = (0..2_000)
-            .map(|f| {
-                let path = PathBuf::from("radice")
-                    .join(format!("cartella {}", f % 37))
-                    .join("sotto cartella con un nome lungo")
-                    .join(format!("Documento numero {f}.txt"));
-                Arc::new(DocPath::file(path))
-            })
-            .collect();
-        (0..200_000u32)
-            .map(|i| {
-                let doc = &docs[(i as usize * 7919) % docs.len()];
-                let mut row = hit("x", i % 5000, &format!("parola{}", i % 977));
-                row.doc = Arc::clone(doc);
-                row
-            })
-            .collect()
     }
 
     /// Il clic e le frecce portano il focus sulla riga del cursore; i passi
@@ -1313,76 +1291,5 @@ mod tests {
             Some(3),
             "\"carta\" è ora l'ultima"
         );
-    }
-
-    /// C-08, misura P-07: `cargo test --release -p lynkeus-app --lib step_target_200k --
-    /// --ignored --nocapture`. Obiettivo: meno di 1 ms per chiamata.
-    #[test]
-    #[ignore = "misura di prestazioni, da eseguire in release"]
-    fn step_target_200k() {
-        let hits = many_hits();
-        let steps = [
-            Step::NextInFile,
-            Step::PreviousInFile,
-            Step::NextFile,
-            Step::PreviousFile,
-        ];
-        // Righe per file (ordine predefinito) e sparse (per parola), con il cursore
-        // all'inizio, a metà e in fondo: i casi peggiori di una ricerca per scorrimento.
-        for sort in [None, Some(SortSpec::ascending(SortColumn::Word))] {
-            let mut view = ResultsView::new(sort);
-            view.finish(&hits, &roots());
-            for position in [0, hits.len() / 2, hits.len() - 1] {
-                view.jump_to(position);
-                const CALLS: u32 = 50;
-                let started = std::time::Instant::now();
-                for _ in 0..CALLS {
-                    for step in steps {
-                        std::hint::black_box(view.step_target(std::hint::black_box(step)));
-                    }
-                }
-                let per_call = started.elapsed() / (CALLS * 4);
-                println!("step_target {sort:?} da {position}: {per_call:?} per chiamata");
-                assert!(
-                    per_call < std::time::Duration::from_millis(1),
-                    "{per_call:?}"
-                );
-            }
-        }
-    }
-
-    /// Misura dell'ordinamento finale: `cargo test --release -p lynkeus-app --lib
-    /// sort_200k -- --ignored --nocapture`. Obiettivo: meno di ~50 ms per colonna.
-    #[test]
-    #[ignore = "misura di prestazioni, da eseguire in release"]
-    fn sort_200k_timing() {
-        let hits = many_hits();
-        for column in [
-            SortColumn::File,
-            SortColumn::Position,
-            SortColumn::Word,
-            SortColumn::Term,
-            SortColumn::Context,
-        ] {
-            let mut view = ResultsView::new(Some(SortSpec::ascending(column)));
-            let started = std::time::Instant::now();
-            view.finish(&hits, &roots());
-            println!("{column:?}: {:?}", started.elapsed());
-
-            // Durante la ricerca, con l'ordinamento scelto: righe inserite al loro posto a
-            // lotti come quelli di un frame (`MAX_HITS_PER_FRAME`).
-            let mut streaming = ResultsView::new(Some(SortSpec::ascending(column)));
-            let mut slowest = std::time::Duration::ZERO;
-            for end in (5_000..=hits.len()).step_by(5_000) {
-                let batch = std::time::Instant::now();
-                streaming.extend_to(&hits[..end], &roots());
-                slowest = slowest.max(batch.elapsed());
-            }
-            println!("{column:?}, a lotti di 5000: al massimo {slowest:?} per lotto");
-            assert!(
-                slowest < std::time::Duration::from_millis(50),
-                "{column:?}: {slowest:?}"
-            );
-        }
     }
 }

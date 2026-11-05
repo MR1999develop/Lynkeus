@@ -154,27 +154,3 @@ fn cancel_stops_a_busy_worker_within_one_second() {
     let took = cancel_with_busy_workers(1);
     assert!(took < CANCEL_BUDGET, "annulla in {took:?}");
 }
-
-/// Misura P-02 (piano di test): 4 processi lenti, CPU satura, 30 ripetizioni; stampa p50,
-/// p95 e massimo. `cargo test --release -p lynkeus-engine --test annulla -- --ignored
-/// --nocapture`.
-#[test]
-#[ignore = "misura di prestazioni (P-02), da lanciare a mano in release"]
-fn cancel_under_load_distribution() {
-    const REPETITIONS: usize = 30;
-    // Una esecuzione scartata, poi le ripetizioni.
-    let _warmup = cancel_with_busy_workers(4);
-    let mut times: Vec<Duration> = (0..REPETITIONS)
-        .map(|_| cancel_with_busy_workers(4))
-        .collect();
-    times.sort_unstable();
-    let at = |q: usize| times[(times.len() - 1) * q / 100];
-    let cores = thread::available_parallelism().map_or(0, NonZeroUsize::get);
-    println!(
-        "P-02: {REPETITIONS} ripetizioni, {cores} core logici; p50 {:?}, p95 {:?}, massimo {:?}",
-        at(50),
-        at(95),
-        at(100)
-    );
-    assert!(at(100) < CANCEL_BUDGET, "massimo {:?}", at(100));
-}

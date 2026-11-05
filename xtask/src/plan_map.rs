@@ -700,10 +700,16 @@ pub const MEASURES: &[Measure] = &[
         title: "ordinamento di 200.000 righe per colonna",
         test: app_measure("p06_sort_200k"),
         output: Output::Line,
-        thresholds: &[Threshold::Below {
-            key: "p95_ms",
-            limit: 50.0,
-        }],
+        thresholds: &[
+            Threshold::Below {
+                key: "p95_ms",
+                limit: 50.0,
+            },
+            Threshold::Below {
+                key: "batch_max_ms",
+                limit: 50.0,
+            },
+        ],
         length: Length::Short,
         touches: None,
         note: "5 colonne × 15 ripetizioni; batch_max_ms = lotto più lento durante la ricerca",

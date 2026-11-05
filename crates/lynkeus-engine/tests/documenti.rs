@@ -340,50 +340,6 @@ fn the_total_is_known_while_a_document_is_still_read() {
     source.pool().shutdown();
 }
 
-/// Misura P-05 (piano di test): documenti demo letti dal processo estrattore e dalla cache;
-/// stampa p50 e p95 di 15 letture dopo una scartata. `cargo test --release -p lynkeus-engine
-/// --test documenti cache_against_extraction -- --ignored --nocapture`.
-#[test]
-#[ignore = "misura di prestazioni (P-05), da lanciare a mano in release"]
-fn cache_against_extraction_timing() {
-    let cache = tempfile::tempdir().expect("cartella della cache");
-    let files = [
-        fixtures("demo/ufficio/note.docx"),
-        fixtures("demo/musica/archivio.zip"),
-    ];
-    let measure = |source: &lynkeus_engine::DocumentSource, expected: Origin| {
-        let never = || false;
-        let mut times: Vec<Duration> = (0..16)
-            .map(|_| {
-                let started = Instant::now();
-                for file in &files {
-                    let mut events: Vec<ExtractEvent> = Vec::new();
-                    let (end, origin) = source.extract(
-                        file,
-                        &ExtractOptions::default(),
-                        Duration::from_secs(30),
-                        &never,
-                        &mut events,
-                    );
-                    assert_eq!(end, ExtractEnd::Completed);
-                    assert_eq!(origin, expected);
-                }
-                started.elapsed()
-            })
-            .skip(1)
-            .collect();
-        times.sort_unstable();
-        (times[times.len() / 2], times[(times.len() - 1) * 95 / 100])
-    };
-    let extractor = documents_with(launcher(), 1, None);
-    let cached = documents_with(launcher(), 1, Some(&cache.path().join("cache")));
-    let (p50, p95) = measure(&extractor, Origin::Extractor);
-    println!("P-05 processo estrattore: p50 {p50:?}, p95 {p95:?}");
-    let _fill = measure(&cached, Origin::Extractor);
-    let (p50, p95) = measure(&cached, Origin::Cache);
-    println!("P-05 cache: p50 {p50:?}, p95 {p95:?}");
-}
-
 #[test]
 fn second_search_reads_from_the_cache_and_corrupt_entries_are_dropped() {
     let cache = tempfile::tempdir().expect("cartella della cache");

@@ -53,11 +53,11 @@ Comandi (dalla radice del repository):
 | `cargo test -p lynkeus-engine` | motore: scansione, pool, cache, documenti, processi |
 | `cargo test -p lynkeus-extract` | formati, archivi, voci, protocollo |
 | `cargo test -p lynkeus-core` | ricerca pura e proprietà |
-| `cargo test --release -p lynkeus-app --lib sort_200k_timing -- --ignored --nocapture` | misura dell'ordinamento di 200.000 risultati (obiettivo nel codice: meno di ~50 ms per colonna) |
+| `cargo test --release -p lynkeus-app --test prestazioni_interfaccia p06_sort_200k -- --ignored --exact --nocapture` | una misura del livello 3 a mano (qui P-06, l'ordinamento di 200.000 risultati); le misure sono elencate nel livello 3 |
 | `cargo test -p <crate> -- --list` | elenco dei test di un crate |
 | `cd fuzz; cargo +nightly fuzz run <target> -- -max_total_time=300` | fuzzing (Linux); target: `doc_piece_table`, `ppt_records`, `rtf`, `protocol_frame` (vedi `fuzz/README.md`) |
 
-Nota: i test `#[ignore]` di `context_menu.rs` e `windows_ffi.rs` sono figli di altri test e non si lanciano a mano; l'unico `#[ignore]` di misura è `sort_200k_timing`.
+Nota: i test `#[ignore]` di `context_menu.rs` e `windows_ffi.rs` sono figli di altri test e non si lanciano a mano. Ogni misura ha un solo test `#[ignore]`, quello del livello 3 (`crates/lynkeus-engine/tests/prestazioni.rs`, `crates/lynkeus-app/tests/prestazioni_interfaccia.rs` e, per P-04, `prepared_filter_timing` in `filter.rs`); i test di sistema `#[ignore]` di `sistema.rs` sono la parte automatica di M-22, M-24 e M-26.
 
 Copertura per area (nomi verificati nel codice):
 
@@ -182,8 +182,8 @@ Totale livello 2: 14 (A) + 10 (B) + 13 (C) + 13 (D) = 50 test, di cui 9 derivati
 | P-03 | `p03_and_retained_hits_memory` | 16 file con 300.000 "il", AND con "zzz"; 5 ripetizioni; picco di memoria privata | nessun risultato; massimo sotto il budget di 256 MiB | B-02 |
 | P-04 | Filtro di 32 estensioni su 100.000 nomi | `criterion` con `black_box`, prima e dopo il filtro compilato | nessuna allocazione nel ciclo; miglioramento oltre il rumore | B-11 |
 | P-05 | Cache contro estrazione sui documenti demo | p50 e p95 della seconda ricerca contro la prima | la seconda più veloce, p95 riportato | B-12 |
-| P-06 | `sort_200k_timing` | `cargo test --release -p lynkeus-app --lib sort_200k_timing -- --ignored --nocapture` | < 50 ms per colonna (obiettivo del codice) | regola 31 |
-| P-07 | `step_target_200k` | Test `#[ignore]` da scrivere, 200.000 righe, release | < 1 ms per chiamata | C-08 |
+| P-06 | `p06_sort_200k` | Ordinamento finale di 200.000 righe per ognuna delle 5 colonne (15 ripetizioni per colonna) e, durante la ricerca, inserimento a lotti di 5000 righe (`batch_max_ms`) | p95 < 50 ms; lotto più lento < 50 ms (obiettivo del codice) | regola 31 |
+| P-07 | `p07_step_target_200k` | `step_target` con 200.000 righe, per file e per parola, cursore all'inizio, a metà e in fondo | < 1 ms per chiamata | C-08 |
 | P-08 | `p08_copy_200k` | Con 200.000 risultati: copia delle righe che stanno in 8 MiB (`MAX_CLIPBOARD_BYTES`), fino alla scrittura negli appunti di sistema, e copia di tutte le righe, che va rifiutata; blocco più lungo del thread UI, durata del rifiuto, picco di memoria. Il testo che c'era negli appunti torna lì alla fine, anche se la misura fallisce | thread UI libero (nessun blocco oltre 100 ms); rifiuto entro 1 s, senza toccare gli appunti | C-07 |
 | P-09 | Primo frame e risposta a un tasto | Tempo dal tasto al ridisegno con 200.000 risultati | < 100 ms (regola 40) | C-07, C-08 |
 
