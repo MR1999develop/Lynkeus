@@ -174,6 +174,8 @@ column-sort-tooltip = Ordina per questa colonna; un altro clic inverte l'ordine.
 # Nome di una riga dei risultati per i lettori di schermo.
 # $word (testo): parola trovata; $file (testo): file; $location (testo): posizione, es. "riga 12".
 table-row-name = { $word }, { $file }, { $location }
+# Nome della tabella dei risultati per i lettori di schermo.
+table-results-name = Risultati della ricerca
 empty-add-root-title = Da dove cominciamo?
 empty-add-root-text = Aggiungi una cartella o un file in cui cercare: trascinali qui o usa i pulsanti.
 empty-write-term-title = Scrivi che cosa cercare
@@ -332,6 +334,13 @@ notice-reveal-failed = Errore: non è stato possibile mostrare { $file } nella c
 notice-copied = { $count ->
         [one] 1 riga copiata negli appunti.
        *[other] { $count } righe copiate negli appunti.
+    }
+# Al posto della copia, quando il testo supera il limite degli appunti; accanto c'è il
+# bottone Esporta… (menu-export).
+# $count (numero): righe selezionate.
+notice-copy-too-large = { $count ->
+        [one] La riga selezionata è troppo lunga per gli appunti: salvala in un file con Esporta.
+       *[other] Le { $count } righe selezionate sono troppe per gli appunti: salvale in un file con Esporta.
     }
 # $count (numero): righe scritte; $file (testo): file esportato.
 notice-exported = { $count ->

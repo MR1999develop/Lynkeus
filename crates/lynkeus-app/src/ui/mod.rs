@@ -36,7 +36,7 @@ use lynkeus_engine::{DocPath, Notify};
 
 use crate::app::{Application, FileChoice, MAX_HITS_PER_FRAME, Notice, Pump, Tab};
 use crate::diagnostics::LogLevel;
-use crate::export::ExportFormat;
+use crate::export::{ExportFormat, ExportScope, ExportSettings};
 use crate::form::{FormField, RootKind};
 use crate::i18n::Language;
 use crate::results::{ClickKind, SortColumn};
@@ -59,7 +59,14 @@ pub(crate) enum Action {
     InsertTerm(String),
     TermsEdited,
     Sort(SortColumn),
+    /// Clic sulla riga del risultato con quell'indice (non della posizione: vedi
+    /// [`crate::results::ResultsView::click_hit`]).
     ClickRow(usize, ClickKind),
+    /// Doppio clic sulla riga del risultato con quell'indice.
+    DoubleClickRow(usize),
+    /// Il focus della tastiera è arrivato con Tab o F6 sulla riga del risultato con
+    /// quell'indice.
+    FocusRow(usize),
     MoveCursor(isize, bool),
     SetTheme(ThemeChoice),
     SetLanguage(Option<Language>),
@@ -76,6 +83,9 @@ pub(crate) enum Action {
     /// Chiude il dialogo delle impostazioni di esportazione; con `true` le applica ed
     /// esporta.
     CloseExportDialog(bool),
+    /// Apre le impostazioni di esportazione con le sole righe selezionate (righe troppe
+    /// per gli appunti).
+    ExportSelection,
 }
 
 /// Chi avvisare quando un lavoro in background finisce: un nuovo frame.
@@ -165,7 +175,9 @@ impl eframe::App for Application {
 
     fn on_exit(&mut self) {
         if let Err(error) = self.save_settings() {
-            tracing::warn!(%error, "impostazioni non salvate");
+            // Con la causa: per esempio il file ancora in scrittura in un altro thread.
+            let error = anyhow::Error::from(error);
+            tracing::warn!(error = format!("{error:#}"), "impostazioni non salvate");
         }
         // Nessun thread di ricerca usa più i processi estrattori mentre si chiudono.
         self.cancel_search_and_wait();
@@ -404,7 +416,13 @@ fn apply(app: &mut Application, ctx: &egui::Context, frame: &eframe::Frame, acti
         }
         Action::TermsEdited => app.clear_start_error(),
         Action::Sort(column) => app.sort_by(column),
-        Action::ClickRow(position, kind) => app.view_mut().click(position, kind),
+        Action::ClickRow(hit, kind) => app.view_mut().click_hit(hit, kind),
+        Action::DoubleClickRow(hit) => {
+            if app.view_mut().double_click_hit(hit) {
+                run_command(app, ctx, frame, Command::Open);
+            }
+        }
+        Action::FocusRow(hit) => app.view_mut().focus_hit(hit),
         Action::MoveCursor(delta, extend) => app.view_mut().move_cursor(delta, extend),
         Action::SetTheme(choice) => {
             app.set_theme(choice);
@@ -420,6 +438,16 @@ fn apply(app: &mut Application, ctx: &egui::Context, frame: &eframe::Frame, acti
         Action::UndoFiltersReset => app.undo_filters_reset(),
         Action::DismissNotice(index) => app.dismiss_notice(index),
         Action::Reveal(doc) => app.reveal(&doc, &repaint(ctx)),
+        Action::ExportSelection => {
+            if Command::ExportSettings.availability(app).is_ok() {
+                // L'utente conferma formato e righe, poi sceglie il file.
+                let settings = ExportSettings {
+                    scope: ExportScope::Selected,
+                    ..app.export_settings().clone()
+                };
+                app.view_state.export_dialog = Some(settings);
+            }
+        }
         Action::CloseExportDialog(confirmed) => {
             let draft = app.view_state.export_dialog.take();
             if let (true, Some(settings)) = (confirmed, draft) {

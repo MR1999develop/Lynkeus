@@ -51,6 +51,13 @@ pub enum Notice {
         /// Quante.
         rows: usize,
     },
+    /// Righe selezionate troppe per gli appunti
+    /// ([`MAX_CLIPBOARD_BYTES`](crate::app::MAX_CLIPBOARD_BYTES)): il messaggio propone
+    /// Esporta.
+    CopyTooLarge {
+        /// Quante.
+        rows: usize,
+    },
     /// Esportazione riuscita.
     Exported {
         /// Righe scritte.
@@ -122,6 +129,7 @@ impl Notice {
             | Notice::OpenFailed { .. }
             | Notice::RevealFailed { .. }
             | Notice::Copied { .. }
+            | Notice::CopyTooLarge { .. }
             | Notice::Exported { .. }
             | Notice::ExportFailed { .. }
             | Notice::NoThread
@@ -168,6 +176,12 @@ impl Notices {
         if index < self.items.len() {
             self.items.remove(index);
         }
+    }
+
+    /// Toglie i messaggi che `gone` riconosce, dovunque siano: il problema che dicevano non
+    /// c'è più. Gli altri restano nel loro ordine.
+    pub(crate) fn withdraw(&mut self, gone: impl Fn(&Notice) -> bool) {
+        self.items.retain(|notice| !gone(notice));
     }
 
     /// Toglie e restituisce il più recente, se `wanted` lo accetta.
@@ -243,6 +257,19 @@ mod tests {
                 Notice::SettingsReplaced,
             ]
         );
+    }
+
+    /// Un messaggio ritirato sparisce dovunque sia nella coda; gli altri restano in ordine.
+    #[test]
+    fn a_withdrawn_notice_disappears() {
+        let mut notices = Notices::default();
+        notices.push(Notice::SettingsNotSaved(SettingsProblem::WriteFailed));
+        notices.push(Notice::CacheNotWritten);
+        notices.push(copied(2));
+        notices.withdraw(|notice| matches!(notice, Notice::SettingsNotSaved(_)));
+        assert_eq!(notices.all(), [copied(2), Notice::CacheNotWritten]);
+        notices.withdraw(|notice| matches!(notice, Notice::SettingsNotSaved(_)));
+        assert_eq!(notices.all().len(), 2, "niente da ritirare: nulla cambia");
     }
 
     #[test]

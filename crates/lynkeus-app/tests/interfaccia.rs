@@ -15,8 +15,10 @@ use egui::{Color32, Key, Role};
 use egui_kittest::Harness;
 use egui_kittest::kittest::{NodeT, Queryable};
 use fluent_templates::fluent_bundle::FluentValue;
+use lynkeus_app::export::ExportScope;
 use lynkeus_app::i18n::{I18n, Language};
 use lynkeus_app::preview::Loaded;
+use lynkeus_app::results::{SortColumn, SortOrder, SortSpec};
 use lynkeus_app::settings::{ExtensionMode, FilterSettings, LayoutSettings};
 use lynkeus_app::theme::SystemContrast;
 use lynkeus_app::{Application, Notice, PreviewState, Settings, Tab, setup_context};
@@ -25,6 +27,10 @@ use lynkeus_app::{Application, Notice, PreviewState, Settings, Tab, setup_contex
 const SEARCH_DEADLINE: Duration = Duration::from_secs(60);
 /// Pausa tra due frame mentre il worker lavora: la ricerca gira su un altro thread.
 const FRAME_PAUSE: Duration = Duration::from_millis(5);
+/// Frame concessi a `Harness::run` per assestarsi. I thread dell'app (anteprima, verifica
+/// delle radici) chiedono un frame quando finiscono, in un momento che dipende dal carico:
+/// con il limite predefinito di egui_kittest (4) i test fallivano a caso.
+const MAX_SETTLE_STEPS: u64 = 12;
 
 fn demo_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/demo")
@@ -56,6 +62,7 @@ fn harness_with(settings: Settings) -> (Harness<'static, Application>, I18n) {
     let i18n = app.i18n().clone();
     let harness = Harness::builder()
         .with_size(egui::vec2(1280.0, 800.0))
+        .with_max_steps(MAX_SETTLE_STEPS)
         .build_eframe(move |cc| {
             setup_context(&cc.egui_ctx, &app);
             app
@@ -448,6 +455,170 @@ fn f6_moves_between_panes() {
     );
 }
 
+/// R-01: con un ordinamento scelto le righe che entrano sopra durante la ricerca non
+/// spostano quelle in vista: la tabella scorre di altrettante righe.
+#[test]
+fn rows_arriving_above_do_not_move_the_visible_ones() {
+    // Per posizione decrescente ogni lotto di righe (righe del file più avanti) entra in
+    // cima; 5.000 righe per frame, quindi molti frame.
+    let dir = many_words("parole.txt", 60_000);
+    let (mut harness, i18n) = harness_with(Settings {
+        language: Some(Language::Italian),
+        layout: LayoutSettings {
+            sort: Some(SortSpec {
+                column: SortColumn::Position,
+                order: SortOrder::Descending,
+            }),
+            ..LayoutSettings::default()
+        },
+        ..Settings::default()
+    });
+    start_search(&mut harness, &i18n, dir.path(), "ar");
+    step_until(&mut harness, "prime righe", |app| !app.view().is_empty());
+    harness.step();
+    // Una riga in vista, con il suo nome (la riga del file) e dove sta sullo schermo.
+    let watched = |harness: &Harness<'static, Application>| -> Vec<(String, f32)> {
+        harness
+            .get_all_by_role(Role::Row)
+            .filter_map(|row| Some((row.accesskit_node().label()?, row.rect().top())))
+            .collect()
+    };
+    let before = watched(&harness);
+    let (name, top) = before.get(3).cloned().expect("righe in vista");
+    let shown = harness.state().view().len();
+    step_until(&mut harness, "altre righe sopra", |app| {
+        app.view().len() > shown
+    });
+    harness.step();
+    let after = watched(&harness);
+    let moved = after
+        .iter()
+        .find(|(label, _)| *label == name)
+        .map(|(_, y)| *y);
+    assert!(
+        moved.is_some_and(|y| (y - top).abs() < 0.5),
+        "{name:?} era a {top}, ora {moved:?}"
+    );
+
+    harness.state_mut().cancel_search();
+    step_until(&mut harness, "fine della ricerca", |app| {
+        !app.is_searching()
+    });
+}
+
+/// R-05: il messaggio delle righe troppe per gli appunti offre "Esporta…", che apre le
+/// impostazioni di esportazione con le sole righe selezionate.
+#[test]
+fn rows_too_many_for_the_clipboard_offer_to_export_the_selection() {
+    let (mut harness, i18n) = harness(Language::Italian);
+    search_ar_in_demo(&mut harness, &i18n);
+    harness.state_mut().view_mut().select_all();
+    harness
+        .state_mut()
+        .set_notice(Notice::CopyTooLarge { rows: 9 });
+    harness.run();
+    harness.get_by_label(&i18n.tr_args("notice-copy-too-large", &[("count", 9.into())]));
+    harness
+        .get_by_role_and_label(Role::Button, &i18n.tr("menu-export"))
+        .click();
+    harness.run();
+    let draft = harness.state().view_state.export_dialog.clone();
+    assert_eq!(
+        draft.map(|settings| settings.scope),
+        Some(ExportScope::Selected)
+    );
+    assert_eq!(harness.state().notice(), None, "messaggio chiuso");
+}
+
+/// R-02: il focus che arriva alla tabella con F6 porta lì il cursore e lascia la
+/// selezione: Ctrl+A, F6 fino alla tabella, Ctrl+C copia tutte le righe.
+#[test]
+fn f6_into_the_table_keeps_the_selection() {
+    focus_key_keeps_the_selection(Key::F6, 3);
+}
+
+/// R-02: lo stesso con Tab.
+#[test]
+fn tab_into_the_table_keeps_the_selection() {
+    focus_key_keeps_the_selection(Key::Tab, 40);
+}
+
+/// Ctrl+A, poi `key` (al più `presses` volte) finché una riga ha il focus: il cursore è
+/// sulla riga con il focus, la selezione è intatta e Ctrl+C copia tutte le righe.
+fn focus_key_keeps_the_selection(key: Key, presses: usize) {
+    let (mut harness, i18n) = harness(Language::Italian);
+    search_ar_in_demo(&mut harness, &i18n);
+    let rows = harness.state().view().len();
+    assert!(rows > 1, "servono più righe: {rows}");
+    harness.key_press_modifiers(egui::Modifiers::COMMAND, Key::A);
+    harness.run();
+    assert_eq!(harness.state().view().selected_count(), rows, "Ctrl+A");
+
+    // La posizione della riga con il focus, se una riga ce l'ha.
+    let focused_row = |harness: &Harness<'static, Application>| {
+        harness
+            .get_all_by_role(Role::Row)
+            .find(egui_kittest::Node::is_focused)
+            .map(|row| row.accesskit_node().data().row_index())
+    };
+    for _ in 0..presses {
+        if focused_row(&harness).is_some() {
+            break;
+        }
+        harness.key_press(key);
+        harness.run();
+    }
+    let focused = focused_row(&harness).expect("una riga con il focus");
+    assert_eq!(
+        harness.state().view().selected_count(),
+        rows,
+        "selezione intatta"
+    );
+    let cursor = harness.state().view().cursor_position();
+    assert!(cursor.is_some(), "il focus porta il cursore sulla riga");
+    assert_eq!(focused, cursor, "il cursore è sulla riga con il focus");
+
+    harness.input_mut().events.push(egui::Event::Copy);
+    step_until(&mut harness, "copia di tutte le righe", |app| {
+        matches!(app.notice(), Some(Notice::Copied { .. }))
+    });
+    assert_eq!(harness.state().notice(), Some(&Notice::Copied { rows }));
+}
+
+/// R-06: per i lettori di schermo la tabella è una griglia con il numero di righe, e ogni
+/// riga ne è figlia con la sua posizione ("riga x di y").
+#[test]
+fn the_table_is_a_grid_of_positioned_rows() {
+    let (mut harness, i18n) = harness(Language::Italian);
+    search_ar_in_demo(&mut harness, &i18n);
+    let total = harness.state().view().len();
+    let grid = harness.get_by_role(Role::Grid);
+    let node = grid.accesskit_node();
+    assert_eq!(node.label(), Some(i18n.tr("table-results-name")));
+    assert_eq!(node.data().row_count(), Some(total));
+    assert_eq!(node.size_of_set(), Some(total));
+    assert!(node.is_multiselectable());
+    let rows: Vec<_> = grid
+        .children()
+        .filter(|child| child.accesskit_node().role() == Role::Row)
+        .collect();
+    assert_eq!(
+        rows.len(),
+        total,
+        "tutte le righe in vista, figlie della griglia"
+    );
+    assert_eq!(
+        harness.get_all_by_role(Role::Row).count(),
+        total,
+        "nessuna altrove"
+    );
+    for (position, row) in rows.iter().enumerate() {
+        let row = row.accesskit_node();
+        assert_eq!(row.data().row_index(), Some(position));
+        assert_eq!(row.position_in_set(), Some(position));
+    }
+}
+
 /// C-P6: un paragrafo lungo nell'anteprima va a capo invece di scorrere in orizzontale.
 #[test]
 fn long_preview_lines_wrap() {
@@ -653,6 +824,7 @@ fn regaining_focus_rereads_the_system_contrast() {
     app.set_system_contrast(Some(stale));
     let mut harness = Harness::builder()
         .with_size(egui::vec2(1280.0, 800.0))
+        .with_max_steps(MAX_SETTLE_STEPS)
         .build_eframe(move |cc| {
             setup_context(&cc.egui_ctx, &app);
             app
