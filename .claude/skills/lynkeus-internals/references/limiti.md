@@ -9,17 +9,20 @@
 | Rilevamento binari | NUL nei primi 8 KB (senza schema UTF-16) o firma nota |
 | Lettura dei file di testo | blocchi di circa 8 MB tagliati a fine riga; la codifica si decide sul primo blocco; una riga più lunga di un blocco si taglia dopo l'ultimo spazio (file con soli CR = una riga); passi di ricerca di 10.000 righe e 1 MiB |
 | Dimensione massima di un file | 200 MiB (modificabile o senza limite); vale anche per le radici; in `settings.toml` da 1 a 1.048.576 MiB |
-| Luoghi di ricerca | al più 256 (`MAX_ROOTS`, `form.rs`); vale per l'elenco, per i percorsi dell'istanza unica e per `roots` di `settings.toml` (oltre, scartati); il 257° non entra e compare l'avviso `notice-roots-limit` |
+| Luoghi di ricerca (radici) | al più 256 (`MAX_ROOTS`, `form.rs`); vale per l'elenco, per i percorsi dell'istanza unica e per `roots` di `settings.toml` (oltre, scartati); il 257° non entra e compare l'avviso `notice-roots-limit` |
 | Termini | 32 per ricerca, 256 caratteri ciascuno (spazi esterni esclusi) |
 | Estensioni nei filtri | 32 caratteri, senza punti interni |
 | Recenti | 10 radici, 10 termini |
 | `settings.toml` | letto fino a 1 MiB, elenchi fino a 256 voci, stringhe fino a 4096 byte |
 | Processi estrattori | `min(core/2, 4)`, avviati al primo documento |
 | Timeout per file | 60 s, poi processo terminato e sostituito |
-| Annulla | richiesta di stop (chiusura stdin), chiusura forzata dopo 500 ms; risposta attesa entro 1 s |
+| Annulla | la ricerca chiude lo stdin dei processi e risponde subito (`Stopped`); il thread del pool termina i processi che non escono entro 500 ms (`STOP_GRACE`) e li raccoglie in altri 500 ms. Budget dei test: 1 s dall'Annulla a `Finished`, anche con la CPU satura (`tests/annulla.rs`) |
 | Memoria per processo estrattore | 1 GiB (minimo accettato dal figlio 64 MiB); Windows: memoria impegnata, Job Object; Linux: `RLIMIT_AS` |
-| Messaggio del protocollo | 16 MiB per frame (lunghezza, versione e corpo) |
-| Coda dei messaggi per processo | 16 messaggi non ancora consumati |
+| Messaggio del protocollo | 1,25 MiB per frame (`MAX_FRAME_BYTES`, versione e corpo: un'unità di testo o un pezzo di voce da 1 MiB più 256 KiB di margine) |
+| Unità di testo | 1 MiB (`MAX_UNIT_TEXT_BYTES`); il padre lo rivalida, come la profondità delle voci |
+| Fogli di calcolo ods e xls | memoria stimata in byte, al più 512 MiB (`MAX_WORKBOOK_BYTES`, `extract/sheet_memory.rs`); oltre, avviso "memoria". Conta: il rettangolo di ogni foglio (un valore per cella, più il testo di ogni cella, clonato per ogni ripetizione), le stringhe condivise (SST) degli xls e, per il foglio più grande, la parte transitoria (celle lette o copia del rettangolo). Le formule degli xls si svuotano prima di misurare. Gli xlsx si leggono a flusso, senza questa stima. Sta dentro il limite di 1 GiB del processo: ci stanno un xls denso di 65.536 righe per 40 colonne e un ods di 100.000 per 40 con valori brevi. Falso positivo noto: un xls con record sovrapposti, dove una formula sfugge allo svuotamento, è rifiutato con lo stesso avviso |
+| Appunti | al più 8 MiB di testo (`MAX_CLIPBOARD_BYTES`, `app.rs`); oltre, niente appunti e un messaggio propone Esporta con le sole righe selezionate |
+| Coda dei messaggi per processo | 16 messaggi non ancora consumati (con frame da 1,25 MiB, al più circa 20 MiB) |
 | Archivi: profondità | 5 |
 | Archivi: voci | 100.000 |
 | Archivi: byte per voce | 512 MB |
