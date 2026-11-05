@@ -41,6 +41,8 @@ menu-next-in-file = Risultato successivo nel file
 menu-previous-in-file = Risultato precedente nel file
 menu-next-file = File successivo
 menu-previous-file = File precedente
+menu-next-pane = Riquadro successivo
+menu-previous-pane = Riquadro precedente
 theme-system = Come il sistema
 theme-light = Chiaro
 theme-dark = Scuro
@@ -68,6 +70,8 @@ reason-first-file = È il primo file dei risultati.
 reason-nothing-to-export = Non ci sono risultati da esportare.
 reason-export-running = Un'esportazione è già in corso.
 reason-export-no-selection = Nessuna riga selezionata: selezionane qualcuna, o scegli "Tutte le righe" in Impostazioni di esportazione.
+reason-dialog-open = Una finestra di dialogo è già aperta.
+reason-copy-running = Una copia negli appunti è già in corso.
 
 ## Modulo di ricerca
 
@@ -124,6 +128,8 @@ filters-reset = Ripristina i filtri predefiniti
 action-search = Cerca
 action-cancel = Annulla
 action-close = Chiudi
+# Bottone accanto a un messaggio: rimette com'era prima.
+action-undo = Annulla
 drop-hint = Rilascia per aggiungere all'elenco
 dialog-add-folder = Aggiungi cartelle in cui cercare
 dialog-add-file = Aggiungi file in cui cercare
@@ -149,6 +155,8 @@ error-extension-invalid = "{ $extension }" non è un'estensione valida: scrivila
 # $extension (testo): l'estensione scritta; $max (numero): caratteri ammessi.
 error-extension-too-long = "{ $extension }" è troppo lunga: al massimo { $max } caratteri.
 error-start-failed = Non è stato possibile avviare la ricerca: il sistema non ha risorse libere. Chiudi qualche programma e riprova.
+# Sotto la barra di stato quando Cerca non parte per un campo sbagliato.
+error-form-invalid = Ricerca non avviata: correggi i campi segnalati nel pannello di ricerca.
 
 ## Schede, tabelle e stati vuoti
 
@@ -163,6 +171,9 @@ column-position = Posizione
 column-context = Contesto
 column-reason = Motivo
 column-sort-tooltip = Ordina per questa colonna; un altro clic inverte l'ordine.
+# Nome di una riga dei risultati per i lettori di schermo.
+# $word (testo): parola trovata; $file (testo): file; $location (testo): posizione, es. "riga 12".
+table-row-name = { $word }, { $file }, { $location }
 empty-add-root-title = Da dove cominciamo?
 empty-add-root-text = Aggiungi una cartella o un file in cui cercare: trascinali qui o usa i pulsanti.
 empty-write-term-title = Scrivi che cosa cercare
@@ -171,6 +182,11 @@ empty-searching-title = Ricerca in corso…
 empty-searching-text = Le parole trovate compariranno qui man mano.
 empty-none-title = Nessuna parola trovata
 empty-none-text = Prova un termine più corto, i caratteri jolly, "Ignora gli accenti", o controlla i filtri.
+empty-cancelled-title = Ricerca annullata
+empty-cancelled-text = La ricerca è stata annullata prima di trovare parole. Per ripeterla premi "Ripeti la ricerca" o F5.
+empty-interrupted-title = Ricerca interrotta
+empty-interrupted-text = La ricerca si è interrotta per un errore interno prima di trovare parole. Ripetila; se succede ancora, segnala il problema.
+empty-search-again = Ripeti la ricerca
 warnings-empty = Nessun avviso: tutti i file sono stati letti.
 banner-limit-title = Troppi risultati.
 # $max (numero): limite dei risultati.
@@ -205,7 +221,7 @@ mail-part-body = testo
 ## Stato
 
 status-idle = Pronto.
-# $searched, $hits, $skipped, $binary, $warnings, $seconds (numeri).
+# $searched (numero): file letti; $hits (numero): parole trovate; $skipped (numero): file saltati; $binary (numero): file binari; $warnings (numero): avvisi; $seconds (numero): secondi trascorsi.
 status-running = Ricerca in corso: { $searched ->
         [one] 1 file letto
        *[other] { $searched } file letti
@@ -222,7 +238,7 @@ status-running = Ricerca in corso: { $searched ->
         [one] 1 avviso
        *[other] { $warnings } avvisi
     } ({ $seconds } s)
-# Come status-running.
+# Stesse variabili di status-running.
 status-completed = Ricerca completata: { $searched ->
         [one] 1 file letto
        *[other] { $searched } file letti
@@ -239,7 +255,7 @@ status-completed = Ricerca completata: { $searched ->
         [one] 1 avviso
        *[other] { $warnings } avvisi
     } ({ $seconds } s)
-# Come status-running.
+# $searched, $hits, $seconds come in status-running.
 status-cancelled = Ricerca annullata: { $searched ->
         [one] 1 file letto
        *[other] { $searched } file letti
@@ -265,6 +281,8 @@ status-selected = { $count ->
         [one] 1 riga selezionata
        *[other] { $count } righe selezionate
     }
+# Nella barra di stato mentre la copia di molte righe è in preparazione.
+status-copying = Copia delle righe negli appunti…
 
 ## Avvisi
 
@@ -323,6 +341,11 @@ notice-exported = { $count ->
 # $file (testo): file che si voleva scrivere.
 notice-export-failed = Errore: esportazione in { $file } non riuscita; un file già presente non è stato toccato. Scegli un'altra cartella o controlla lo spazio libero.
 notice-no-thread = Errore: il sistema non ha risorse libere. Chiudi qualche programma e riprova.
+notice-filters-reset = Filtri riportati ai valori predefiniti.
+notice-settings-newer = Attenzione: le impostazioni sono state salvate da una versione più recente di Lynkeus Searcher e non verranno sovrascritte: le modifiche fatte ora non si salvano. Aggiorna il programma per conservarle.
+notice-settings-unreadable = Attenzione: il file delle impostazioni non si è potuto leggere (permessi o dimensione) e non verrà sovrascritto: le modifiche fatte ora non si salvano. Controlla il file settings.toml nella cartella dell'app.
+notice-settings-write-failed = Errore: le impostazioni non si sono salvate. Controlla lo spazio libero e i permessi della cartella dell'app; il salvataggio si riprova più tardi.
+notice-settings-replaced = Attenzione: il file delle impostazioni era danneggiato ed è stato messo da parte come settings.toml.invalid; si riparte dalle impostazioni predefinite.
 
 ## Esportazione
 
@@ -393,29 +416,3 @@ log-level-error = Solo errori
 log-level-warn = Errori e avvisi
 log-level-info = Anche le informazioni
 log-level-debug = Tutto (per la diagnosi)
-
-## Area C: interfaccia (accessibilità, stati, messaggi)
-
-# Sotto la barra di stato quando Cerca non parte per un campo sbagliato.
-error-form-invalid = Ricerca non avviata: correggi i campi segnalati nel pannello di ricerca.
-# Nella barra di stato mentre la copia di molte righe è in preparazione.
-status-copying = Copia delle righe negli appunti…
-empty-cancelled-title = Ricerca annullata
-empty-cancelled-text = La ricerca è stata annullata prima di trovare parole. Per ripeterla premi "Ripeti la ricerca" o F5.
-empty-interrupted-title = Ricerca interrotta
-empty-interrupted-text = La ricerca si è interrotta per un errore interno prima di trovare parole. Ripetila; se succede ancora, segnala il problema.
-empty-search-again = Ripeti la ricerca
-notice-filters-reset = Filtri riportati ai valori predefiniti.
-# Bottone accanto a un messaggio: rimette com'era prima.
-action-undo = Annulla
-notice-settings-newer = Attenzione: le impostazioni sono state salvate da una versione più recente di Lynkeus Searcher e non verranno sovrascritte: le modifiche fatte ora non si salvano. Aggiorna il programma per conservarle.
-notice-settings-unreadable = Attenzione: il file delle impostazioni non si è potuto leggere (permessi o dimensione) e non verrà sovrascritto: le modifiche fatte ora non si salvano. Controlla il file settings.toml nella cartella dell'app.
-notice-settings-write-failed = Errore: le impostazioni non si sono salvate. Controlla lo spazio libero e i permessi della cartella dell'app; il salvataggio si riprova più tardi.
-notice-settings-replaced = Attenzione: il file delle impostazioni era danneggiato ed è stato messo da parte come settings.toml.invalid; si riparte dalle impostazioni predefinite.
-reason-dialog-open = Una finestra di dialogo è già aperta.
-reason-copy-running = Una copia negli appunti è già in corso.
-menu-next-pane = Riquadro successivo
-menu-previous-pane = Riquadro precedente
-# Nome di una riga dei risultati per i lettori di schermo.
-# $word (testo): parola trovata; $file (testo): file; $location (testo): posizione, es. "riga 12".
-table-row-name = { $word }, { $file }, { $location }

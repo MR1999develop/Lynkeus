@@ -41,6 +41,8 @@ menu-next-in-file = Next result in file
 menu-previous-in-file = Previous result in file
 menu-next-file = Next file
 menu-previous-file = Previous file
+menu-next-pane = Next pane
+menu-previous-pane = Previous pane
 theme-system = Same as system
 theme-light = Light
 theme-dark = Dark
@@ -68,6 +70,8 @@ reason-first-file = This is the first file in the results.
 reason-nothing-to-export = There are no results to export.
 reason-export-running = An export is already running.
 reason-export-no-selection = No rows selected: select some, or choose "All rows" in Export settings.
+reason-dialog-open = A dialog is already open.
+reason-copy-running = Rows are already being copied to the clipboard.
 
 ## Search form
 
@@ -124,6 +128,8 @@ filters-reset = Restore the default filters
 action-search = Search
 action-cancel = Cancel
 action-close = Close
+# Button next to a message: puts things back as they were.
+action-undo = Undo
 drop-hint = Drop to add to the list
 dialog-add-folder = Add folders to search in
 dialog-add-file = Add files to search in
@@ -149,6 +155,8 @@ error-extension-invalid = "{ $extension }" is not a valid extension: write it wi
 # $extension (text): the extension typed; $max (number): allowed characters.
 error-extension-too-long = "{ $extension }" is too long: at most { $max } characters.
 error-start-failed = The search could not start: the system is out of resources. Close some programs and try again.
+# In the status bar when Search does not start because of a wrong field.
+error-form-invalid = Search not started: fix the fields marked in the search panel.
 
 ## Tabs, tables and empty states
 
@@ -163,6 +171,9 @@ column-position = Location
 column-context = Context
 column-reason = Reason
 column-sort-tooltip = Sort by this column; click again to reverse the order.
+# Name of a result row for screen readers.
+# $word (text): word found; $file (text): file; $location (text): location, e.g. "line 12".
+table-row-name = { $word }, { $file }, { $location }
 empty-add-root-title = Where shall we start?
 empty-add-root-text = Add a folder or a file to search in: drop them here or use the buttons.
 empty-write-term-title = Type what to find
@@ -171,6 +182,11 @@ empty-searching-title = Searching…
 empty-searching-text = The words found will appear here as they come.
 empty-none-title = No words found
 empty-none-text = Try a shorter term, wildcards, "Ignore accents", or check the filters.
+empty-cancelled-title = Search cancelled
+empty-cancelled-text = The search was cancelled before finding any words. To run it again, press "Search again" or F5.
+empty-interrupted-title = Search interrupted
+empty-interrupted-text = The search stopped because of an internal error before finding any words. Run it again; if it happens again, please report the problem.
+empty-search-again = Search again
 warnings-empty = No warnings: every file was read.
 banner-limit-title = Too many results.
 # $max (number): result limit.
@@ -205,7 +221,7 @@ mail-part-body = body
 ## Status
 
 status-idle = Ready.
-# $searched, $hits, $skipped, $binary, $warnings, $seconds (numbers).
+# $searched (number): files read; $hits (number): words found; $skipped (number): files skipped; $binary (number): binary files; $warnings (number): warnings; $seconds (number): elapsed seconds.
 status-running = Searching: { $searched ->
         [one] 1 file read
        *[other] { $searched } files read
@@ -222,7 +238,7 @@ status-running = Searching: { $searched ->
         [one] 1 warning
        *[other] { $warnings } warnings
     } ({ $seconds } s)
-# Same as status-running.
+# Same variables as status-running.
 status-completed = Search complete: { $searched ->
         [one] 1 file read
        *[other] { $searched } files read
@@ -239,7 +255,7 @@ status-completed = Search complete: { $searched ->
         [one] 1 warning
        *[other] { $warnings } warnings
     } ({ $seconds } s)
-# Same as status-running.
+# $searched, $hits, $seconds as in status-running.
 status-cancelled = Search cancelled: { $searched ->
         [one] 1 file read
        *[other] { $searched } files read
@@ -253,18 +269,32 @@ status-worker-lost = The search stopped because of an internal error. Try again;
 # $file (text): path of the file being read.
 status-current-file = Reading: { $file }
 # $done (number): files already examined; $seen (number): files found so far (the total is not known).
-status-progress = { $done } of { $seen } files found so far
+status-progress = { $done } of { $seen ->
+        [one] 1 file
+       *[other] { $seen } files
+    } found so far
 # $done (number): files already examined; $total (number): files to examine in all (the folder scan has finished).
-status-progress-total = { $done } of { $total } files
+status-progress-total = { $done } of { $total ->
+        [one] 1 file
+       *[other] { $total } files
+    }
 # $done and $total as in status-progress-total; $seconds (number): estimated seconds left.
-status-progress-seconds-left = { $done } of { $total } files, about { $seconds } s left
+status-progress-seconds-left = { $done } of { $total ->
+        [one] 1 file
+       *[other] { $total } files
+    }, about { $seconds } s left
 # $done and $total as in status-progress-total; $minutes (number): estimated minutes left.
-status-progress-minutes-left = { $done } of { $total } files, about { $minutes } min left
+status-progress-minutes-left = { $done } of { $total ->
+        [one] 1 file
+       *[other] { $total } files
+    }, about { $minutes } min left
 # $count (number): selected rows.
 status-selected = { $count ->
         [one] 1 row selected
        *[other] { $count } rows selected
     }
+# In the status bar while a copy of many rows is being prepared.
+status-copying = Copying rows to the clipboard…
 
 ## Warnings
 
@@ -323,6 +353,11 @@ notice-exported = { $count ->
 # $file (text): file that was to be written.
 notice-export-failed = Error: export to { $file } failed; an existing file was left untouched. Choose another folder or check the free space.
 notice-no-thread = Error: the system has no free resources. Close some programs and try again.
+notice-filters-reset = Filters restored to their defaults.
+notice-settings-newer = Warning: the settings were saved by a newer version of Lynkeus Searcher and will not be overwritten: changes made now are not saved. Update the program to keep them.
+notice-settings-unreadable = Warning: the settings file could not be read (permissions or size) and will not be overwritten: changes made now are not saved. Check the settings.toml file in the app folder.
+notice-settings-write-failed = Error: the settings were not saved. Check the free space and the permissions of the app folder; saving will be tried again later.
+notice-settings-replaced = Warning: the settings file was damaged and has been set aside as settings.toml.invalid; starting again from the default settings.
 
 ## Export
 
@@ -393,29 +428,3 @@ log-level-error = Errors only
 log-level-warn = Errors and warnings
 log-level-info = Information too
 log-level-debug = Everything (for diagnosis)
-
-## Area C: interface (accessibility, states, messages)
-
-# In the status bar when Search does not start because of a wrong field.
-error-form-invalid = Search not started: fix the fields marked in the search panel.
-# In the status bar while a copy of many rows is being prepared.
-status-copying = Copying rows to the clipboard…
-empty-cancelled-title = Search cancelled
-empty-cancelled-text = The search was cancelled before finding any words. To run it again, press "Search again" or F5.
-empty-interrupted-title = Search interrupted
-empty-interrupted-text = The search stopped because of an internal error before finding any words. Run it again; if it happens again, please report the problem.
-empty-search-again = Search again
-notice-filters-reset = Filters restored to their defaults.
-# Button next to a message: puts things back as they were.
-action-undo = Undo
-notice-settings-newer = Warning: the settings were saved by a newer version of Lynkeus Searcher and will not be overwritten: changes made now are not saved. Update the program to keep them.
-notice-settings-unreadable = Warning: the settings file could not be read (permissions or size) and will not be overwritten: changes made now are not saved. Check the settings.toml file in the app folder.
-notice-settings-write-failed = Error: the settings were not saved. Check the free space and the permissions of the app folder; saving will be tried again later.
-notice-settings-replaced = Warning: the settings file was damaged and has been set aside as settings.toml.invalid; starting again from the default settings.
-reason-dialog-open = A dialog is already open.
-reason-copy-running = Rows are already being copied to the clipboard.
-menu-next-pane = Next pane
-menu-previous-pane = Previous pane
-# Name of a result row for screen readers.
-# $word (text): word found; $file (text): file; $location (text): position, e.g. "line 12".
-table-row-name = { $word }, { $file }, { $location }
