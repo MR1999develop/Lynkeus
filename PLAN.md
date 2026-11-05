@@ -295,14 +295,23 @@ Ogni fase finisce con `cargo xtask check` verde e un commit. Il lavoro si orches
 
 ### Fase 7 — Lingue, integrazione e rilascio
 - [x] Threat model della pipe e del registro
-- [ ] Traduzione inglese completa
-- [ ] Clic destro su Windows e script Nautilus
-- [ ] Istanza unica con pipe autenticata
-- [ ] Cartelle private con descrittore esplicito
-- [ ] Icona (fatta: assets/), manifest, informazioni di versione
-- [ ] `xtask dist` con `SHA256SUMS` e controllo dei percorsi locali
-- [ ] README d'uso e `SECURITY.md`
-- [ ] Verifica finale (sezione Verifica) e commit
+- [x] Traduzione inglese completa
+- [x] Clic destro su Windows e script Nautilus
+- [x] Istanza unica con pipe autenticata
+- [x] Cartelle private con descrittore esplicito
+- [x] Icona, manifest, informazioni di versione
+- [x] `xtask dist` con `SHA256SUMS` e controllo dei percorsi locali
+- [x] README d'uso e `SECURITY.md`
+- [x] Verifica finale (sezione Verifica) e commit
+
+
+### Esito della verifica finale (2026-11-05)
+- `cargo xtask check` e `cargo xtask check-linux` verdi; `cargo xtask dist`: CFG e CETCOMPAT presenti, nessun percorso locale, zip e `SHA256SUMS`.
+- Accettazione automatica su `fixtures/demo` e `fixtures/malevoli`: "ar", `c?rt*`, frase, OR/AND, accenti, maiuscole, cinque avvisi attesi e nessun file scritto fuori.
+- 100.000 file di testo: 0,8–1 s a caldo, 18 MB di memoria del processo principale; la prima esecuzione a freddo (63 s) su file appena creati non è una misura pulita.
+- Ordinamento di 200.000 risultati: 2–52 ms per colonna, in release.
+- Conformità: nessun dato personale nella storia, nei file e nel pacchetto.
+- Non verificato qui: interfaccia e integrazione su Linux (solo compilate; serve la CI su Ubuntu), fluidità dell'interfaccia con 200.000 risultati, Annulla durante un PDF lento.
 
 ## Verifica
 
