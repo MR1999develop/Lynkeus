@@ -10,9 +10,9 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -29,8 +29,8 @@ use crate::instance::InstanceServer;
 use crate::export::{self, ExportScope, ExportSettings};
 use crate::extraction::{self, ExtractionSetup, OpenedEntries, PoolDocumentUnits};
 use crate::form::{
-    FormErrors, MAX_ROOTS, PathInputError, PathInputStatus, RootAdded, RootKind, SearchForm,
-    TermRowError, absolute_root,
+    FilterForm, FormErrors, FormField, MAX_ROOTS, PathInputError, PathInputStatus, RootAdded,
+    RootKind, SearchForm, TermRowError, absolute_root,
 };
 use crate::i18n::{I18n, Language};
 use crate::launch::{
@@ -43,9 +43,9 @@ use crate::results::{ResultsView, SortColumn, SortSpec, Step};
 use crate::root_check::{RootCheck, RootChecks};
 use crate::settings::{
     CACHE_SIZE_MIB_RANGE, CacheSettings, LayoutSettings, Settings, SettingsError, SettingsFile,
-    push_recent,
+    SettingsProblem, push_recent,
 };
-use crate::theme::ThemeChoice;
+use crate::theme::{SystemContrast, ThemeChoice};
 
 /// Righe di risultato inserite al massimo in una chiamata di
 /// [`Application::pump_events`] fatta dalla vista: il frame resta veloce anche con
@@ -54,6 +54,9 @@ pub const MAX_HITS_PER_FRAME: usize = 5_000;
 
 /// Dopo quanto tempo la barra d'avanzamento compare.
 pub const PROGRESS_DELAY: Duration = Duration::from_secs(1);
+
+/// Quanto si aspetta all'uscita un salvataggio delle impostazioni ancora in corso.
+const SETTINGS_SAVE_WAIT: Duration = Duration::from_secs(2);
 
 /// Perché una ricerca non è partita.
 #[derive(Debug, thiserror::Error)]
@@ -84,6 +87,42 @@ pub enum SearchStatus {
     WorkerLost,
 }
 
+/// L'avanzamento da mostrare durante una ricerca.
+///
+/// Il motore conta i file man mano che li trova e non sa quanti ne troverà: il totale non
+/// è mai noto prima della fine, quindi l'avanzamento è indeterminato, con i conteggi.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Progress {
+    /// Totale ignoto: `done` file esaminati su `seen` trovati finora.
+    Indeterminate {
+        /// File letti, saltati o con un avviso.
+        done: u64,
+        /// File trovati finora (almeno `done`).
+        seen: u64,
+    },
+}
+
+impl SearchStatus {
+    /// L'avanzamento da mostrare: solo durante una ricerca, dopo [`PROGRESS_DELAY`].
+    pub fn progress(&self) -> Option<Progress> {
+        let SearchStatus::Running { counts, elapsed } = self else {
+            return None;
+        };
+        if *elapsed < PROGRESS_DELAY {
+            return None;
+        }
+        let done = counts
+            .files_searched
+            .saturating_add(counts.files_skipped)
+            .saturating_add(counts.binary_skipped)
+            .saturating_add(counts.warnings);
+        Some(Progress::Indeterminate {
+            done,
+            seen: counts.files_seen.max(done),
+        })
+    }
+}
+
 /// Esito di [`Application::pump_events`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pump {
@@ -108,8 +147,12 @@ pub enum EmptyState {
     WriteTerm,
     /// Ricerca in corso, ancora nessuna riga.
     Searching,
-    /// Ricerca finita senza righe.
+    /// Ricerca arrivata in fondo senza righe.
     NothingFound,
+    /// Ricerca annullata prima di trovare righe.
+    Cancelled,
+    /// Ricerca interrotta da un errore interno prima di trovare righe.
+    Interrupted,
 }
 
 /// Scheda del pannello centrale.
@@ -129,8 +172,9 @@ pub struct ViewState {
     pub tab: Tab,
     /// Finestra Informazioni aperta.
     pub about_open: bool,
-    /// Richiesta di portare il focus sul primo termine al prossimo frame.
-    pub focus_first_term: bool,
+    /// Richiesta di portare il focus su un campo del modulo al prossimo frame (Ctrl+F, o il
+    /// primo campo sbagliato quando la ricerca non parte).
+    pub focus_field: Option<FormField>,
     /// Richiesta di aprire la sezione Filtri al prossimo frame.
     pub open_filters: bool,
     /// Dialogo "Impostazioni di esportazione" aperto, con la copia che modifica (Annulla
@@ -242,6 +286,25 @@ pub enum Notice {
         /// Il massimo ([`MAX_ROOTS`]).
         max: usize,
     },
+    /// Filtri riportati ai predefiniti; "Annulla" rimette questi.
+    FiltersReset {
+        /// I filtri di prima.
+        previous: Box<FilterForm>,
+    },
+    /// Le modifiche alle impostazioni non arrivano sul disco.
+    SettingsNotSaved(SettingsProblem),
+    /// Il file delle impostazioni non era valido: messo da parte, si riparte dai
+    /// predefiniti.
+    SettingsReplaced,
+}
+
+/// Una scelta fatta in un dialogo di sistema, aperto in un thread.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileChoice {
+    /// Cartelle o file da aggiungere ai luoghi.
+    AddRoots(Vec<PathBuf>),
+    /// Il file in cui esportare.
+    ExportTo(PathBuf),
 }
 
 /// Una modifica della voce del clic destro in corso.
@@ -255,6 +318,18 @@ struct ContextMenuJob {
 struct ContextMenuSetup {
     store: Arc<dyn ContextMenuStore>,
     exe: PathBuf,
+}
+
+/// Una copia negli appunti in preparazione: il testo si costruisce in un thread.
+struct CopyJob {
+    rows: usize,
+    started: Instant,
+    done: Receiver<String>,
+}
+
+/// Un salvataggio delle impostazioni in corso: le impostazioni scritte e l'esito.
+struct SaveJob {
+    done: Receiver<(Settings, Result<(), SettingsError>)>,
 }
 
 /// Un'esportazione in corso.
@@ -304,8 +379,9 @@ pub struct Results {
     pub terms: Vec<String>,
     /// La query compilata della ricerca, per evidenziare l'anteprima.
     pub query: Option<Arc<CompiledQuery>>,
-    /// Le righe, nell'ordine di arrivo.
-    pub hits: Vec<Hit>,
+    /// Le righe, nell'ordine di arrivo; condivise (senza copia) con i thread che copiano
+    /// ed esportano.
+    pub hits: Arc<Vec<Hit>>,
     /// Gli avvisi, nell'ordine di arrivo.
     pub warnings: Vec<Warning>,
 }
@@ -313,9 +389,23 @@ pub struct Results {
 /// L'applicazione: radice dell'albero di proprietà dello stato.
 pub struct Application {
     settings: Settings,
-    settings_file: Option<SettingsFile>,
+    /// Il file delle impostazioni, condiviso con il thread che lo scrive.
+    settings_file: Option<Arc<Mutex<SettingsFile>>>,
     /// Le impostazioni come sono sul disco, per scrivere solo se cambiano.
     saved: Option<Settings>,
+    save_job: Option<SaveJob>,
+    /// Vero se il file letto all'avvio non va riscritto (più recente o illeggibile).
+    settings_blocked: bool,
+    /// Vero dopo il primo salvataggio fallito: il messaggio si mostra una volta.
+    save_failure_reported: bool,
+    copy_job: Option<CopyJob>,
+    /// Testo pronto per gli appunti, che la vista consegna al sistema.
+    clipboard: Option<String>,
+    dialog_job: Option<Receiver<Option<FileChoice>>>,
+    /// Chi avvisare (un nuovo frame) quando un lavoro finisce senza che la vista lo chieda.
+    waker: Notify,
+    /// Colori del tema a contrasto elevato del sistema, se attivo.
+    system_contrast: Option<SystemContrast>,
     i18n: I18n,
     limits: Limits,
     /// Campi del modulo, modificati dalla vista.
@@ -369,6 +459,12 @@ impl Application {
         // Le radici si verificano dopo, fuori dal thread dell'interfaccia.
         let form = SearchForm::from_settings(&settings, |_| RootKind::Pending);
         let saved = settings_file.as_ref().map(|_| settings.clone());
+        let blocked = settings_file.as_ref().and_then(SettingsFile::save_blocked);
+        let notice = match (blocked, &settings_file) {
+            (Some(problem), _) => Some(Notice::SettingsNotSaved(problem)),
+            (None, Some(file)) => file.replaced_invalid().then_some(Notice::SettingsReplaced),
+            (None, None) => None,
+        };
         let mut root_checks = RootChecks::new();
         for root in &form.roots {
             root_checks.request(root.path.clone());
@@ -391,7 +487,7 @@ impl Application {
             archive_extractor: Arc::new(NoArchiveExtraction),
             launch_job: None,
             export_job: None,
-            notice: None,
+            notice,
             document_source: None,
             opened_entries: None,
             cache_job: None,
@@ -401,9 +497,34 @@ impl Application {
             context_menu_job: None,
             log_control: None,
             settings,
-            settings_file,
+            settings_file: settings_file.map(|file| Arc::new(Mutex::new(file))),
             saved,
+            save_job: None,
+            settings_blocked: blocked.is_some(),
+            save_failure_reported: false,
+            copy_job: None,
+            clipboard: None,
+            dialog_job: None,
+            waker: Arc::new(|| {}),
+            system_contrast: None,
         }
+    }
+
+    /// Chi avvisare (di solito la richiesta di un nuovo frame) quando un lavoro avviato
+    /// senza la vista finisce: salvataggio periodico, dialoghi.
+    pub fn set_waker(&mut self, waker: Notify) {
+        self.waker = waker;
+    }
+
+    /// I colori del tema a contrasto elevato del sistema, letti all'avvio dalla piattaforma;
+    /// `None` se il tema non è attivo. La vista li applica con [`crate::setup_context`].
+    pub fn set_system_contrast(&mut self, contrast: Option<SystemContrast>) {
+        self.system_contrast = contrast;
+    }
+
+    /// I colori del tema a contrasto elevato, se attivo.
+    pub fn system_contrast(&self) -> Option<SystemContrast> {
+        self.system_contrast
     }
 
     /// Il traduttore.
@@ -585,13 +706,17 @@ impl Application {
     ///
     /// `notify` è chiamata dal worker a ogni evento (la vista passa `request_repaint`).
     /// L'errore resta anche in [`Application::start_error`] e il modulo mostra da ora gli
-    /// errori dei campi.
+    /// errori dei campi. Con un modulo non valido il pannello di ricerca ricompare, i Filtri
+    /// si aprono se l'errore è lì e il focus va al primo campo da correggere.
     pub fn start_search(&mut self, notify: Notify) -> Result<(), &StartError> {
         self.start_error = None;
         self.form.reveal_all_errors();
         let search = match self.form.validate() {
             Ok(search) => search,
-            Err(errors) => return Err(self.start_error.insert(StartError::Form(errors))),
+            Err(errors) => {
+                self.reveal_form_errors(&errors);
+                return Err(self.start_error.insert(StartError::Form(errors)));
+            }
         };
         let query = search.query.clone();
         let request = SearchRequest {
@@ -611,7 +736,7 @@ impl Application {
             roots: search.roots,
             terms: search.terms,
             query: Some(Arc::new(query)),
-            hits: Vec::new(),
+            hits: Arc::default(),
             warnings: Vec::new(),
         };
         self.view.reset();
@@ -624,6 +749,16 @@ impl Application {
         Ok(())
     }
 
+    /// Porta in vista i campi sbagliati: pannello di ricerca, Filtri se servono, focus sul
+    /// primo campo da correggere.
+    fn reveal_form_errors(&mut self, errors: &FormErrors) {
+        self.layout.search_panel_visible = true;
+        if errors.extensions.is_some() {
+            self.view_state.open_filters = true;
+        }
+        self.view_state.focus_field = errors.first_field();
+    }
+
     /// Chiede di annullare la ricerca in corso; il riepilogo arriverà con gli eventi.
     pub fn cancel_search(&mut self) {
         if let JobState::Running(job) = &self.job {
@@ -634,7 +769,7 @@ impl Application {
     /// Legge gli eventi arrivati, al massimo circa `max_hits` righe di risultato.
     pub fn pump_events(&mut self, max_hits: usize) -> Pump {
         let pump = self.receive(max_hits);
-        self.view.extend_to(self.results.hits.len());
+        self.view.extend_to(&self.results.hits, &self.results.roots);
         if pump == Pump::Ended {
             self.view.finish(&self.results.hits, &self.results.roots);
         }
@@ -648,6 +783,11 @@ impl Application {
         if let Some(current) = job.handle.progress().current_file() {
             self.current_file = Some(current);
         }
+        // Una copia o un'esportazione sta leggendo le righe: gli eventi aspettano in coda
+        // (il motore rallenta) invece di copiare tutte le righe per aggiungerne di nuove.
+        if Arc::strong_count(&self.results.hits) > 1 {
+            return Pump::Drained;
+        }
         let mut inserted = 0usize;
         loop {
             if inserted >= max_hits {
@@ -656,7 +796,7 @@ impl Application {
             match job.handle.try_recv() {
                 Received::Event(SearchEvent::Hits(hits)) => {
                     inserted += hits.len();
-                    self.results.hits.extend(hits);
+                    Arc::make_mut(&mut self.results.hits).extend(hits);
                 }
                 Received::Event(SearchEvent::Warning(warning)) => {
                     self.results.warnings.push(warning);
@@ -833,7 +973,7 @@ impl Application {
 
     /// Dove porta `step` dal cursore (posizione mostrata), se c'è una riga.
     pub fn step_target(&self, step: Step) -> Option<usize> {
-        self.view.step_target(&self.results.hits, step)
+        self.view.step_target(step)
     }
 
     /// Sposta cursore e selezione con `step`; falso se non c'è una riga in quella
@@ -935,16 +1075,76 @@ impl Application {
 
     // --- Copia ed esportazione --------------------------------------------------------
 
-    /// Le righe selezionate come TSV per gli appunti, con il loro numero; `None` senza
-    /// selezione.
-    pub fn selection_tsv(&self) -> Option<(String, usize)> {
+    /// Copia negli appunti le righe selezionate, come TSV: il testo si costruisce in un
+    /// thread; quando è pronto [`Application::take_clipboard_text`] lo consegna alla vista
+    /// e un messaggio dice quante righe. Senza selezione o con una copia in corso non fa
+    /// nulla.
+    pub fn copy_selection(&mut self, notify: &Notify) {
+        if self.copy_job.is_some() {
+            return;
+        }
         let indices: Vec<usize> = self.view.selected_hits().collect();
         if indices.is_empty() {
-            return None;
+            return;
         }
-        let results = &self.results;
-        let table = export::results_table(&self.i18n, &results.hits, &results.terms, indices);
-        Some((export::to_tsv(&table.rows), table.rows.len()))
+        let rows = indices.len();
+        let hits = Arc::clone(&self.results.hits);
+        let terms = self.results.terms.clone();
+        let i18n = self.i18n.clone();
+        let (tx, rx) = mpsc::channel();
+        let notify = Arc::clone(notify);
+        let spawned = thread::Builder::new()
+            .name("copia".to_owned())
+            .spawn(move || {
+                let table = export::results_table(&i18n, &hits, &terms, indices);
+                drop(hits);
+                if tx.send(export::to_tsv(&table.rows)).is_ok() {
+                    notify();
+                }
+            });
+        match spawned {
+            Ok(_) => {
+                self.copy_job = Some(CopyJob {
+                    rows,
+                    started: Instant::now(),
+                    done: rx,
+                });
+            }
+            Err(_) => self.notice = Some(Notice::NoThread),
+        }
+    }
+
+    /// Vero se una copia negli appunti è in preparazione.
+    pub fn is_copying(&self) -> bool {
+        self.copy_job.is_some()
+    }
+
+    /// Da quanto è in preparazione la copia negli appunti, se c'è.
+    pub fn copy_elapsed(&self) -> Option<Duration> {
+        self.copy_job.as_ref().map(|job| job.started.elapsed())
+    }
+
+    /// Il testo pronto per gli appunti, una volta sola: la vista lo consegna al sistema.
+    pub fn take_clipboard_text(&mut self) -> Option<String> {
+        self.clipboard.take()
+    }
+
+    fn poll_copy(&mut self) {
+        let Some(job) = &self.copy_job else {
+            return;
+        };
+        match job.done.try_recv() {
+            Ok(text) => {
+                self.clipboard = Some(text);
+                self.notice = Some(Notice::Copied { rows: job.rows });
+            }
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => {
+                tracing::error!("thread di copia interrotto");
+                self.notice = Some(Notice::NoThread);
+            }
+        }
+        self.copy_job = None;
     }
 
     /// Le ultime scelte di esportazione.
@@ -972,7 +1172,8 @@ impl Application {
 
     /// Esporta in `path` le righe e nel formato delle ultime scelte, in un thread; ricorda
     /// la cartella. La conferma della sovrascrittura l'ha già chiesta il dialogo di
-    /// salvataggio; la scrittura è atomica e il file precedente resta se fallisce.
+    /// salvataggio; la tabella si costruisce e si scrive nel thread, in modo atomico: il
+    /// file precedente resta se fallisce.
     pub fn export_to(&mut self, path: PathBuf, notify: &Notify) {
         let settings = self.settings.export.clone();
         let indices: Vec<usize> = match settings.scope {
@@ -981,9 +1182,10 @@ impl Application {
                 .collect(),
             ExportScope::Selected => self.view.selected_hits().collect(),
         };
-        let results = &self.results;
-        let table = export::results_table(&self.i18n, &results.hits, &results.terms, indices);
-        let rows = table.rows.len();
+        let rows = indices.len();
+        let hits = Arc::clone(&self.results.hits);
+        let terms = self.results.terms.clone();
+        let i18n = self.i18n.clone();
         let language = self.i18n.language();
         if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
             self.settings.export.last_dir = Some(dir.to_owned());
@@ -994,6 +1196,8 @@ impl Application {
         let spawned = thread::Builder::new()
             .name("esportazione".to_owned())
             .spawn(move || {
+                let table = export::results_table(&i18n, &hits, &terms, indices);
+                drop(hits);
                 let bytes = export::encode(&table, settings.format, language);
                 let written = export::write_export(&path, &bytes);
                 if tx.send(written).is_ok() {
@@ -1184,13 +1388,73 @@ impl Application {
         self.notice = None;
     }
 
-    /// Raccoglie, senza attendere, l'esito delle aperture, delle esportazioni e delle
-    /// modifiche al clic destro finite.
+    /// Raccoglie, senza attendere, l'esito delle aperture, delle copie, delle esportazioni,
+    /// dei dialoghi, dei salvataggi e delle modifiche al clic destro finite.
     pub fn pump_actions(&mut self) {
         self.poll_launch();
+        self.poll_copy();
         self.poll_export();
+        self.poll_dialog();
         self.poll_cache();
         self.poll_context_menu();
+        self.poll_save();
+    }
+
+    /// Riporta i filtri ai predefiniti, senza conferma: il messaggio offre "Annulla".
+    pub fn reset_filters(&mut self) {
+        let previous = Box::new(self.form.filters.clone());
+        self.form.filters.reset();
+        self.notice = Some(Notice::FiltersReset { previous });
+    }
+
+    /// Rimette i filtri di prima dell'ultimo ripristino, se il suo messaggio è ancora
+    /// quello mostrato.
+    pub fn undo_filters_reset(&mut self) {
+        match self.notice.take() {
+            Some(Notice::FiltersReset { previous }) => self.form.filters = *previous,
+            other => self.notice = other,
+        }
+    }
+
+    // --- Dialoghi di sistema ------------------------------------------------------------
+
+    /// Un dialogo di sistema è aperto in un thread: la scelta arriverà su `done` (`None` =
+    /// annullato) e si applica da sola (luoghi aggiunti, esportazione avviata). Intanto la
+    /// finestra si ridisegna e la ricerca continua.
+    pub fn wait_for_dialog(&mut self, done: Receiver<Option<FileChoice>>) {
+        self.dialog_job = Some(done);
+    }
+
+    /// Vero se un dialogo di sistema è aperto.
+    pub fn is_dialog_open(&self) -> bool {
+        self.dialog_job.is_some()
+    }
+
+    fn poll_dialog(&mut self) {
+        let Some(done) = &self.dialog_job else {
+            return;
+        };
+        let choice = match done.try_recv() {
+            Ok(choice) => choice,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => {
+                tracing::error!("thread del dialogo interrotto");
+                None
+            }
+        };
+        self.dialog_job = None;
+        match choice {
+            Some(FileChoice::AddRoots(paths)) => {
+                for path in paths {
+                    self.add_root(path);
+                }
+            }
+            Some(FileChoice::ExportTo(path)) => {
+                let waker = Arc::clone(&self.waker);
+                self.export_to(path, &waker);
+            }
+            None => {}
+        }
     }
 
     // --- Avvio con `--add` e istanza unica ----------------------------------------------
@@ -1364,17 +1628,99 @@ impl Application {
         }
     }
 
-    /// Salva le impostazioni se sono cambiate dall'ultimo salvataggio. Senza file (test)
-    /// non fa nulla.
-    pub fn save_settings(&mut self) -> Result<(), SettingsError> {
+    /// Salva le impostazioni se sono cambiate dall'ultimo salvataggio, in un thread: il
+    /// thread dell'interfaccia non aspetta il disco. L'esito arriva con
+    /// [`Application::pump_actions`] e un nuovo frame lo chiede chi è stato dato a
+    /// [`Application::set_waker`]; un errore si mostra una volta. Senza file (test), con
+    /// un salvataggio in corso o con il file bloccato dall'avvio non fa nulla.
+    pub fn save_settings_in_background(&mut self) {
+        if self.save_job.is_some() {
+            return;
+        }
         let current = self.settings();
-        let Some(file) = self.settings_file.as_mut() else {
+        let Some(file) = &self.settings_file else {
+            return;
+        };
+        if self.saved.as_ref() == Some(&current) {
+            return;
+        }
+        // Il file più recente o illeggibile non si riscrive: lo dice già il messaggio
+        // dell'avvio.
+        if self.settings_blocked {
+            return;
+        }
+        let file = Arc::clone(file);
+        let (tx, rx) = mpsc::channel();
+        let notify = Arc::clone(&self.waker);
+        let spawned = thread::Builder::new()
+            .name("impostazioni".to_owned())
+            .spawn(move || {
+                let saved = save_to(&file, &current);
+                if tx.send((current, saved)).is_ok() {
+                    notify();
+                }
+            });
+        match spawned {
+            Ok(_) => self.save_job = Some(SaveJob { done: rx }),
+            Err(error) => tracing::warn!(%error, "thread delle impostazioni non avviato"),
+        }
+    }
+
+    /// Vero se le impostazioni si stanno scrivendo.
+    pub fn is_saving_settings(&self) -> bool {
+        self.save_job.is_some()
+    }
+
+    fn poll_save(&mut self) {
+        let Some(job) = &self.save_job else {
+            return;
+        };
+        let outcome = match job.done.try_recv() {
+            Ok(outcome) => outcome,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => {
+                tracing::error!("thread delle impostazioni interrotto");
+                self.save_job = None;
+                return;
+            }
+        };
+        self.save_job = None;
+        self.record_save(outcome);
+    }
+
+    /// Registra l'esito di un salvataggio: le impostazioni scritte, o l'errore (nel log e,
+    /// la prima volta, in un messaggio).
+    fn record_save(&mut self, (written, saved): (Settings, Result<(), SettingsError>)) {
+        match saved {
+            Ok(()) => self.saved = Some(written),
+            Err(error) => {
+                tracing::warn!(%error, "impostazioni non salvate");
+                if !std::mem::replace(&mut self.save_failure_reported, true) {
+                    self.notice = Some(Notice::SettingsNotSaved(error.problem()));
+                }
+            }
+        }
+    }
+
+    /// Salva le impostazioni subito, nel thread che chiama (all'uscita), dopo aver atteso
+    /// per un tempo limitato un salvataggio in corso. Senza file (test) non fa nulla.
+    pub fn save_settings(&mut self) -> Result<(), SettingsError> {
+        if let Some(job) = self.save_job.take() {
+            match job.done.recv_timeout(SETTINGS_SAVE_WAIT) {
+                Ok(outcome) => self.record_save(outcome),
+                Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {
+                    tracing::warn!("salvataggio delle impostazioni in corso non concluso");
+                }
+            }
+        }
+        let current = self.settings();
+        let Some(file) = &self.settings_file else {
             return Ok(());
         };
         if self.saved.as_ref() == Some(&current) {
             return Ok(());
         }
-        file.save(&current)?;
+        save_to(file, &current)?;
         self.saved = Some(current);
         Ok(())
     }
@@ -1394,10 +1740,23 @@ fn empty_state(has_hits: bool, has_roots: bool, job: &JobState) -> EmptyState {
     match job {
         _ if has_hits => EmptyState::None,
         JobState::Running(_) => EmptyState::Searching,
-        JobState::Finished(_) | JobState::WorkerLost => EmptyState::NothingFound,
+        JobState::Finished(summary) => match summary.outcome {
+            Outcome::Cancelled => EmptyState::Cancelled,
+            Outcome::Completed | Outcome::LimitReached => EmptyState::NothingFound,
+        },
+        JobState::WorkerLost => EmptyState::Interrupted,
         JobState::Idle if has_roots => EmptyState::WriteTerm,
         JobState::Idle => EmptyState::AddRoot,
     }
+}
+
+/// Scrive `settings` nel file condiviso; un altro thread che lo scriveva e si è fermato a
+/// metà (lock avvelenato) rende il file inutilizzabile per la sessione.
+fn save_to(file: &Mutex<SettingsFile>, settings: &Settings) -> Result<(), SettingsError> {
+    let mut file = file
+        .lock()
+        .map_err(|_| SettingsError::Io(io::Error::other("scrittura precedente interrotta")))?;
+    file.save(settings)
 }
 
 #[cfg(test)]
@@ -1406,13 +1765,18 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn empty_state_partitions() {
-        let finished = JobState::Finished(Summary {
-            outcome: Outcome::Completed,
+    fn finished(outcome: Outcome) -> JobState {
+        JobState::Finished(Summary {
+            outcome,
             elapsed: Duration::ZERO,
             counts: ProgressSnapshot::default(),
-        });
+        })
+    }
+
+    /// T-C10 (C-10): ogni fine senza righe ha il suo stato vuoto; "nessuna parola
+    /// trovata" solo se la ricerca è arrivata in fondo.
+    #[test]
+    fn empty_state_partitions() {
         assert_eq!(
             empty_state(false, false, &JobState::Idle),
             EmptyState::AddRoot
@@ -1422,14 +1786,216 @@ mod tests {
             EmptyState::WriteTerm
         );
         assert_eq!(
-            empty_state(false, true, &finished),
+            empty_state(false, true, &finished(Outcome::Completed)),
             EmptyState::NothingFound
         );
         assert_eq!(
-            empty_state(false, true, &JobState::WorkerLost),
-            EmptyState::NothingFound
+            empty_state(false, true, &finished(Outcome::Cancelled)),
+            EmptyState::Cancelled
         );
-        assert_eq!(empty_state(true, true, &finished), EmptyState::None);
+        assert_eq!(
+            empty_state(false, true, &JobState::WorkerLost),
+            EmptyState::Interrupted
+        );
+        assert_eq!(
+            empty_state(true, true, &finished(Outcome::Completed)),
+            EmptyState::None
+        );
+        assert_eq!(
+            empty_state(true, true, &finished(Outcome::Cancelled)),
+            EmptyState::None
+        );
+    }
+
+    /// T-C08 (C-06): il motore non conosce il totale dei file finché la scansione non
+    /// finisce: l'avanzamento è indeterminato, con i conteggi, mai una percentuale.
+    #[test]
+    fn progress_indeterminate_while_walking() {
+        let counts = ProgressSnapshot {
+            files_seen: 40,
+            files_searched: 30,
+            files_skipped: 2,
+            binary_skipped: 1,
+            warnings: 1,
+            ..ProgressSnapshot::default()
+        };
+        let running = |elapsed| SearchStatus::Running { counts, elapsed };
+        assert_eq!(running(Duration::from_millis(999)).progress(), None);
+        assert_eq!(
+            running(PROGRESS_DELAY).progress(),
+            Some(Progress::Indeterminate { done: 34, seen: 40 })
+        );
+        assert_eq!(SearchStatus::Idle.progress(), None);
+        assert_eq!(SearchStatus::WorkerLost.progress(), None);
+    }
+
+    /// C-04: un modulo non valido mostra il pannello, apre i Filtri se serve e chiede il
+    /// focus per il primo campo da correggere.
+    #[test]
+    fn a_form_error_reveals_the_panel_and_the_field() {
+        let mut app = Application::build(Settings::default()).expect("app");
+        app.form.add_root(missing_root(), RootKind::Missing);
+        app.set_term("ar");
+        app.form.filters.extension_mode = crate::settings::ExtensionMode::Include;
+        app.layout.search_panel_visible = false;
+        assert!(app.start_search(Arc::new(|| {})).is_err());
+        assert!(app.layout.search_panel_visible);
+        assert!(app.view_state.open_filters);
+        assert_eq!(app.view_state.focus_field, Some(FormField::Extensions));
+
+        let mut app = Application::build(Settings::default()).expect("app");
+        app.form.add_root(missing_root(), RootKind::Missing);
+        app.set_terms(&["ar", "**"]);
+        assert!(app.start_search(Arc::new(|| {})).is_err());
+        assert!(!app.view_state.open_filters, "i Filtri non c'entrano");
+        assert_eq!(app.view_state.focus_field, Some(FormField::Term(1)));
+    }
+
+    /// C-14: "Ripristina i filtri predefiniti" non chiede conferma e si annulla.
+    #[test]
+    fn reset_filters_can_be_undone() {
+        let mut app = Application::build(Settings::default()).expect("app");
+        app.form.filters.extension_mode = crate::settings::ExtensionMode::Exclude;
+        app.form.filters.extensions = "log".to_owned();
+        let customized = app.form.filters.clone();
+        app.reset_filters();
+        assert!(!app.form.filters.is_customized());
+        assert!(matches!(app.notice(), Some(Notice::FiltersReset { .. })));
+        app.undo_filters_reset();
+        assert_eq!(app.form.filters, customized);
+        assert!(app.notice().is_none());
+        // Senza un ripristino da annullare non cambia nulla.
+        app.undo_filters_reset();
+        assert_eq!(app.form.filters, customized);
+    }
+
+    /// T-C13 (C-11): un settings.toml più recente o illeggibile si dice all'utente, perché
+    /// le modifiche della sessione non si salveranno.
+    #[test]
+    fn settings_newer_version_is_reported() {
+        let dir = tempfile::tempdir().expect("cartella");
+        let path = dir.path().join(crate::settings::FILE_NAME);
+        std::fs::write(&path, "format_version = 99\n").expect("scritto");
+        let (file, settings, _) = SettingsFile::load(path.clone());
+        let app = Application::build_persistent(settings, file).expect("app");
+        assert_eq!(
+            app.notice(),
+            Some(&Notice::SettingsNotSaved(SettingsProblem::NewerVersion))
+        );
+
+        let unreadable = dir.path().join("cartella-al-posto-del-file");
+        std::fs::create_dir(&unreadable).expect("cartella");
+        let (file, settings, _) = SettingsFile::load(unreadable);
+        let app = Application::build_persistent(settings, file).expect("app");
+        assert_eq!(
+            app.notice(),
+            Some(&Notice::SettingsNotSaved(SettingsProblem::Unreadable))
+        );
+
+        std::fs::write(&path, "non è toml [[[").expect("scritto");
+        let (file, settings, _) = SettingsFile::load(path.clone());
+        let app = Application::build_persistent(settings, file).expect("app");
+        assert_eq!(app.notice(), Some(&Notice::SettingsReplaced));
+    }
+
+    /// C-11: il salvataggio periodico scrive in un thread; la vista raccoglie l'esito.
+    #[test]
+    fn settings_are_saved_off_the_ui_thread() {
+        let dir = tempfile::tempdir().expect("cartella");
+        let path = dir.path().join(crate::settings::FILE_NAME);
+        let (file, settings, _) = SettingsFile::load(path.clone());
+        let mut app = Application::build_persistent(settings, file).expect("app");
+        app.set_theme(ThemeChoice::Dark);
+        app.save_settings_in_background();
+        assert!(app.is_saving_settings());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.is_saving_settings() {
+            assert!(Instant::now() < deadline, "salvataggio non finito");
+            app.pump_actions();
+            thread::yield_now();
+        }
+        let written = std::fs::read_to_string(&path).expect("letto");
+        assert!(written.contains("dark"), "{written}");
+        // Nulla di cambiato: nessun altro salvataggio.
+        app.save_settings_in_background();
+        assert!(!app.is_saving_settings());
+    }
+
+    /// Un file con `lines` righe "ar": tante parole trovate in un file solo.
+    fn many_words_file(dir: &Path, lines: usize) -> PathBuf {
+        let path = dir.join("parole.txt");
+        std::fs::write(&path, "ar\n".repeat(lines)).expect("scritto");
+        path
+    }
+
+    /// C-07: la tabella da copiare si costruisce in un thread; il testo arriva agli
+    /// appunti dalla vista, poi il messaggio.
+    #[test]
+    fn copy_is_built_off_the_ui_thread() {
+        let dir = tempfile::tempdir().expect("cartella");
+        let file = many_words_file(dir.path(), 3);
+        let mut app = Application::build(Settings::default()).expect("app");
+        app.form.add_root(file, RootKind::File);
+        app.set_term("ar");
+        run_to_end(&mut app);
+        app.view_mut().select_all();
+        app.copy_selection(&(Arc::new(|| {}) as Notify));
+        assert!(app.is_copying());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let text = loop {
+            app.pump_actions();
+            if let Some(text) = app.take_clipboard_text() {
+                break text;
+            }
+            assert!(Instant::now() < deadline, "copia non finita");
+            thread::yield_now();
+        };
+        assert_eq!(text.lines().count(), 3, "{text}");
+        assert_eq!(app.notice(), Some(&Notice::Copied { rows: 3 }));
+        assert!(!app.is_copying());
+    }
+
+    /// Misura P-08 (C-07): `cargo test --release -p lynkeus-app --lib copy_200k --
+    /// --ignored --nocapture`. Con 200 000 righe selezionate, la copia occupa il thread
+    /// dell'interfaccia per meno di 50 ms (il resto è nel thread di copia).
+    #[test]
+    #[ignore = "misura di prestazioni, da eseguire in release"]
+    fn copy_200k() {
+        let dir = tempfile::tempdir().expect("cartella");
+        let file = many_words_file(dir.path(), 200_000);
+        let mut app = Application::build(Settings::default()).expect("app");
+        app.form.add_root(file, RootKind::File);
+        app.set_term("ar");
+        run_to_end(&mut app);
+        assert_eq!(app.results().hits.len(), 200_000);
+        app.view_mut().select_all();
+        let notify: Notify = Arc::new(|| {});
+        let started = Instant::now();
+        app.copy_selection(&notify);
+        let on_ui_thread = started.elapsed();
+        let mut longest_pump = Duration::ZERO;
+        let text = loop {
+            let pump = Instant::now();
+            app.pump_actions();
+            let taken = app.take_clipboard_text();
+            longest_pump = longest_pump.max(pump.elapsed());
+            if let Some(text) = taken {
+                break text;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(60),
+                "copia non finita"
+            );
+            thread::sleep(Duration::from_millis(1));
+        };
+        println!(
+            "copy_200k: thread dell'interfaccia {on_ui_thread:?} all'avvio, \
+             {longest_pump:?} al massimo per frame, totale {:?}, {} byte",
+            started.elapsed(),
+            text.len()
+        );
+        assert!(on_ui_thread < Duration::from_millis(50), "{on_ui_thread:?}");
+        assert!(longest_pump < Duration::from_millis(50), "{longest_pump:?}");
     }
 
     /// Una radice che non esiste: la ricerca finisce subito con un avviso.

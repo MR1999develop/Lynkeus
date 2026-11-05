@@ -33,6 +33,8 @@ pub(crate) enum Command {
     ToggleSearchPanel,
     TogglePreview,
     ToggleFilters,
+    NextPane,
+    PreviousPane,
     About,
 }
 
@@ -40,7 +42,7 @@ impl Command {
     /// Ordine in cui si leggono le scorciatoie: le più specifiche prima (Ctrl+Maiusc+O
     /// prima di Ctrl+O, Maiusc+F3 prima di F3), perché `consume_shortcut` ignora Maiusc e
     /// Alt in più.
-    pub(crate) const SHORTCUT_ORDER: [Command; 21] = [
+    pub(crate) const SHORTCUT_ORDER: [Command; 23] = [
         Command::AddFile,
         Command::AddFolder,
         Command::Reveal,
@@ -62,6 +64,8 @@ impl Command {
         Command::ShowWarnings,
         Command::TogglePreview,
         Command::ToggleSearchPanel,
+        Command::PreviousPane,
+        Command::NextPane,
     ];
 
     /// La scorciatoia, se c'è.
@@ -91,6 +95,8 @@ impl Command {
             Command::ShowWarnings => ctrl(Key::Num2),
             Command::TogglePreview => ctrl(Key::Num3),
             Command::ToggleSearchPanel => plain(Key::F9),
+            Command::NextPane => plain(Key::F6),
+            Command::PreviousPane => KeyboardShortcut::new(Modifiers::SHIFT, Key::F6),
             Command::AddTerm | Command::ToggleFilters | Command::About => return None,
         })
     }
@@ -121,6 +127,8 @@ impl Command {
             Command::ToggleSearchPanel => "menu-search-panel",
             Command::TogglePreview => "menu-preview",
             Command::ToggleFilters => "menu-filters",
+            Command::NextPane => "menu-next-pane",
+            Command::PreviousPane => "menu-previous-pane",
             Command::About => "menu-about",
         }
     }
@@ -132,6 +140,9 @@ impl Command {
         let on_results = app.view_state.tab == Tab::Results;
         let has_cursor = app.cursor_hit().is_some();
         match self {
+            Command::AddFolder | Command::AddFile | Command::Export if app.is_dialog_open() => {
+                Err("reason-dialog-open")
+            }
             Command::Search if app.is_searching() => Err("reason-search-running"),
             Command::Cancel if !app.is_searching() => Err("reason-no-search"),
             Command::SelectAll | Command::SelectNone if !has_rows => Err("reason-no-results"),
@@ -146,6 +157,7 @@ impl Command {
                 Err("reason-not-results-tab")
             }
             Command::Copy if app.view().selected_count() == 0 => Err("reason-no-selection"),
+            Command::Copy if app.is_copying() => Err("reason-copy-running"),
             Command::Open | Command::Reveal | Command::Step(_) if !has_cursor => {
                 Err("reason-no-current-row")
             }
@@ -173,6 +185,12 @@ impl Command {
             Command::AddTerm if !app.form.can_add_term() => Err("reason-too-many-terms"),
             _ => Ok(()),
         }
+    }
+
+    /// Vero se la scorciatoia va lasciata a un menu o a un popup aperto: Esc lo chiude,
+    /// Invio ne attiva la voce; non annullano la ricerca né aprono il risultato.
+    pub(crate) fn yields_to_popups(self) -> bool {
+        matches!(self, Command::Cancel | Command::Open)
     }
 
     /// Vero se la scorciatoia va lasciata al campo di testo con il focus (Ctrl+A seleziona

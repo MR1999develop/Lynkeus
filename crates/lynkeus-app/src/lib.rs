@@ -31,8 +31,8 @@ pub mod theme;
 mod ui;
 
 pub use app::{
-    Application, EmptyState, MAX_HITS_PER_FRAME, Notice, PROGRESS_DELAY, PreviewKey, PreviewState,
-    Pump, Results, SearchStatus, StartError, Tab, ViewState,
+    Application, EmptyState, FileChoice, MAX_HITS_PER_FRAME, Notice, PROGRESS_DELAY, PreviewKey,
+    PreviewState, Progress, Pump, Results, SearchStatus, StartError, Tab, ViewState,
 };
 pub use settings::{Settings, SettingsFile};
 pub use ui::setup_context;

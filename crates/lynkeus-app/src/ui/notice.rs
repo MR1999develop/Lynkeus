@@ -2,15 +2,19 @@
 // Copyright (C) 2026 MR
 
 //! Barra dei messaggi sopra la tabella: esito di copia ed esportazione, aperture non
-//! riuscite o rifiutate. Resta finché l'utente la chiude o arriva un altro messaggio; gli
-//! errori iniziano con una parola che lo dice, non solo con il colore.
+//! riuscite o rifiutate, filtri ripristinati (con "Annulla"), impostazioni che non si
+//! salvano. Resta finché l'utente la chiude o arriva un altro messaggio; gli errori
+//! iniziano con una parola che lo dice, non solo con il colore. Il testo è una regione
+//! "live": i lettori di schermo lo annunciano senza spostare il focus.
 
+use egui::accesskit::Live;
 use egui::{Label, RichText, Ui};
 
 use super::Action;
 use crate::app::{Application, Notice};
 use crate::context_menu::MenuError;
 use crate::launch::EntryFailure;
+use crate::settings::SettingsProblem;
 use crate::theme::{self, SPACE};
 
 pub(super) fn bar(app: &Application, ui: &mut Ui, actions: &mut Vec<Action>) {
@@ -80,6 +84,16 @@ pub(super) fn bar(app: &Application, ui: &mut Ui, actions: &mut Vec<Action>) {
             i18n.tr_args("notice-roots-limit", &[("max", (*max).into())]),
             false,
         ),
+        Notice::FiltersReset { .. } => (i18n.tr("notice-filters-reset"), false),
+        Notice::SettingsNotSaved(problem) => {
+            let id = match problem {
+                SettingsProblem::NewerVersion => "notice-settings-newer",
+                SettingsProblem::Unreadable => "notice-settings-unreadable",
+                SettingsProblem::WriteFailed => "notice-settings-write-failed",
+            };
+            (i18n.tr(id), true)
+        }
+        Notice::SettingsReplaced => (i18n.tr("notice-settings-replaced"), true),
     };
     ui.add_space(SPACE[0]);
     // Da destra: Chiudi, l'eventuale azione, poi il testo nello spazio che resta.
@@ -92,13 +106,20 @@ pub(super) fn bar(app: &Application, ui: &mut Ui, actions: &mut Vec<Action>) {
         {
             actions.push(Action::Reveal(doc.clone()));
         }
+        if let Notice::FiltersReset { .. } = notice
+            && ui.button(i18n.tr("action-undo")).clicked()
+        {
+            actions.push(Action::UndoFiltersReset);
+        }
         let text = if is_error {
             RichText::new(text).color(tokens.error)
         } else {
             RichText::new(text)
         };
         ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-            ui.add(Label::new(text).wrap());
+            let response = ui.add(Label::new(text).wrap());
+            ui.ctx()
+                .accesskit_node_builder(response.id, |node| node.set_live(Live::Polite));
         });
     });
     ui.add_space(SPACE[0]);

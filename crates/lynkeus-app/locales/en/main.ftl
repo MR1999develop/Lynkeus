@@ -212,7 +212,13 @@ status-running = Searching: { $searched ->
     }, { $hits ->
         [one] 1 word found
        *[other] { $hits } words found
-    }, { $skipped } skipped, { $binary } binary, { $warnings ->
+    }, { $skipped ->
+        [one] 1 skipped
+       *[other] { $skipped } skipped
+    }, { $binary ->
+        [one] 1 binary file
+       *[other] { $binary } binary files
+    }, { $warnings ->
         [one] 1 warning
        *[other] { $warnings } warnings
     } ({ $seconds } s)
@@ -223,7 +229,13 @@ status-completed = Search complete: { $searched ->
     }, { $hits ->
         [one] 1 word found
        *[other] { $hits } words found
-    }, { $skipped } skipped, { $binary } binary, { $warnings ->
+    }, { $skipped ->
+        [one] 1 skipped
+       *[other] { $skipped } skipped
+    }, { $binary ->
+        [one] 1 binary file
+       *[other] { $binary } binary files
+    }, { $warnings ->
         [one] 1 warning
        *[other] { $warnings } warnings
     } ({ $seconds } s)
@@ -240,8 +252,8 @@ status-limit-reached = Reached the limit of { $max } results: narrow the search 
 status-worker-lost = The search stopped because of an internal error. Try again; if it happens again, please report the problem.
 # $file (text): path of the file being read.
 status-current-file = Reading: { $file }
-# $done (number): files already examined; $seen (number): files found so far.
-status-progress = { $done } of { $seen } files
+# $done (number): files already examined; $seen (number): files found so far (the total is not known).
+status-progress = { $done } of { $seen } files found so far
 # $count (number): selected rows.
 status-selected = { $count ->
         [one] 1 row selected
@@ -374,3 +386,29 @@ log-level-error = Errors only
 log-level-warn = Errors and warnings
 log-level-info = Information too
 log-level-debug = Everything (for diagnosis)
+
+## Area C: interface (accessibility, states, messages)
+
+# In the status bar when Search does not start because of a wrong field.
+error-form-invalid = Search not started: fix the fields marked in the search panel.
+# In the status bar while a copy of many rows is being prepared.
+status-copying = Copying rows to the clipboard…
+empty-cancelled-title = Search cancelled
+empty-cancelled-text = The search was cancelled before finding any words. To run it again, press "Search again" or F5.
+empty-interrupted-title = Search interrupted
+empty-interrupted-text = The search stopped because of an internal error before finding any words. Run it again; if it happens again, please report the problem.
+empty-search-again = Search again
+notice-filters-reset = Filters restored to their defaults.
+# Button next to a message: puts things back as they were.
+action-undo = Undo
+notice-settings-newer = Warning: the settings were saved by a newer version of Lynkeus Searcher and will not be overwritten: changes made now are not saved. Update the program to keep them.
+notice-settings-unreadable = Warning: the settings file could not be read (permissions or size) and will not be overwritten: changes made now are not saved. Check the settings.toml file in the app folder.
+notice-settings-write-failed = Error: the settings were not saved. Check the free space and the permissions of the app folder; saving will be tried again later.
+notice-settings-replaced = Warning: the settings file was damaged and has been set aside as settings.toml.invalid; starting again from the default settings.
+reason-dialog-open = A dialog is already open.
+reason-copy-running = Rows are already being copied to the clipboard.
+menu-next-pane = Next pane
+menu-previous-pane = Previous pane
+# Name of a result row for screen readers.
+# $word (text): word found; $file (text): file; $location (text): position, e.g. "line 12".
+table-row-name = { $word }, { $file }, { $location }

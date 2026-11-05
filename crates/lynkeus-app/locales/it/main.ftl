@@ -212,7 +212,13 @@ status-running = Ricerca in corso: { $searched ->
     }, { $hits ->
         [one] 1 parola trovata
        *[other] { $hits } parole trovate
-    }, { $skipped } saltati, { $binary } binari, { $warnings ->
+    }, { $skipped ->
+        [one] 1 saltato
+       *[other] { $skipped } saltati
+    }, { $binary ->
+        [one] 1 binario
+       *[other] { $binary } binari
+    }, { $warnings ->
         [one] 1 avviso
        *[other] { $warnings } avvisi
     } ({ $seconds } s)
@@ -223,7 +229,13 @@ status-completed = Ricerca completata: { $searched ->
     }, { $hits ->
         [one] 1 parola trovata
        *[other] { $hits } parole trovate
-    }, { $skipped } saltati, { $binary } binari, { $warnings ->
+    }, { $skipped ->
+        [one] 1 saltato
+       *[other] { $skipped } saltati
+    }, { $binary ->
+        [one] 1 binario
+       *[other] { $binary } binari
+    }, { $warnings ->
         [one] 1 avviso
        *[other] { $warnings } avvisi
     } ({ $seconds } s)
@@ -240,8 +252,8 @@ status-limit-reached = Raggiunto il limite di { $max } risultati: restringi la r
 status-worker-lost = La ricerca si è interrotta per un errore interno. Riprova; se succede ancora, segnala il problema.
 # $file (testo): percorso del file in lettura.
 status-current-file = In lettura: { $file }
-# $done (numero): file già esaminati; $seen (numero): file trovati finora.
-status-progress = { $done } di { $seen } file
+# $done (numero): file già esaminati; $seen (numero): file trovati finora (il totale non è noto).
+status-progress = { $done } di { $seen } file trovati finora
 # $count (numero): righe selezionate.
 status-selected = { $count ->
         [one] 1 riga selezionata
@@ -374,3 +386,29 @@ log-level-error = Solo errori
 log-level-warn = Errori e avvisi
 log-level-info = Anche le informazioni
 log-level-debug = Tutto (per la diagnosi)
+
+## Area C: interfaccia (accessibilità, stati, messaggi)
+
+# Sotto la barra di stato quando Cerca non parte per un campo sbagliato.
+error-form-invalid = Ricerca non avviata: correggi i campi segnalati nel pannello di ricerca.
+# Nella barra di stato mentre la copia di molte righe è in preparazione.
+status-copying = Copia delle righe negli appunti…
+empty-cancelled-title = Ricerca annullata
+empty-cancelled-text = La ricerca è stata annullata prima di trovare parole. Per ripeterla premi "Ripeti la ricerca" o F5.
+empty-interrupted-title = Ricerca interrotta
+empty-interrupted-text = La ricerca si è interrotta per un errore interno prima di trovare parole. Ripetila; se succede ancora, segnala il problema.
+empty-search-again = Ripeti la ricerca
+notice-filters-reset = Filtri riportati ai valori predefiniti.
+# Bottone accanto a un messaggio: rimette com'era prima.
+action-undo = Annulla
+notice-settings-newer = Attenzione: le impostazioni sono state salvate da una versione più recente di Lynkeus Searcher e non verranno sovrascritte: le modifiche fatte ora non si salvano. Aggiorna il programma per conservarle.
+notice-settings-unreadable = Attenzione: il file delle impostazioni non si è potuto leggere (permessi o dimensione) e non verrà sovrascritto: le modifiche fatte ora non si salvano. Controlla il file settings.toml nella cartella dell'app.
+notice-settings-write-failed = Errore: le impostazioni non si sono salvate. Controlla lo spazio libero e i permessi della cartella dell'app; il salvataggio si riprova più tardi.
+notice-settings-replaced = Attenzione: il file delle impostazioni era danneggiato ed è stato messo da parte come settings.toml.invalid; si riparte dalle impostazioni predefinite.
+reason-dialog-open = Una finestra di dialogo è già aperta.
+reason-copy-running = Una copia negli appunti è già in corso.
+menu-next-pane = Riquadro successivo
+menu-previous-pane = Riquadro precedente
+# Nome di una riga dei risultati per i lettori di schermo.
+# $word (testo): parola trovata; $file (testo): file; $location (testo): posizione, es. "riga 12".
+table-row-name = { $word }, { $file }, { $location }

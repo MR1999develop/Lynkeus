@@ -250,6 +250,29 @@ pub enum SettingsError {
     Serialize(#[from] toml::ser::Error),
 }
 
+impl SettingsError {
+    /// Che cosa dire all'utente di questo errore.
+    pub fn problem(&self) -> SettingsProblem {
+        match self {
+            SettingsError::NewerVersion(_) => SettingsProblem::NewerVersion,
+            SettingsError::NotLoaded => SettingsProblem::Unreadable,
+            SettingsError::Io(_) | SettingsError::Serialize(_) => SettingsProblem::WriteFailed,
+        }
+    }
+}
+
+/// Perché le modifiche alle impostazioni non arrivano sul disco, per il messaggio
+/// all'utente.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsProblem {
+    /// Il file è di una versione più recente: non si riscrive.
+    NewerVersion,
+    /// Il file non si è letto all'avvio (permessi, troppo grande): non si riscrive.
+    Unreadable,
+    /// La scrittura non è riuscita (disco pieno, permessi).
+    WriteFailed,
+}
+
 /// Com'è andata la lettura.
 #[derive(Debug)]
 pub enum LoadOutcome {
@@ -274,6 +297,8 @@ pub struct SettingsFile {
     path: PathBuf,
     document: Table,
     blocked: Option<Blocked>,
+    /// Vero se all'avvio il file non era TOML ed è stato spostato da parte.
+    replaced: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -290,6 +315,7 @@ impl SettingsFile {
             path,
             document: Table::new(),
             blocked: None,
+            replaced: false,
         };
         let text = match read_limited(&file.path) {
             Ok(Some(text)) => text,
@@ -305,6 +331,7 @@ impl SettingsFile {
             if moved_to.is_none() {
                 file.blocked = Some(Blocked::NotLoaded);
             }
+            file.replaced = moved_to.is_some();
             let outcome = LoadOutcome::Invalid { moved_to };
             return (file, Settings::default(), outcome);
         };
@@ -324,6 +351,21 @@ impl SettingsFile {
     /// Il percorso del file.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Perché le impostazioni non si salveranno in questa sessione, se è già noto
+    /// dall'avvio (file più recente o illeggibile).
+    pub fn save_blocked(&self) -> Option<SettingsProblem> {
+        self.blocked.map(|blocked| match blocked {
+            Blocked::Newer(_) => SettingsProblem::NewerVersion,
+            Blocked::NotLoaded => SettingsProblem::Unreadable,
+        })
+    }
+
+    /// Vero se all'avvio il file non era valido ed è stato spostato in
+    /// `settings.toml.invalid`: l'app è ripartita dalle impostazioni predefinite.
+    pub fn replaced_invalid(&self) -> bool {
+        self.replaced
     }
 
     /// Scrive `settings` in modo durevole, conservando le chiavi sconosciute lette.

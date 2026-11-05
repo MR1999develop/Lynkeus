@@ -6,8 +6,13 @@
 //!
 //! Un solo accento (blu) e solo sugli elementi interattivi; mai rosso né arancio per
 //! l'accento. Le corrispondenze evidenziate hanno un fondo proprio, non d'accento, e sono
-//! anche in grassetto e sottolineate: lo stato non è affidato al solo colore. I contrasti
-//! (testo ≥ 4,5:1, bordi e controlli ≥ 3:1) sono verificati da un test.
+//! anche in grassetto e sottolineate; le righe selezionate hanno anche un segno sul bordo
+//! sinistro: lo stato non è affidato al solo colore. Il focus della tastiera è un bordo di
+//! 2 px. I contrasti (testo ≥ 4,5:1, bordi, segni e focus ≥ 3:1) sono verificati da un test.
+//!
+//! Con un tema a contrasto elevato del sistema ([`SystemContrast`], letto dalla
+//! piattaforma all'avvio) i token vengono dai colori di sistema, per il tema chiaro e per
+//! lo scuro.
 
 use egui::{
     Color32, CornerRadius, FontFamily, FontId, Stroke, TextStyle, Theme, ThemePreference, Visuals,
@@ -27,6 +32,14 @@ pub const INTERACT_HEIGHT: f32 = 24.0;
 pub const BODY_SIZE: f32 = FONT[2];
 /// Corpo delle didascalie e dei messaggi sotto i campi.
 pub const CAPTION_SIZE: f32 = FONT[0];
+
+/// Larghezza del bordo di focus della tastiera, in punti.
+pub const FOCUS_WIDTH: f32 = 2.0;
+/// Distanza del bordo di focus da un controllo con il fondo d'accento (il primario), in
+/// punti: l'anello sta sul fondo del pannello, non sull'accento.
+pub const FOCUS_GAP: f32 = 2.0;
+/// Larghezza del segno sul bordo sinistro delle righe selezionate, in punti.
+pub const SELECTION_MARK_WIDTH: f32 = 4.0;
 
 /// Nome della famiglia SemiBold, registrata da [`crate::platform::install_fonts`].
 pub const SEMIBOLD: &str = "semibold";
@@ -95,6 +108,28 @@ pub struct Tokens {
     pub highlight_bg: Color32,
     /// Fondo delle righe e del testo selezionati.
     pub selection_bg: Color32,
+    /// Testo sopra `selection_bg`.
+    pub on_selection: Color32,
+    /// Segno sul bordo sinistro delle righe selezionate.
+    pub selection_mark: Color32,
+    /// Bordo di focus della tastiera.
+    pub focus: Color32,
+}
+
+/// I colori di un tema a contrasto elevato del sistema (su Windows `GetSysColor`), da cui
+/// derivano tutti i token quando il tema è attivo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SystemContrast {
+    /// Fondo delle finestre (`COLOR_WINDOW`).
+    pub window: Color32,
+    /// Testo delle finestre (`COLOR_WINDOWTEXT`).
+    pub window_text: Color32,
+    /// Fondo degli elementi selezionati (`COLOR_HIGHLIGHT`).
+    pub highlight: Color32,
+    /// Testo degli elementi selezionati (`COLOR_HIGHLIGHTTEXT`).
+    pub highlight_text: Color32,
+    /// Fondo dei bottoni (`COLOR_BTNFACE`).
+    pub button_face: Color32,
 }
 
 impl Tokens {
@@ -116,6 +151,9 @@ impl Tokens {
             warning: Color32::from_rgb(0x8A, 0x55, 0x00),
             highlight_bg: Color32::from_rgb(0xFF, 0xEB, 0x8A),
             selection_bg: Color32::from_rgb(0xCC, 0xE4, 0xF7),
+            on_selection: Color32::from_rgb(0x1A, 0x1A, 0x1A),
+            selection_mark: Color32::from_rgb(0x00, 0x5F, 0xB8),
+            focus: Color32::from_rgb(0x1A, 0x1A, 0x1A),
         }
     }
 
@@ -137,6 +175,35 @@ impl Tokens {
             warning: Color32::from_rgb(0xFC, 0xE1, 0x00),
             highlight_bg: Color32::from_rgb(0x6B, 0x55, 0x00),
             selection_bg: Color32::from_rgb(0x1F, 0x3F, 0x5C),
+            on_selection: Color32::from_rgb(0xF2, 0xF2, 0xF2),
+            selection_mark: Color32::from_rgb(0x60, 0xCD, 0xFF),
+            focus: Color32::from_rgb(0xF2, 0xF2, 0xF2),
+        }
+    }
+
+    /// I token di un tema a contrasto elevato: solo i colori di sistema, in coppia (testo
+    /// della finestra sul fondo della finestra, testo della selezione sulla selezione).
+    /// Le corrispondenze restano riconoscibili da SemiBold e sottolineatura, senza fondo.
+    pub const fn high_contrast(colors: &SystemContrast) -> Tokens {
+        Tokens {
+            accent: colors.highlight,
+            on_accent: colors.highlight_text,
+            text_strong: colors.window_text,
+            text_weak: colors.window_text,
+            stroke_strong: colors.window_text,
+            stroke_weak: colors.window_text,
+            fill: colors.button_face,
+            fill_hover: colors.button_face,
+            bg: colors.window,
+            bg_raised: colors.window,
+            bg_overlay: colors.window,
+            error: colors.window_text,
+            warning: colors.window_text,
+            highlight_bg: colors.window,
+            selection_bg: colors.highlight,
+            on_selection: colors.highlight_text,
+            selection_mark: colors.highlight_text,
+            focus: colors.window_text,
         }
     }
 
@@ -149,10 +216,19 @@ impl Tokens {
     }
 }
 
-/// Applica token, corpi e spaziature ai due temi del contesto e imposta la preferenza.
-pub fn apply(ctx: &egui::Context, choice: ThemeChoice) {
+/// Applica token, corpi e spaziature ai due temi del contesto e imposta la preferenza. Con
+/// `contrast` (tema a contrasto elevato del sistema) i due temi usano i colori di sistema.
+pub fn apply(ctx: &egui::Context, choice: ThemeChoice, contrast: Option<SystemContrast>) {
+    let contrast = contrast.as_ref().map(Tokens::high_contrast);
+    ctx.data_mut(|data| {
+        if let Some(tokens) = contrast {
+            data.insert_temp(contrast_id(), tokens);
+        } else {
+            data.remove::<Tokens>(contrast_id());
+        }
+    });
     for theme in [Theme::Light, Theme::Dark] {
-        let tokens = Tokens::of(theme);
+        let tokens = contrast.unwrap_or_else(|| Tokens::of(theme));
         ctx.set_visuals_of(theme, visuals(&tokens, theme));
         ctx.style_mut_of(theme, |style| {
             style.text_styles = text_styles();
@@ -172,7 +248,18 @@ pub fn set_choice(ctx: &egui::Context, choice: ThemeChoice) {
 
 /// I token del tema in uso ora nel contesto.
 pub fn current(ctx: &egui::Context) -> Tokens {
-    Tokens::of(ctx.theme())
+    ctx.data(|data| data.get_temp::<Tokens>(contrast_id()))
+        .unwrap_or_else(|| Tokens::of(ctx.theme()))
+}
+
+/// Dove il contesto conserva i token del contrasto elevato, se attivo.
+fn contrast_id() -> egui::Id {
+    egui::Id::unique("lynkeus-system-contrast")
+}
+
+/// Il bordo di focus della tastiera.
+pub fn focus_stroke(tokens: &Tokens) -> Stroke {
+    Stroke::new(FOCUS_WIDTH, tokens.focus)
 }
 
 fn text_styles() -> std::collections::BTreeMap<TextStyle, FontId> {
@@ -209,7 +296,9 @@ fn visuals(t: &Tokens, theme: Theme) -> Visuals {
     v.window_corner_radius = overlay;
     v.menu_corner_radius = overlay;
     v.selection.bg_fill = t.selection_bg;
-    v.selection.stroke = Stroke::new(1.0, t.text_strong);
+    // Testo delle righe selezionate; i campi di testo lo usano anche come bordo di focus
+    // (il modulo lo sostituisce con `focus_stroke`, vedi `ui::search_panel`).
+    v.selection.stroke = Stroke::new(FOCUS_WIDTH, t.on_selection);
     v.text_cursor.stroke = Stroke::new(2.0, t.accent);
 
     let w = &mut v.widgets;
@@ -231,10 +320,11 @@ fn visuals(t: &Tokens, theme: Theme) -> Visuals {
     w.hovered.fg_stroke = Stroke::new(1.5, t.text_strong);
     w.hovered.corner_radius = control;
 
-    // Focus e pressione: bordo d'accento ben visibile.
+    // Focus e pressione: bordo di 2 px che contrasta con ogni fondo (anche con l'accento
+    // del primario, dove l'anello si disegna all'esterno).
     w.active.bg_fill = t.fill_hover;
     w.active.weak_bg_fill = t.fill_hover;
-    w.active.bg_stroke = Stroke::new(2.0, t.accent);
+    w.active.bg_stroke = focus_stroke(t);
     w.active.fg_stroke = Stroke::new(2.0, t.text_strong);
     w.active.corner_radius = control;
 
@@ -350,6 +440,136 @@ mod tests {
                     bg,
                     NON_TEXT_MIN,
                 );
+            }
+        }
+    }
+
+    /// T-C07 (C-02): la riga selezionata non si riconosce solo dal fondo: il segno sul
+    /// bordo sinistro ha almeno 3:1 contro il fondo della selezione e contro ogni fondo di
+    /// riga (normale, alterna, sotto il puntatore).
+    #[test]
+    fn selection_contrast() {
+        for (name, t) in both() {
+            for (bg_name, bg) in [
+                ("selection_bg", t.selection_bg),
+                ("bg_raised", t.bg_raised),
+                ("fill", t.fill),
+                ("fill_hover", t.fill_hover),
+            ] {
+                assert_contrast(
+                    name,
+                    &format!("selection_mark/{bg_name}"),
+                    t.selection_mark,
+                    bg,
+                    NON_TEXT_MIN,
+                );
+            }
+            assert_contrast(
+                name,
+                "on_selection/selection_bg",
+                t.on_selection,
+                t.selection_bg,
+                TEXT_MIN,
+            );
+        }
+    }
+
+    /// T-C11 (C-09): il bordo di focus è largo 2 px e ha almeno 3:1 contro tutti i fondi
+    /// su cui compare (pannello, campi, controlli, primario disegnato all'esterno).
+    #[test]
+    fn focus_ring_contrast() {
+        for (name, t) in both() {
+            for (bg_name, bg) in [
+                ("bg", t.bg),
+                ("bg_raised", t.bg_raised),
+                ("bg_overlay", t.bg_overlay),
+                ("fill", t.fill),
+                ("fill_hover", t.fill_hover),
+            ] {
+                assert_contrast(name, &format!("focus/{bg_name}"), t.focus, bg, NON_TEXT_MIN);
+            }
+            let theme = if name == "chiaro" {
+                Theme::Light
+            } else {
+                Theme::Dark
+            };
+            let v = visuals(&t, theme);
+            assert_eq!(v.widgets.active.bg_stroke, focus_stroke(&t), "{name}");
+            assert!(focus_stroke(&t).width >= 2.0);
+        }
+    }
+
+    /// Le tavolozze dei temi a contrasto elevato di Windows: Nero e Bianco classici, più
+    /// Acquatico e Deserto di Windows 11.
+    fn windows_contrast_themes() -> [(&'static str, SystemContrast); 4] {
+        let rgb = Color32::from_rgb;
+        [
+            (
+                "nero",
+                SystemContrast {
+                    window: rgb(0x00, 0x00, 0x00),
+                    window_text: rgb(0xFF, 0xFF, 0xFF),
+                    highlight: rgb(0x1A, 0xEB, 0xFF),
+                    highlight_text: rgb(0x00, 0x00, 0x00),
+                    button_face: rgb(0x00, 0x00, 0x00),
+                },
+            ),
+            (
+                "bianco",
+                SystemContrast {
+                    window: rgb(0xFF, 0xFF, 0xFF),
+                    window_text: rgb(0x00, 0x00, 0x00),
+                    highlight: rgb(0x37, 0x00, 0x6E),
+                    highlight_text: rgb(0xFF, 0xFF, 0xFF),
+                    button_face: rgb(0xFF, 0xFF, 0xFF),
+                },
+            ),
+            (
+                "acquatico",
+                SystemContrast {
+                    window: rgb(0x20, 0x20, 0x20),
+                    window_text: rgb(0xFF, 0xFF, 0xFF),
+                    highlight: rgb(0x8E, 0xE3, 0xF0),
+                    highlight_text: rgb(0x26, 0x3B, 0x50),
+                    button_face: rgb(0x20, 0x20, 0x20),
+                },
+            ),
+            (
+                "deserto",
+                SystemContrast {
+                    window: rgb(0xFF, 0xFA, 0xEF),
+                    window_text: rgb(0x3D, 0x3D, 0x3D),
+                    highlight: rgb(0x90, 0x39, 0x09),
+                    highlight_text: rgb(0xFF, 0xF5, 0xE3),
+                    button_face: rgb(0xFF, 0xFA, 0xEF),
+                },
+            ),
+        ]
+    }
+
+    /// C-P4: con un tema a contrasto elevato i token vengono dai colori di sistema e le
+    /// coppie usate dall'interfaccia restano leggibili.
+    #[test]
+    fn high_contrast_tokens_follow_the_system_colors() {
+        for (name, colors) in windows_contrast_themes() {
+            let t = Tokens::high_contrast(&colors);
+            assert_eq!(t.bg, colors.window, "{name}");
+            assert_eq!(t.text_strong, colors.window_text, "{name}");
+            assert_eq!(t.selection_bg, colors.highlight, "{name}");
+            assert_eq!(t.on_selection, colors.highlight_text, "{name}");
+            for (pair, a, b, min) in [
+                ("testo/fondo", t.text_strong, t.bg, TEXT_MIN),
+                ("testo debole/fondo", t.text_weak, t.bg, TEXT_MIN),
+                ("errore/fondo", t.error, t.bg, TEXT_MIN),
+                ("testo/controlli", t.text_strong, t.fill, TEXT_MIN),
+                ("selezione", t.on_selection, t.selection_bg, TEXT_MIN),
+                ("primario", t.on_accent, t.accent, TEXT_MIN),
+                ("corrispondenze", t.text_strong, t.highlight_bg, TEXT_MIN),
+                ("bordi", t.stroke_strong, t.bg, NON_TEXT_MIN),
+                ("focus", t.focus, t.bg, NON_TEXT_MIN),
+                ("segno", t.selection_mark, t.selection_bg, NON_TEXT_MIN),
+            ] {
+                assert_contrast(name, pair, a, b, min);
             }
         }
     }

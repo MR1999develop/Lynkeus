@@ -5,17 +5,26 @@
 //! primario Cerca (che diventa Annulla), fisso in fondo al pannello.
 //!
 //! Gli errori di un campo compaiono sotto il campo dopo la prima uscita dal campo o il
-//! primo tentativo di ricerca, poi si aggiornano a ogni modifica.
+//! primo tentativo di ricerca, poi si aggiornano a ogni modifica. Quando la ricerca non
+//! parte, il primo campo da correggere riceve il focus e va in vista.
+//!
+//! L'ordine del Tab è quello di lettura: luoghi, termini, opzioni, filtri, poi Cerca (il
+//! bottone si disegna per ultimo, nello spazio riservato in fondo). I campi hanno un bordo
+//! di focus di 2 px; il primario, con il fondo d'accento, ha l'anello all'esterno.
 
-use egui::{Button, CollapsingHeader, DragValue, Label, RichText, TextEdit, Ui, vec2};
+use egui::{
+    Button, CollapsingHeader, CornerRadius, DragValue, Id, Label, Response, RichText, Stroke,
+    StrokeKind, TextEdit, Ui, vec2,
+};
 
+use super::panes::{self, Pane};
 use super::{Action, Command};
 use crate::app::Application;
-use crate::form::{PathInputStatus, RootKind, TermRowError};
+use crate::form::{FormField, PathInputStatus, RootKind, TermRowError};
 use crate::format;
 use crate::i18n::I18n;
 use crate::settings::{ExtensionMode, MAX_FILE_SIZE_MIB_RANGE};
-use crate::theme::{self, SPACE};
+use crate::theme::{self, FOCUS_GAP, RADIUS, SPACE};
 
 /// Larghezza dei bottoni quadrati "×" accanto alle righe.
 const ICON_BUTTON_WIDTH: f32 = 28.0;
@@ -23,23 +32,42 @@ const ICON_BUTTON_WIDTH: f32 = 28.0;
 const PRIMARY_HEIGHT: f32 = 32.0;
 
 pub(super) fn show(app: &mut Application, ui: &mut Ui, actions: &mut Vec<Action>) {
-    egui::Panel::bottom("search_actions")
-        .show_separator_line(false)
-        .show(ui, |ui| primary_button(app, ui, actions));
+    let tokens = theme::current(ui.ctx());
+    // I campi di testo disegnano il focus con il tratto della selezione.
+    ui.visuals_mut().selection.stroke = theme::focus_stroke(&tokens);
+    let panel = ui.max_rect();
+    let focus = app.view_state.focus_field.take();
+    // Lo spazio del bottone primario in fondo; il modulo scorre in quello che resta.
+    let footer = PRIMARY_HEIGHT + 2.0 * SPACE[1] + 3.0 * ui.spacing().item_spacing.y;
+    let form_height = (ui.available_height() - footer).max(0.0);
+    let mut first_term = None;
     egui::ScrollArea::vertical()
         .id_salt("search_form")
         .auto_shrink([false, false])
+        .max_height(form_height)
         .show(ui, |ui| {
             ui.add_space(SPACE[1]);
-            roots_section(app, ui, actions);
+            roots_section(app, ui, focus, actions);
             ui.add_space(SPACE[4]);
-            terms_section(app, ui, actions);
+            first_term = terms_section(app, ui, focus, actions);
             ui.add_space(SPACE[4]);
             options_section(app, ui, actions);
             ui.add_space(SPACE[3]);
-            filters_section(app, ui, actions);
+            filters_section(app, ui, focus, actions);
             ui.add_space(SPACE[2]);
         });
+    primary_button(app, ui, actions);
+    if let Some(target) = first_term {
+        panes::register(ui.ctx(), Pane::Search, panel, target);
+    }
+}
+
+/// Se `field` è il campo richiesto, gli dà il focus e lo porta in vista.
+fn focus_if_requested(response: &Response, field: FormField, requested: Option<FormField>) {
+    if requested == Some(field) {
+        response.request_focus();
+        response.scroll_to_me(None);
+    }
 }
 
 fn section_title(ui: &mut Ui, text: String) -> egui::Response {
@@ -65,7 +93,12 @@ fn caption(ui: &mut Ui, text: String) {
     ));
 }
 
-fn roots_section(app: &mut Application, ui: &mut Ui, actions: &mut Vec<Action>) {
+fn roots_section(
+    app: &mut Application,
+    ui: &mut Ui,
+    focus: Option<FormField>,
+    actions: &mut Vec<Action>,
+) {
     let i18n = app.i18n().clone();
     section_title(ui, i18n.tr("form-roots-title"));
     if app.form.roots.is_empty() {
@@ -106,7 +139,9 @@ fn roots_section(app: &mut Application, ui: &mut Ui, actions: &mut Vec<Action>) 
         });
     }
     ui.horizontal_wrapped(|ui| {
-        if ui.button(i18n.tr("form-add-folder")).clicked() {
+        let add_folder = ui.button(i18n.tr("form-add-folder"));
+        focus_if_requested(&add_folder, FormField::Roots, focus);
+        if add_folder.clicked() {
             actions.push(Action::Command(Command::AddFolder));
         }
         if ui.button(i18n.tr("form-add-file")).clicked() {
@@ -143,11 +178,18 @@ fn short_name(path: &std::path::Path) -> String {
     )
 }
 
-fn terms_section(app: &mut Application, ui: &mut Ui, actions: &mut Vec<Action>) {
+/// I termini, una riga ciascuno; restituisce il campo della prima riga (la zona del
+/// pannello per F6).
+fn terms_section(
+    app: &mut Application,
+    ui: &mut Ui,
+    focus: Option<FormField>,
+    actions: &mut Vec<Action>,
+) -> Option<Id> {
     let i18n = app.i18n().clone();
     section_title(ui, i18n.tr("form-terms-title"));
     let row_count = app.form.terms().len();
-    let focus_first = std::mem::take(&mut app.view_state.focus_first_term);
+    let mut first_field = None;
     for index in 0..row_count {
         let number = index + 1;
         let Some(row_id) = app.form.terms().get(index).map(crate::form::TermRow::id) else {
@@ -192,8 +234,9 @@ fn terms_section(app: &mut Application, ui: &mut Ui, actions: &mut Vec<Action>) 
             })
             .inner;
         if let Some(field) = field {
-            if focus_first && index == 0 {
-                field.request_focus();
+            focus_if_requested(&field, FormField::Term(index), focus);
+            if index == 0 {
+                first_field = Some(field.id);
             }
             if field.changed() {
                 actions.push(Action::TermsEdited);
@@ -225,6 +268,7 @@ fn terms_section(app: &mut Application, ui: &mut Ui, actions: &mut Vec<Action>) 
     {
         error_text(ui, format::query_error(&i18n, error));
     }
+    first_field
 }
 
 /// Il messaggio sotto la riga `index`, se va mostrato.
@@ -281,7 +325,12 @@ fn options_section(app: &mut Application, ui: &mut Ui, actions: &mut Vec<Action>
     });
 }
 
-fn filters_section(app: &mut Application, ui: &mut Ui, actions: &mut Vec<Action>) {
+fn filters_section(
+    app: &mut Application,
+    ui: &mut Ui,
+    focus: Option<FormField>,
+    actions: &mut Vec<Action>,
+) {
     let i18n = app.i18n().clone();
     let open = std::mem::take(&mut app.view_state.open_filters).then_some(true);
     let filters = &mut app.form.filters;
@@ -322,6 +371,7 @@ fn filters_section(app: &mut Application, ui: &mut Ui, actions: &mut Vec<Action>
                         .desired_width(f32::INFINITY),
                 )
                 .labelled_by(label.id);
+            focus_if_requested(&field, FormField::Extensions, focus);
             if field.lost_focus() {
                 filters.show_extension_error = true;
             }
@@ -376,18 +426,38 @@ fn primary_button(app: &Application, ui: &mut Ui, actions: &mut Vec<Action>) {
         (i18n.tr("action-search"), Command::Search)
     };
     ui.add_space(SPACE[1]);
+    // Lascia posto all'anello di focus esterno, ai lati.
+    let width = ui.available_width() - 2.0 * (FOCUS_GAP + theme::FOCUS_WIDTH);
     let button = Button::new(
         RichText::new(label)
             .color(tokens.on_accent)
             .family(theme::semibold_family()),
     )
     .fill(tokens.accent)
-    .min_size(vec2(ui.available_width(), PRIMARY_HEIGHT));
+    .min_size(vec2(width, PRIMARY_HEIGHT));
     let shortcut = command
         .shortcut()
         .map(|s| ui.ctx().format_shortcut(&s))
         .unwrap_or_default();
-    if ui.add(button).on_hover_text(shortcut).clicked() {
+    let response = ui
+        .horizontal(|ui| {
+            ui.add_space(FOCUS_GAP + theme::FOCUS_WIDTH);
+            // Sul fondo d'accento il bordo resta dell'accento: il focus è l'anello fuori.
+            let widgets = &mut ui.visuals_mut().widgets;
+            widgets.active.bg_stroke = Stroke::new(theme::FOCUS_WIDTH, tokens.accent);
+            ui.add(button)
+        })
+        .inner;
+    if response.has_focus() {
+        let radius = f32::from(RADIUS[0]) + FOCUS_GAP;
+        ui.painter().rect_stroke(
+            response.rect.expand(FOCUS_GAP),
+            CornerRadius::from(radius),
+            theme::focus_stroke(&tokens),
+            StrokeKind::Outside,
+        );
+    }
+    if response.on_hover_text(shortcut).clicked() {
         actions.push(Action::Command(command));
     }
     ui.add_space(SPACE[1]);

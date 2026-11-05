@@ -86,6 +86,9 @@ pub(super) fn bar(app: &Application, ui: &mut Ui, actions: &mut Vec<Action>) {
                 actions,
             );
             ui.separator();
+            item(app, ui, Command::NextPane, actions);
+            item(app, ui, Command::PreviousPane, actions);
+            ui.separator();
             ui.menu_button(i18n.tr("menu-theme"), |ui| {
                 for choice in ThemeChoice::ALL {
                     let id = match choice {

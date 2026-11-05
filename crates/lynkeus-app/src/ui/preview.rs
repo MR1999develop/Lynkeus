@@ -7,11 +7,16 @@
 //! L'unità del risultato è segnata da "›" e da un fondo; le corrispondenze come nella
 //! tabella (fondo, SemiBold, sottolineate): il colore non è mai l'unico segnale. Il
 //! contenuto lo prepara [`Application::update_preview`] in un thread; qui si disegna
-//! soltanto.
+//! soltanto. Le unità lunghe (un paragrafo intero) vanno a capo: si scorre solo in
+//! verticale.
+//!
+//! I bottoni dell'intestazione mostrano un testo breve ("« File") e hanno come nome
+//! accessibile quello completo del comando ("File precedente").
 
 use egui::text::LayoutJob;
-use egui::{Button, Color32, FontId, Label, RichText, ScrollArea, Stroke, TextFormat, Ui};
+use egui::{Button, Color32, FontId, Id, Label, RichText, ScrollArea, Stroke, TextFormat, Ui};
 
+use super::panes::{self, Pane};
 use super::{Action, Command};
 use crate::app::{Application, PROGRESS_DELAY, PreviewState};
 use crate::format;
@@ -23,8 +28,11 @@ use crate::theme::{self, SPACE, Tokens};
 const FOCUS_MARK: &str = "›";
 
 pub(super) fn show(app: &mut Application, ui: &mut Ui, actions: &mut Vec<Action>) {
+    let pane = ui.max_rect();
     ui.add_space(SPACE[0]);
-    header(app, ui, actions);
+    if let Some(first_button) = header(app, ui, actions) {
+        panes::register(ui.ctx(), Pane::Preview, pane, first_button);
+    }
     ui.separator();
     let i18n = app.i18n().clone();
     let tokens = theme::current(ui.ctx());
@@ -60,7 +68,7 @@ pub(super) fn show(app: &mut Application, ui: &mut Ui, actions: &mut Vec<Action>
         PreviewState::Ready(key, Loaded::Units(units)) => {
             let scroll_now = app.view_state.preview_scrolled != Some(key);
             app.view_state.preview_scrolled = Some(key);
-            ScrollArea::both()
+            ScrollArea::vertical()
                 .id_salt("preview_units")
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
@@ -77,9 +85,11 @@ pub(super) fn show(app: &mut Application, ui: &mut Ui, actions: &mut Vec<Action>
 }
 
 /// Intestazione: documento e posizione del risultato, poi i passi tra i risultati e Apri.
-fn header(app: &Application, ui: &mut Ui, actions: &mut Vec<Action>) {
+/// Restituisce il primo bottone attivo (dove va il focus arrivando all'anteprima con F6).
+fn header(app: &Application, ui: &mut Ui, actions: &mut Vec<Action>) -> Option<Id> {
     let i18n = app.i18n();
     ui.horizontal(|ui| {
+        let mut first = None;
         for (step, id) in [
             (Step::PreviousFile, "preview-previous-file"),
             (Step::PreviousInFile, "preview-previous"),
@@ -87,10 +97,11 @@ fn header(app: &Application, ui: &mut Ui, actions: &mut Vec<Action>) {
             (Step::NextFile, "preview-next-file"),
         ] {
             let command = Command::Step(step);
-            step_button(app, ui, command, id, actions);
+            let button = step_button(app, ui, command, id, actions);
+            first = first.or(button);
         }
         let open = Command::Open;
-        step_button(app, ui, open, "preview-open", actions);
+        let open = step_button(app, ui, open, "preview-open", actions);
         ui.add_space(SPACE[1]);
         if let Some(hit) = app.cursor_hit() {
             let root = app.results().roots.get(hit.root);
@@ -103,21 +114,27 @@ fn header(app: &Application, ui: &mut Ui, actions: &mut Vec<Action>) {
             ui.add(Label::new(RichText::new(title).family(theme::semibold_family())).truncate())
                 .on_hover_text(hit.doc.to_string());
         }
-    });
+        first.or(open)
+    })
+    .inner
 }
 
-/// Un bottone dell'intestazione legato a un comando: disabilitato con il motivo nel
-/// tooltip, la scorciatoia nel tooltip quando è attivo.
+/// Un bottone dell'intestazione legato a un comando: testo breve, nome accessibile del
+/// comando, disabilitato con il motivo nel tooltip, la scorciatoia nel tooltip quando è
+/// attivo. Restituisce il suo `Id` se è attivo.
 fn step_button(
     app: &Application,
     ui: &mut Ui,
     command: Command,
     label_id: &str,
     actions: &mut Vec<Action>,
-) {
+) -> Option<Id> {
     let i18n = app.i18n();
     let availability = command.availability(app);
-    let response = ui.add_enabled(availability.is_ok(), Button::new(i18n.tr(label_id)));
+    let response = ui
+        .add_enabled(availability.is_ok(), Button::new(i18n.tr(label_id)))
+        .accessible_name(i18n.tr(command.label_id()));
+    let id = availability.is_ok().then_some(response.id);
     let response = match availability {
         Err(reason) => response.on_disabled_hover_text(i18n.tr(reason)),
         Ok(()) => {
@@ -131,9 +148,11 @@ fn step_button(
     if response.clicked() {
         actions.push(Action::Command(command));
     }
+    id
 }
 
-/// Una riga dell'anteprima: posizione, segno del risultato, testo con le corrispondenze.
+/// Una riga dell'anteprima: posizione, segno del risultato, testo con le corrispondenze,
+/// che va a capo nello spazio della riga.
 fn unit_row(
     app: &Application,
     ui: &mut Ui,
@@ -142,7 +161,7 @@ fn unit_row(
     tokens: &Tokens,
 ) -> egui::InnerResponse<()> {
     let i18n = app.i18n();
-    ui.horizontal(|ui| {
+    ui.horizontal_top(|ui| {
         let location = format::location(i18n, &unit.location);
         let mark = if focused { FOCUS_MARK } else { " " };
         ui.add_sized(
@@ -159,7 +178,7 @@ fn unit_row(
             .selectable(false),
         );
         let job = unit_job(unit, focused, tokens);
-        ui.add(Label::new(job).extend().selectable(false));
+        ui.add(Label::new(job).wrap().selectable(false));
     })
 }
 

@@ -323,6 +323,48 @@ mod tests {
         }
     }
 
+    /// T-C06 (C-12): saltati e binari hanno il plurale in entrambe le lingue, anche nel
+    /// riepilogo finale.
+    #[test]
+    fn plural_skipped_binary() {
+        let text = |language, skipped, binary| {
+            let counts = ProgressSnapshot {
+                files_skipped: skipped,
+                binary_skipped: binary,
+                ..ProgressSnapshot::default()
+            };
+            let running = SearchStatus::Running {
+                counts,
+                elapsed: Duration::from_secs(1),
+            };
+            let done = SearchStatus::Finished(Summary {
+                outcome: Outcome::Completed,
+                elapsed: Duration::from_secs(1),
+                counts,
+            });
+            let i18n = I18n::new(language);
+            [
+                plain(&status(&i18n, &running, 10)),
+                plain(&status(&i18n, &done, 10)),
+            ]
+        };
+        for line in text(Language::Italian, 1, 1) {
+            assert!(line.contains("1 saltato,"), "{line}");
+            assert!(line.contains("1 binario,"), "{line}");
+        }
+        for line in text(Language::Italian, 2, 3) {
+            assert!(line.contains("2 saltati,"), "{line}");
+            assert!(line.contains("3 binari,"), "{line}");
+        }
+        for line in text(Language::English, 1, 1) {
+            assert!(line.contains("1 skipped,"), "{line}");
+            assert!(line.contains("1 binary file,"), "{line}");
+        }
+        for line in text(Language::English, 2, 2) {
+            assert!(line.contains("2 binary files,"), "{line}");
+        }
+    }
+
     #[test]
     fn plural_in_status() {
         let it = italian();
