@@ -7,7 +7,7 @@
 | Contesto | circa 120 caratteri intorno alla parola |
 | Anteprima | unità di testo con ±20 unità vicine |
 | Rilevamento binari | NUL nei primi 8 KB (senza schema UTF-16) o firma nota |
-| Lettura dei file di testo | blocchi di circa 8 MB tagliati a fine riga; la codifica si decide sul primo blocco; una riga più lunga di un blocco si taglia dopo l'ultimo spazio (file con soli CR = una riga); passi di ricerca di 10.000 righe e 1 MiB |
+| Lettura dei file di testo | blocchi di circa 8 MB tagliati a fine riga; la codifica si decide sul primo blocco; una riga più lunga di un blocco si taglia dopo l'ultimo spazio (file con soli CR = una riga); passi di ricerca di 10.000 righe e 64 KiB (`step.rs`), usati anche per le unità dei documenti: limitano la memoria dei risultati di `find_words` di un passo (circa 240 byte per parola trovata, al più una parola ogni due byte: circa 8 MB per thread) |
 | Dimensione massima di un file | 200 MiB (modificabile o senza limite); vale anche per le radici; in `settings.toml` da 1 a 1.048.576 MiB |
 | Luoghi di ricerca (radici) | al più 256 (`MAX_ROOTS`, `form.rs`); vale per l'elenco, per i percorsi dell'istanza unica e per `roots` di `settings.toml` (oltre, scartati); il 257° non entra e compare l'avviso `notice-roots-limit` |
 | Termini | 32 per ricerca, 256 caratteri ciascuno (spazi esterni esclusi) |

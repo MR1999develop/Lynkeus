@@ -26,6 +26,7 @@ use crate::event::WarningKind;
 use crate::halt::Stop;
 use crate::progress::{Counter, Progress};
 use crate::request::SearchRequest;
+use crate::step::steps;
 
 /// Quale lettura del file.
 #[derive(Debug, Clone, Copy)]
@@ -195,7 +196,7 @@ impl<'a, S: HitSink> DocSearch<'a, S> {
         }
     }
 
-    /// Cerca in un'unità del documento aperto.
+    /// Cerca in un'unità del documento aperto, a passi come i file di testo ([`steps`]).
     fn unit(&mut self, unit: &TextUnit) -> Result<(), Stop> {
         self.sink.check()?;
         let Some(open) = self.open.as_mut() else {
@@ -207,17 +208,19 @@ impl<'a, S: HitSink> DocSearch<'a, S> {
             root: self.root,
             doc: Arc::clone(&open.doc),
         };
-        let room = self.sink.remaining();
-        for found in find_words(label.query, &unit.text) {
-            let make = || {
-                label.hit(
-                    &unit.text,
-                    &found,
-                    line_location(&unit.location, found.line),
-                )
-            };
-            if let Some(batch) = open.batcher.push(found.terms, room, make) {
-                self.sink.deliver(batch)?;
+        for step in steps(&unit.text) {
+            self.sink.check()?;
+            // Un'unità ha al più MAX_UNIT_TEXT_BYTES byte: le righe stanno in un u32.
+            let lines_before = u32::try_from(step.lines_before).unwrap_or(u32::MAX);
+            let room = self.sink.remaining();
+            for found in find_words(label.query, step.text) {
+                let make = || {
+                    let line = lines_before.saturating_add(found.line);
+                    label.hit(step.text, &found, line_location(&unit.location, line))
+                };
+                if let Some(batch) = open.batcher.push(found.terms, room, make) {
+                    self.sink.deliver(batch)?;
+                }
             }
         }
         Ok(())
@@ -245,11 +248,12 @@ impl<S: HitSink> EventSink for DocSearch<'_, S> {
 #[cfg(test)]
 mod tests {
     use lynkeus_core::{Combine, Location, MatchOptions, Query, Term, WildcardMode};
-    use lynkeus_extract::Format;
+    use lynkeus_extract::{Format, MAX_UNIT_TEXT_BYTES};
 
     use super::*;
     use crate::event::Hit;
     use crate::request::{Filters, Limits};
+    use crate::step::{STEP_MAX_BYTES, STEP_MAX_LINES};
 
     /// Raccoglie risultati e avvisi, senza limite.
     #[derive(Default)]
@@ -315,6 +319,52 @@ mod tests {
             kind: lynkeus_extract::WarningKind::Corrupt,
         });
         events
+    }
+
+    /// Un'unità più lunga di un passo si cerca a passi (la memoria dei risultati di un passo
+    /// è limitata) con le stesse righe dell'unità intera, anche oltre i confini dei passi.
+    #[test]
+    fn a_unit_longer_than_a_step_keeps_its_line_numbers() {
+        let lines = 3 * STEP_MAX_LINES;
+        let mut text = String::new();
+        for n in 0..lines {
+            let word = if n % 997 == 0 { "carta" } else { "riga" };
+            text.push_str(&format!("{word} {n}\n"));
+        }
+        assert!(text.len() > 2 * STEP_MAX_BYTES && text.len() <= MAX_UNIT_TEXT_BYTES);
+        let mut request = request(&["ar"]);
+        request.limits.max_results = usize::MAX;
+        let progress = Progress::default();
+        let held = HeldHits::new(usize::MAX);
+        let mut found = Collect::default();
+        {
+            let path = Path::new("documento.pdf");
+            let mut search =
+                DocSearch::new(&request, &progress, &held, &mut found, path, 0, Pass::First);
+            let events = [
+                ExtractEvent::DocumentStart {
+                    inner: Vec::new(),
+                    format: Format::Pdf,
+                },
+                ExtractEvent::Unit(TextUnit {
+                    location: Location::PageLine { page: 3, line: 5 },
+                    text,
+                }),
+                ExtractEvent::DocumentEnd,
+            ];
+            for event in events {
+                assert!(search.emit(event).is_ok());
+            }
+        }
+        let found: Vec<Location> = found.hits.into_iter().map(|h| h.location).collect();
+        let expected: Vec<Location> = (0..lines)
+            .filter(|n| n % 997 == 0)
+            .map(|n| Location::PageLine {
+                page: 3,
+                line: 5 + u32::try_from(n).unwrap_or(u32::MAX),
+            })
+            .collect();
+        assert_eq!(found, expected);
     }
 
     /// Senza posti per trattenere (altri documenti li occupano) la voce con tutti i termini

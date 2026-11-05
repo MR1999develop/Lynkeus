@@ -8,16 +8,21 @@
 //! Tra un passo e l'altro chi cerca controlla l'annullamento, e
 //! [`find_words`](lynkeus_core::find_words) lavora su un passo alla volta: i suoi risultati
 //! di un passo sono tutti in memoria insieme, quindi la dimensione del passo limita la
-//! memoria di ogni thread che cerca.
+//! memoria di ogni thread che cerca. Valgono per i file di testo e per le unità dei
+//! documenti (fino a 1 MiB ciascuna).
 
 use lynkeus_extract::text::soft_cut;
 
 /// Righe massime di un passo, tra due controlli dell'annullamento.
 pub(crate) const STEP_MAX_LINES: usize = 10_000;
 
-/// Byte massimi di un passo: limita anche la memoria dei risultati di
-/// [`find_words`](lynkeus_core::find_words).
-pub(crate) const STEP_MAX_BYTES: usize = 1024 * 1024;
+/// Byte massimi di un passo: limita la memoria dei risultati di
+/// [`find_words`](lynkeus_core::find_words), che tiene insieme tutte le parole trovate nel
+/// passo (circa 240 byte l'una, misurati con P-03) e ne trova al più una ogni due byte
+/// ("a a a …"). Con 64 KiB sono al più circa 8 MB per thread che cerca (12 della scansione
+/// più i lettori dei documenti); con 1 MiB erano 73 MB per thread già con "il il il …"
+/// (P-03: 875 MB con 12 file letti insieme).
+pub(crate) const STEP_MAX_BYTES: usize = 64 * 1024;
 
 /// Un passo di un testo.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
