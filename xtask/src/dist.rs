@@ -190,8 +190,12 @@ impl Locations {
                 text,
             });
         };
+        // Il nome utente da solo può essere una parola comune, presente per esempio nei
+        // dizionari di compressione o nelle tabelle Unicode incluse dalle dipendenze:
+        // conta solo dentro un percorso, cioè tra separatori.
         if let Some(name) = &self.user_name {
-            add("nome utente", name.clone());
+            add("nome utente in un percorso", format!(r"\{name}\"));
+            add("nome utente in un percorso", format!("/{name}/"));
         }
         if let Some(home) = &self.home {
             add("cartella utente", home.display().to_string());
