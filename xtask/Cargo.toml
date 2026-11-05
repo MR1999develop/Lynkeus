@@ -11,6 +11,8 @@ publish.workspace = true
 [dependencies]
 anyhow = "1.0.104"
 sha2 = "0.11.1"
+# Lettura delle eccezioni di deny.toml (`cargo xtask deny-review`).
+toml.workspace = true
 zip = { version = "9.3.0", default-features = false, features = ["deflate"] }
 
 [lints]

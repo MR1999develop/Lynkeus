@@ -5,12 +5,13 @@
 //! workspace (il crate ha `#![deny(unsafe_code)]`; qui il permesso è mirato).
 //!
 //! - [`restrict_dll_search`]: `SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32)`, prima
-//!   istruzione di `main`: nessuna DLL caricata dalla cartella dell'eseguibile, dalla cartella
-//!   corrente o dal `PATH`.
+//!   istruzione di `main`: nessuna DLL caricata da lì in poi dalla cartella dell'eseguibile,
+//!   dalla cartella corrente o dal `PATH` (per le DLL importate, `/DEPENDENTLOADFLAG`).
 //! - [`Job`]: Job Object con `KILL_ON_JOB_CLOSE`, limite di memoria impegnata per processo
-//!   (`JOB_OBJECT_LIMIT_PROCESS_MEMORY`, che `win32job` non offre) e porta di completamento
-//!   per sapere se un processo ha superato il limite (il codice d'uscita non lo distingue da
-//!   un aborto qualsiasi: experiments/jobobject/ESITI.md).
+//!   (`JOB_OBJECT_LIMIT_PROCESS_MEMORY`, che `win32job` non offre), un solo processo attivo,
+//!   restrizioni dell'interfaccia e porta di completamento per sapere se un processo ha
+//!   superato il limite (il codice d'uscita non lo distingue da un aborto qualsiasi:
+//!   experiments/jobobject/ESITI.md).
 //! - [`spawn_in_job`]: `CreateProcessW` con `PROC_THREAD_ATTRIBUTE_JOB_LIST` (il processo
 //!   nasce già nel job) e `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` (eredita solo stdin e stdout),
 //!   percorso assoluto, ambiente con la sola `SystemRoot`, nessuna console, cartella corrente =
@@ -23,9 +24,14 @@
 //! - Istanza unica: named pipe con `FILE_FLAG_FIRST_PIPE_INSTANCE`, solo client locali, DACL
 //!   con il solo utente e I/O sovrapposto con tempi limite ([`PipeServer`], [`PipeClient`],
 //!   aperto con SQoS Identification); [`allow_set_foreground`].
+//! - Shell e accessibilità: [`assoc_is_dangerous`] (`AssocIsDangerous`) e
+//!   [`high_contrast_active`] (`SPI_GETHIGHCONTRAST`).
 //!
 //! Ogni blocco `unsafe` ha il suo `// SAFETY:`; gli handle sono posseduti da `OwnedHandle`
-//! (chiusi una volta sola) e i puntatori passati vivono fino al ritorno della chiamata.
+//! (chiusi una volta sola) e i puntatori passati vivono fino al ritorno della chiamata. Le
+//! funzioni private con precondizioni che il compilatore non verifica sono `unsafe fn` con
+//! la sezione `# Safety` (`owned`, `cancel_and_wait`, `overlapped_io`); la lista degli
+//! attributi di `CreateProcessW` prende in prestito i suoi valori (`AttributeList<'a>`).
 #![allow(
     unsafe_code,
     reason = "unico modulo FFI dell'app: API safe sopra Win32 (PLAN.md, Architettura)"
@@ -34,8 +40,9 @@
 use std::ffi::{OsStr, OsString, c_void};
 use std::fs::File;
 use std::io;
+use std::marker::PhantomData;
 use std::os::windows::ffi::OsStrExt;
-use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle};
 use std::path::Path;
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -71,11 +78,16 @@ use windows_sys::Win32::System::IO::{
     GetQueuedCompletionStatus, OVERLAPPED,
 };
 use windows_sys::Win32::System::JobObjects::{
-    CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION,
-    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
-    JOBOBJECT_ASSOCIATE_COMPLETION_PORT, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-    JobObjectAssociateCompletionPortInformation, JobObjectExtendedLimitInformation,
-    QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
+    CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
+    JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JOB_OBJECT_LIMIT_PROCESS_MEMORY, JOB_OBJECT_UILIMIT_DESKTOP,
+    JOB_OBJECT_UILIMIT_DISPLAYSETTINGS, JOB_OBJECT_UILIMIT_EXITWINDOWS,
+    JOB_OBJECT_UILIMIT_GLOBALATOMS, JOB_OBJECT_UILIMIT_HANDLES, JOB_OBJECT_UILIMIT_READCLIPBOARD,
+    JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS, JOB_OBJECT_UILIMIT_WRITECLIPBOARD,
+    JOBOBJECT_ASSOCIATE_COMPLETION_PORT, JOBOBJECT_BASIC_UI_RESTRICTIONS,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectAssociateCompletionPortInformation,
+    JobObjectBasicUIRestrictions, JobObjectExtendedLimitInformation, QueryInformationJobObject,
+    SetInformationJobObject, TerminateJobObject,
 };
 use windows_sys::Win32::System::LibraryLoader::{
     LOAD_LIBRARY_SEARCH_SYSTEM32, SetDefaultDllDirectories,
@@ -95,13 +107,19 @@ use windows_sys::Win32::System::Threading::{
     SetEvent, TerminateProcess, UpdateProcThreadAttribute, WaitForMultipleObjects,
     WaitForSingleObject,
 };
-use windows_sys::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow;
+use windows_sys::Win32::UI::Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW};
+use windows_sys::Win32::UI::Shell::AssocIsDangerous;
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    AllowSetForegroundWindow, SPI_GETHIGHCONTRAST, SystemParametersInfoW,
+};
 use windows_sys::core::PWSTR;
 
 /// Codice d'uscita dato ai processi terminati da qui.
 const KILLED_EXIT_CODE: u32 = 1;
 
-/// Limita la ricerca delle DLL caricate da qui in poi alla cartella di sistema.
+/// Limita la ricerca delle DLL caricate da qui in poi alla cartella di sistema. Le DLL
+/// importate dall'eseguibile sono già caricate: per loro vale `DependentLoadFlags`
+/// (`/DEPENDENTLOADFLAG:0x800` in `.cargo/config.toml`).
 pub fn restrict_dll_search() -> io::Result<()> {
     // SAFETY: nessun puntatore; la funzione cambia solo un'impostazione del processo.
     let ok = unsafe { SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32) };
@@ -112,24 +130,84 @@ pub fn restrict_dll_search() -> io::Result<()> {
     }
 }
 
+/// Caratteri massimi di un'estensione chiesta ad [`assoc_is_dangerous`]: oltre, nessun tipo
+/// registrato la usa e si risponde "pericolosa" senza chiedere.
+const MAX_ASSOC_EXTENSION_CHARS: usize = 64;
+
+/// Vero se Windows considera pericoloso il tipo con estensione `extension` (senza punto):
+/// `AssocIsDangerous`, che unisce l'elenco del sistema e i tipi registrati come sempre
+/// pericolosi. Un'estensione vuota non è un tipo (falso); con NUL o troppo lunga conta come
+/// pericolosa.
+pub fn assoc_is_dangerous(extension: &str) -> bool {
+    if extension.is_empty() {
+        return false;
+    }
+    if extension.contains('\0') || extension.chars().count() > MAX_ASSOC_EXTENSION_CHARS {
+        return true;
+    }
+    let dotted = wide(OsStr::new(&format!(".{extension}")));
+    // SAFETY: stringa UTF-16 terminata da zero viva fino al ritorno; la funzione la legge
+    // soltanto.
+    unsafe { AssocIsDangerous(dotted.as_ptr()) != 0 }
+}
+
+/// Vero se è attivo un tema a contrasto elevato (`SPI_GETHIGHCONTRAST`, flag
+/// `HCF_HIGHCONTRASTON`); falso se la domanda non riesce.
+pub fn high_contrast_active() -> bool {
+    // SAFETY: struttura C di interi e un puntatore, lo zero è un valore valido.
+    let mut info: HIGHCONTRASTW = unsafe { std::mem::zeroed() };
+    info.cbSize = struct_len::<HIGHCONTRASTW>();
+    // SAFETY: `info` è una HIGHCONTRASTW con `cbSize` corretto, scrivibile per la sua
+    // lunghezza e viva fino al ritorno; nessuna impostazione cambiata (`fWinIni` = 0).
+    let ok = unsafe {
+        SystemParametersInfoW(
+            SPI_GETHIGHCONTRAST,
+            struct_len::<HIGHCONTRASTW>(),
+            (&raw mut info).cast::<c_void>(),
+            0,
+        )
+    };
+    ok != 0 && info.dwFlags & HCF_HIGHCONTRASTON != 0
+}
+
 fn struct_len<T>() -> u32 {
     u32::try_from(size_of::<T>()).unwrap_or(u32::MAX)
 }
 
 /// Un handle appena restituito da Win32, o l'ultimo errore se nullo o non valido.
-fn owned(handle: HANDLE) -> io::Result<OwnedHandle> {
+///
+/// # Safety
+///
+/// `handle` deve essere nullo, `INVALID_HANDLE_VALUE` o un handle aperto appena restituito
+/// da una funzione Win32 e non posseduto da nessun altro: `OwnedHandle` lo chiuderà.
+unsafe fn owned(handle: HANDLE) -> io::Result<OwnedHandle> {
     if handle.is_null() || handle == INVALID_HANDLE_VALUE {
         return Err(io::Error::last_os_error());
     }
-    // SAFETY: handle valido appena creato, posseduto solo da qui: `OwnedHandle` lo chiude una
-    // volta sola.
+    // SAFETY: handle valido appena creato, posseduto solo da qui (garanzia del chiamante):
+    // `OwnedHandle` lo chiude una volta sola.
     Ok(unsafe { OwnedHandle::from_raw_handle(handle) })
 }
+
+/// Restrizioni dell'interfaccia dei processi estrattori: niente appunti, atomi globali,
+/// handle di finestre di altri processi, impostazioni di sistema e dello schermo, desktop,
+/// uscita da Windows. Un estrattore non ha finestre: nulla di questo gli serve.
+const WORKER_UI_RESTRICTIONS: u32 = JOB_OBJECT_UILIMIT_DESKTOP
+    | JOB_OBJECT_UILIMIT_DISPLAYSETTINGS
+    | JOB_OBJECT_UILIMIT_EXITWINDOWS
+    | JOB_OBJECT_UILIMIT_GLOBALATOMS
+    | JOB_OBJECT_UILIMIT_HANDLES
+    | JOB_OBJECT_UILIMIT_READCLIPBOARD
+    | JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS
+    | JOB_OBJECT_UILIMIT_WRITECLIPBOARD;
 
 /// Un Job Object con un solo processo estrattore.
 ///
 /// Chiuderlo (drop) termina il processo (`KILL_ON_JOB_CLOSE`); il sistema lo chiude anche se
-/// l'app termina in modo anomalo, quindi nessun estrattore sopravvive all'app.
+/// l'app termina in modo anomalo, quindi nessun estrattore sopravvive all'app. Il processo
+/// non può avviarne altri (`ActiveProcessLimit` = 1) né usare l'interfaccia del sistema
+/// ([`WORKER_UI_RESTRICTIONS`]): un decoder compromesso resta senza programmi da lanciare,
+/// appunti e finestre altrui.
 #[derive(Debug)]
 pub struct Job {
     handle: OwnedHandle,
@@ -138,15 +216,19 @@ pub struct Job {
 }
 
 impl Job {
-    /// Un job con limite di `memory_limit` byte di memoria impegnata per processo.
+    /// Un job con limite di `memory_limit` byte di memoria impegnata per processo, un solo
+    /// processo attivo e le restrizioni dell'interfaccia.
     pub fn new(memory_limit: usize) -> io::Result<Job> {
-        // SAFETY: attributi nulli (handle non ereditabile) e nessun nome.
-        let handle = owned(unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) })?;
+        // SAFETY: attributi nulli (handle non ereditabile) e nessun nome; l'handle
+        // restituito è posseduto solo da qui.
+        let handle = unsafe { owned(CreateJobObjectW(std::ptr::null(), std::ptr::null())) }?;
         // SAFETY: struttura C di soli interi, lo zero è un valore valido.
         let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
         info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
             | JOB_OBJECT_LIMIT_PROCESS_MEMORY
-            | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
+            | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION
+            | JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
+        info.BasicLimitInformation.ActiveProcessLimit = 1;
         info.ProcessMemoryLimit = memory_limit;
         // SAFETY: handle del job valido; puntatore e lunghezza della struttura corretti, la
         // struttura vive fino al ritorno.
@@ -161,10 +243,31 @@ impl Job {
         if ok == 0 {
             return Err(io::Error::last_os_error());
         }
-        // SAFETY: nuova porta non associata a file (INVALID_HANDLE_VALUE), un thread.
-        let port = owned(unsafe {
-            CreateIoCompletionPort(INVALID_HANDLE_VALUE, std::ptr::null_mut(), 0, 1)
-        })?;
+        let restrictions = JOBOBJECT_BASIC_UI_RESTRICTIONS {
+            UIRestrictionsClass: WORKER_UI_RESTRICTIONS,
+        };
+        // SAFETY: come sopra, con la struttura delle restrizioni dell'interfaccia.
+        let ok = unsafe {
+            SetInformationJobObject(
+                handle.as_raw_handle(),
+                JobObjectBasicUIRestrictions,
+                (&raw const restrictions).cast::<c_void>(),
+                struct_len::<JOBOBJECT_BASIC_UI_RESTRICTIONS>(),
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: nuova porta non associata a file (INVALID_HANDLE_VALUE), un thread;
+        // l'handle restituito è posseduto solo da qui.
+        let port = unsafe {
+            owned(CreateIoCompletionPort(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null_mut(),
+                0,
+                1,
+            ))
+        }?;
         let association = JOBOBJECT_ASSOCIATE_COMPLETION_PORT {
             CompletionKey: std::ptr::null_mut(),
             CompletionPort: port.as_raw_handle(),
@@ -329,7 +432,9 @@ fn pipe() -> io::Result<(OwnedHandle, OwnedHandle)> {
     if unsafe { CreatePipe(&raw mut read, &raw mut write, std::ptr::null(), 0) } == 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok((owned(read)?, owned(write)?))
+    // SAFETY: due handle appena creati da `CreatePipe`, posseduti solo da qui.
+    let (read, write) = unsafe { (owned(read), owned(write)) };
+    Ok((read?, write?))
 }
 
 /// Rende ereditabile un handle (serve per la lista degli handle di `CreateProcessW`).
@@ -420,13 +525,17 @@ fn minimal_environment() -> Vec<u16> {
 static SPAWN_LOCK: Mutex<()> = Mutex::new(());
 
 /// La lista degli attributi di `CreateProcessW`, liberata nel `Drop`.
-struct AttributeList {
+///
+/// La lista tiene puntatori ai valori passati a [`AttributeList::set`]: il prestito `'a`
+/// li tiene vivi finché la lista esiste (e la lista va usata prima del suo `Drop`).
+struct AttributeList<'a> {
     storage: Vec<usize>,
+    values: PhantomData<&'a [HANDLE]>,
 }
 
-impl AttributeList {
+impl<'a> AttributeList<'a> {
     /// Una lista inizializzata per `count` attributi.
-    fn new(count: u32) -> io::Result<AttributeList> {
+    fn new(count: u32) -> io::Result<AttributeList<'a>> {
         let mut size = 0usize;
         // SAFETY: prima chiamata con lista nulla per sapere la dimensione; fallisce di
         // proposito e scrive solo `size`.
@@ -444,21 +553,21 @@ impl AttributeList {
         if ok == 0 {
             return Err(io::Error::last_os_error());
         }
-        Ok(AttributeList { storage })
+        Ok(AttributeList {
+            storage,
+            values: PhantomData,
+        })
     }
 
     fn as_ptr(&mut self) -> *mut c_void {
         self.storage.as_mut_ptr().cast::<c_void>()
     }
 
-    /// Imposta un attributo che punta a `values`.
-    ///
-    /// I valori devono vivere finché la lista è usata da `CreateProcessW`: lo garantisce il
-    /// chiamante tenendoli in vita oltre la chiamata (vedi [`spawn_in_job`]).
-    fn set(&mut self, attribute: usize, values: &[HANDLE]) -> io::Result<()> {
+    /// Imposta un attributo che punta a `values`, prestati finché vive la lista.
+    fn set(&mut self, attribute: usize, values: &'a [HANDLE]) -> io::Result<()> {
         let list = self.as_ptr();
-        // SAFETY: lista inizializzata; `values` è un array valido di `size_of_val` byte che il
-        // chiamante mantiene in vita fino a dopo `CreateProcessW`.
+        // SAFETY: lista inizializzata; `values` è un array valido di `size_of_val` byte, vivo
+        // per tutta la vita della lista (prestito `'a`).
         let ok = unsafe {
             UpdateProcThreadAttribute(
                 list,
@@ -478,7 +587,7 @@ impl AttributeList {
     }
 }
 
-impl Drop for AttributeList {
+impl Drop for AttributeList<'_> {
     fn drop(&mut self) {
         let list = self.as_ptr();
         // SAFETY: lista inizializzata in `new`, cancellata una volta sola.
@@ -549,11 +658,12 @@ pub fn spawn_in_job(exe: &Path, args: &[OsString], job: &Job) -> io::Result<Spaw
     if created == 0 {
         return Err(error);
     }
+    // SAFETY: handle del thread e del processo appena creati da `CreateProcessW` riuscita,
+    // posseduti solo da qui.
+    let (thread, process) = unsafe { (owned(info.hThread), owned(info.hProcess)) };
     // Il thread principale non serve; il processo resta posseduto da `ChildProcess`.
-    drop(owned(info.hThread));
-    let process = ChildProcess {
-        handle: owned(info.hProcess)?,
-    };
+    drop(thread);
+    let process = ChildProcess { handle: process? };
     Ok(SpawnedChild {
         process,
         stdin: File::from(stdin_write),
@@ -701,7 +811,8 @@ fn token_user(process: HANDLE) -> io::Result<Sid> {
     if unsafe { OpenProcessToken(process, TOKEN_QUERY, &raw mut token) } == 0 {
         return Err(io::Error::last_os_error());
     }
-    let token = owned(token)?;
+    // SAFETY: handle del token appena aperto, posseduto solo da qui.
+    let token = unsafe { owned(token) }?;
     let mut needed = 0u32;
     // SAFETY: prima chiamata senza buffer per sapere la dimensione; scrive solo `needed`.
     unsafe {
@@ -745,8 +856,8 @@ pub fn current_user() -> io::Result<Sid> {
 
 /// Il SID dell'utente del processo `pid`.
 pub fn process_user(pid: u32) -> io::Result<Sid> {
-    // SAFETY: nessun puntatore; l'handle restituito è posseduto da `owned`.
-    let process = owned(unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) })?;
+    // SAFETY: nessun puntatore; l'handle restituito è posseduto solo da qui.
+    let process = unsafe { owned(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid)) }?;
     token_user(process.as_raw_handle())
 }
 
@@ -913,10 +1024,10 @@ unsafe fn read_acl(acl: *const ACL) -> io::Result<Vec<Ace>> {
 /// Apre `path` (file o cartella, senza seguire collegamenti) per leggerne la sicurezza.
 fn open_for_security(path: &Path) -> io::Result<OwnedHandle> {
     let name = wide(path.as_os_str());
-    // SAFETY: stringa terminata da zero; attributi nulli; l'handle restituito è posseduto da
-    // `owned`.
-    let handle = unsafe {
-        CreateFileW(
+    // SAFETY: stringa terminata da zero; attributi nulli; l'handle restituito è posseduto
+    // solo da qui.
+    unsafe {
+        owned(CreateFileW(
             name.as_ptr(),
             READ_CONTROL,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
@@ -924,9 +1035,8 @@ fn open_for_security(path: &Path) -> io::Result<OwnedHandle> {
             OPEN_EXISTING,
             FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
             std::ptr::null_mut(),
-        )
-    };
-    owned(handle)
+        ))
+    }
 }
 
 /// Attributi del file aperto.
@@ -1137,9 +1247,9 @@ pub fn create_new_private_file(path: &Path) -> io::Result<File> {
     let attributes = descriptor.attributes();
     let name = wide(path.as_os_str());
     // SAFETY: stringa terminata da zero; attributi con un descrittore vivo fino al ritorno;
-    // l'handle restituito è posseduto da `owned`.
+    // l'handle restituito è posseduto solo da qui.
     let handle = unsafe {
-        CreateFileW(
+        owned(CreateFileW(
             name.as_ptr(),
             GENERIC_WRITE,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
@@ -1147,9 +1257,9 @@ pub fn create_new_private_file(path: &Path) -> io::Result<File> {
             CREATE_NEW,
             FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
             std::ptr::null_mut(),
-        )
-    };
-    Ok(File::from(owned(handle)?))
+        ))
+    }?;
+    Ok(File::from(handle))
 }
 
 /// Cartelle e file privati con il descrittore esplicito, iniettati nell'engine.
@@ -1192,8 +1302,9 @@ struct Event {
 
 impl Event {
     fn new() -> io::Result<Event> {
-        // SAFETY: attributi nulli, nessun nome; evento manuale non segnalato.
-        let handle = owned(unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) })?;
+        // SAFETY: attributi nulli, nessun nome; evento manuale non segnalato; l'handle
+        // restituito è posseduto solo da qui.
+        let handle = unsafe { owned(CreateEventW(std::ptr::null(), 1, 0, std::ptr::null())) }?;
         Ok(Event { handle })
     }
 }
@@ -1247,15 +1358,26 @@ fn is_os_error(error: &io::Error, code: u32) -> bool {
 /// Regola del modulo: ogni operazione sovrapposta avviata (esito `ERROR_IO_PENDING` o
 /// completata) che non si è vista finire con un'attesa riuscita passa da qui prima che
 /// struttura, evento o buffer escano di scope, qualunque sia l'errore visto.
-fn cancel_and_wait(handle: HANDLE, overlapped: &OVERLAPPED) -> io::Result<u32> {
+///
+/// # Safety
+///
+/// `overlapped` punta alla struttura (viva, mai spostata) di un'operazione avviata su
+/// `handle`, anche già finita, e resta valido fino al ritorno. Il puntatore è grezzo di
+/// proposito: il sistema può scrivere nella struttura fino alla fine dell'operazione, quindi
+/// nessun riferimento Rust deve esistere su di essa in quel tempo.
+unsafe fn cancel_and_wait(
+    handle: BorrowedHandle<'_>,
+    overlapped: *mut OVERLAPPED,
+) -> io::Result<u32> {
     let mut transferred = 0u32;
     // SAFETY: `handle` è l'handle su cui l'operazione è stata avviata e `overlapped` la sua
-    // struttura, viva fino al ritorno. `CancelIoEx` su un'operazione già finita fallisce con
-    // `ERROR_NOT_FOUND` senza effetti; `GetOverlappedResult` con attesa (`bWait` = 1) ritorna
-    // solo a operazione finita (completata o annullata).
+    // struttura, viva fino al ritorno (garanzia del chiamante). `CancelIoEx` su
+    // un'operazione già finita fallisce con `ERROR_NOT_FOUND` senza effetti;
+    // `GetOverlappedResult` con attesa (`bWait` = 1) ritorna solo a operazione finita
+    // (completata o annullata).
     let done = unsafe {
-        CancelIoEx(handle, overlapped);
-        GetOverlappedResult(handle, overlapped, &raw mut transferred, 1)
+        CancelIoEx(handle.as_raw_handle(), overlapped);
+        GetOverlappedResult(handle.as_raw_handle(), overlapped, &raw mut transferred, 1)
     };
     if done == 0 {
         Err(io::Error::last_os_error())
@@ -1277,16 +1399,27 @@ fn wait_expired(error: &io::Error) -> bool {
 /// dell'attesa) la annulla e ne aspetta la chiusura ([`cancel_and_wait`]): la struttura
 /// OVERLAPPED, l'evento e il buffer non spariscono mai con l'operazione in corso.
 /// Restituisce i byte trasferiti; `TimedOut` se il tempo è scaduto senza trasferimento.
-fn overlapped_io(
-    handle: HANDLE,
+///
+/// `start` riceve l'handle e la struttura, avvia l'operazione e restituisce l'esito della
+/// funzione Win32 (zero = errore, con `ERROR_IO_PENDING` per un'operazione in corso).
+///
+/// # Safety
+///
+/// `start` avvia al più un'operazione sovrapposta, sull'handle e con la struttura che
+/// riceve; i buffer che le passa restano validi (e non spostati) fino al ritorno di questa
+/// funzione.
+unsafe fn overlapped_io(
+    handle: BorrowedHandle<'_>,
     timeout: Duration,
-    start: impl FnOnce(*mut OVERLAPPED) -> i32,
+    start: impl FnOnce(HANDLE, *mut OVERLAPPED) -> i32,
 ) -> io::Result<u32> {
     let event = Event::new()?;
     // SAFETY: struttura C di interi e puntatori, lo zero è un valore valido.
     let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
     overlapped.hEvent = event.handle.as_raw_handle();
-    if start(&raw mut overlapped) == 0 {
+    // Da qui in poi la struttura si tocca solo tramite questo puntatore.
+    let pointer = &raw mut overlapped;
+    if start(handle.as_raw_handle(), pointer) == 0 {
         let error = io::Error::last_os_error();
         if error.raw_os_error() != i32::try_from(ERROR_IO_PENDING).ok() {
             // L'operazione non è partita: nulla da attendere.
@@ -1297,12 +1430,12 @@ fn overlapped_io(
         .unwrap_or(INFINITE - 1)
         .min(INFINITE - 1);
     let mut transferred = 0u32;
-    // SAFETY: handle valido; `overlapped` vivo fino alla fine dell'operazione (sotto, in ogni
+    // SAFETY: handle valido; la struttura vive fino alla fine dell'operazione (sotto, in ogni
     // caso diverso dal completamento visto qui, `cancel_and_wait`).
     let done = unsafe {
         GetOverlappedResultEx(
-            handle,
-            &raw const overlapped,
+            handle.as_raw_handle(),
+            pointer,
             &raw mut transferred,
             millis,
             0,
@@ -1313,7 +1446,9 @@ fn overlapped_io(
     }
     let error = io::Error::last_os_error();
     let expired = wait_expired(&error);
-    let finished = cancel_and_wait(handle, &overlapped);
+    // SAFETY: `pointer` è la struttura dell'operazione avviata da `start` su `handle`, viva
+    // fino alla fine di questa funzione.
+    let finished = unsafe { cancel_and_wait(handle, pointer) };
     match finished {
         // Finita proprio mentre la si annullava: il trasferimento è avvenuto e conta.
         Ok(transferred) if transferred > 0 => Ok(transferred),
@@ -1324,19 +1459,24 @@ fn overlapped_io(
 }
 
 /// Legge esattamente `buffer.len()` byte da una pipe sovrapposta entro `deadline`.
-fn pipe_read_exact(handle: HANDLE, buffer: &mut [u8], deadline: Instant) -> io::Result<()> {
+fn pipe_read_exact(
+    handle: BorrowedHandle<'_>,
+    buffer: &mut [u8],
+    deadline: Instant,
+) -> io::Result<()> {
     let mut filled = 0usize;
     while filled < buffer.len() {
         let rest = buffer.get_mut(filled..).unwrap_or_default();
         let len = u32::try_from(rest.len()).unwrap_or(u32::MAX);
         let remaining = deadline.saturating_duration_since(Instant::now());
         let pointer = rest.as_mut_ptr();
-        let read = overlapped_io(handle, remaining, |overlapped| {
-            // SAFETY: `rest` scrivibile per `len` byte e vivo fino alla fine dell'operazione
-            // (che `overlapped_io` attende anche in caso di timeout).
-            unsafe { ReadFile(handle, pointer, len, std::ptr::null_mut(), overlapped) }
-        })
-        .map_err(pipe_error)?;
+        let start = |raw: HANDLE, overlapped: *mut OVERLAPPED| {
+            // SAFETY: `rest` scrivibile per `len` byte; handle e struttura validi.
+            unsafe { ReadFile(raw, pointer, len, std::ptr::null_mut(), overlapped) }
+        };
+        // SAFETY: `start` avvia una sola lettura, sull'handle e con la struttura ricevuti,
+        // in `rest`, che resta in prestito fino al ritorno.
+        let read = unsafe { overlapped_io(handle, remaining, start) }.map_err(pipe_error)?;
         if read == 0 {
             return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
         }
@@ -1346,18 +1486,20 @@ fn pipe_read_exact(handle: HANDLE, buffer: &mut [u8], deadline: Instant) -> io::
 }
 
 /// Scrive tutto `bytes` su una pipe sovrapposta entro `deadline`.
-fn pipe_write_all(handle: HANDLE, bytes: &[u8], deadline: Instant) -> io::Result<()> {
+fn pipe_write_all(handle: BorrowedHandle<'_>, bytes: &[u8], deadline: Instant) -> io::Result<()> {
     let mut sent = 0usize;
     while sent < bytes.len() {
         let rest = bytes.get(sent..).unwrap_or_default();
         let len = u32::try_from(rest.len()).unwrap_or(u32::MAX);
         let remaining = deadline.saturating_duration_since(Instant::now());
         let pointer = rest.as_ptr();
-        let written = overlapped_io(handle, remaining, |overlapped| {
-            // SAFETY: `rest` leggibile per `len` byte e vivo fino alla fine dell'operazione.
-            unsafe { WriteFile(handle, pointer, len, std::ptr::null_mut(), overlapped) }
-        })
-        .map_err(pipe_error)?;
+        let start = |raw: HANDLE, overlapped: *mut OVERLAPPED| {
+            // SAFETY: `rest` leggibile per `len` byte; handle e struttura validi.
+            unsafe { WriteFile(raw, pointer, len, std::ptr::null_mut(), overlapped) }
+        };
+        // SAFETY: `start` avvia una sola scrittura, sull'handle e con la struttura ricevuti,
+        // da `rest`, che resta in prestito fino al ritorno.
+        let written = unsafe { overlapped_io(handle, remaining, start) }.map_err(pipe_error)?;
         if written == 0 {
             return Err(io::Error::from(io::ErrorKind::WriteZero));
         }
@@ -1393,9 +1535,9 @@ impl PipeServer {
         let attributes = descriptor.attributes();
         let wide_name = wide(OsStr::new(name));
         // SAFETY: stringa terminata da zero; attributi con un descrittore vivo fino al
-        // ritorno; l'handle restituito è posseduto da `owned`.
+        // ritorno; l'handle restituito è posseduto solo da qui.
         let handle = unsafe {
-            CreateNamedPipeW(
+            owned(CreateNamedPipeW(
                 wide_name.as_ptr(),
                 PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE | FILE_FLAG_OVERLAPPED,
                 PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
@@ -1404,11 +1546,9 @@ impl PipeServer {
                 PIPE_BUFFER_BYTES,
                 0,
                 &raw const attributes,
-            )
-        };
-        Ok(PipeServer {
-            handle: owned(handle)?,
-        })
+            ))
+        }?;
+        Ok(PipeServer { handle })
     }
 
     /// Aspetta un client finché non arriva (vero) o finché `stop` non è dato (falso).
@@ -1436,14 +1576,16 @@ impl PipeServer {
 
     /// Un tentativo di `ConnectNamedPipe` sovrapposto, atteso insieme a `stop`.
     fn connect_once(&self, stop: &StopSignal) -> io::Result<Connection> {
-        let handle = self.handle.as_raw_handle();
+        let handle = self.handle.as_handle();
         let event = Event::new()?;
         // SAFETY: struttura C di interi e puntatori, lo zero è un valore valido.
         let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
         overlapped.hEvent = event.handle.as_raw_handle();
-        // SAFETY: handle della pipe valido; `overlapped` vivo fino alla fine dell'operazione
+        // Da qui in poi la struttura si tocca solo tramite questo puntatore.
+        let pointer = &raw mut overlapped;
+        // SAFETY: handle della pipe valido; la struttura vive fino alla fine dell'operazione
         // (sotto: completamento atteso o `cancel_and_wait`).
-        if unsafe { ConnectNamedPipe(handle, &raw mut overlapped) } != 0 {
+        if unsafe { ConnectNamedPipe(handle.as_raw_handle(), pointer) } != 0 {
             return Ok(Connection::Connected);
         }
         let error = io::Error::last_os_error();
@@ -1465,7 +1607,8 @@ impl PipeServer {
         let which = unsafe { WaitForMultipleObjects(2, waited.as_ptr(), 0, INFINITE) };
         if which == WAIT_OBJECT_0 {
             // Operazione finita: si legge l'esito (attesa immediata).
-            return match cancel_and_wait(handle, &overlapped) {
+            // SAFETY: la struttura dell'operazione avviata qui sopra su `handle`, viva.
+            return match unsafe { cancel_and_wait(handle, pointer) } {
                 Ok(_) => Ok(Connection::Connected),
                 Err(error) if is_os_error(&error, ERROR_NO_DATA) => Ok(Connection::ClientGone),
                 Err(error) => Err(error),
@@ -1474,7 +1617,8 @@ impl PipeServer {
         // Stop, o attesa fallita: in ogni caso l'operazione si annulla e se ne aspetta la
         // fine prima di liberare struttura ed evento.
         let wait_error = (which == WAIT_FAILED).then(io::Error::last_os_error);
-        let _finished = cancel_and_wait(handle, &overlapped);
+        // SAFETY: come sopra.
+        let _finished = unsafe { cancel_and_wait(handle, pointer) };
         match wait_error {
             Some(error) => Err(error),
             None if which == WAIT_OBJECT_0 + 1 => Ok(Connection::Stopped),
@@ -1486,12 +1630,12 @@ impl PipeServer {
 
     /// Legge esattamente `buffer.len()` byte dal client connesso entro `deadline`.
     pub fn read_exact(&self, buffer: &mut [u8], deadline: Instant) -> io::Result<()> {
-        pipe_read_exact(self.handle.as_raw_handle(), buffer, deadline)
+        pipe_read_exact(self.handle.as_handle(), buffer, deadline)
     }
 
     /// Scrive `bytes` al client connesso entro `deadline`.
     pub fn write_all(&self, bytes: &[u8], deadline: Instant) -> io::Result<()> {
-        pipe_write_all(self.handle.as_raw_handle(), bytes, deadline)
+        pipe_write_all(self.handle.as_handle(), bytes, deadline)
     }
 
     /// Chiude la connessione corrente; la pipe resta pronta per il client successivo.
@@ -1554,18 +1698,21 @@ impl PipeClient {
 
     /// Legge esattamente `buffer.len()` byte entro `deadline`.
     pub fn read_exact(&self, buffer: &mut [u8], deadline: Instant) -> io::Result<()> {
-        pipe_read_exact(self.file.as_raw_handle(), buffer, deadline)
+        pipe_read_exact(self.file.as_handle(), buffer, deadline)
     }
 
     /// Scrive `bytes` entro `deadline`.
     pub fn write_all(&self, bytes: &[u8], deadline: Instant) -> io::Result<()> {
-        pipe_write_all(self.file.as_raw_handle(), bytes, deadline)
+        pipe_write_all(self.file.as_handle(), bytes, deadline)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use std::io::Read;
+
+    use windows_sys::Win32::Foundation::GetHandleInformation;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SPI_GETBEEP, SPI_SETBEEP};
 
     use super::*;
 
@@ -1579,6 +1726,12 @@ mod tests {
 
     /// Avvia questo stesso eseguibile di test nel job, eseguendo solo il test `name`.
     fn spawn_test_child(name: &str, job: &Job) -> SpawnedChild {
+        spawn_test_child_with(name, job, &[])
+    }
+
+    /// Come [`spawn_test_child`], con argomenti in più per il figlio (per libtest sono
+    /// filtri che non corrispondono a nessun test).
+    fn spawn_test_child_with(name: &str, job: &Job, extra: &[String]) -> SpawnedChild {
         let exe = std::env::current_exe().expect("eseguibile del test");
         let args: Vec<OsString> = [
             format!("platform::windows_ffi::tests::{name}"),
@@ -1589,9 +1742,150 @@ mod tests {
             "--nocapture".to_owned(),
         ]
         .into_iter()
+        .chain(extra.iter().cloned())
         .map(OsString::from)
         .collect();
         spawn_in_job(&exe, &args, job).expect("figlio avviato")
+    }
+
+    /// Lo stdout del figlio dopo la sua uscita (stdin chiuso subito).
+    fn child_output(mut child: SpawnedChild) -> String {
+        drop(child.stdin);
+        let mut output = String::new();
+        child
+            .stdout
+            .read_to_string(&mut output)
+            .expect("lettura dello stdout");
+        output
+    }
+
+    /// Il valore dopo `key` nella stampa del figlio (libtest può scrivere il nome del test
+    /// sulla stessa riga, prima).
+    fn reported<'a>(output: &'a str, key: &str) -> &'a str {
+        output
+            .split_once(key)
+            .and_then(|(_, rest)| rest.lines().next())
+            .unwrap_or_else(|| panic!("nessuna riga {key} in {output:?}"))
+    }
+
+    /// Prefisso dell'argomento con il valore dell'handle da cercare nel figlio.
+    const HANDLE_ARG: &str = "lynkeus-handle=";
+
+    #[test]
+    #[ignore = "figlio dei test del Job Object"]
+    fn child_looks_for_a_handle() {
+        if is_child() {
+            let value = std::env::args()
+                .find_map(|arg| arg.strip_prefix(HANDLE_ARG).and_then(|v| v.parse().ok()));
+            let visible = value.is_some_and(|value: usize| {
+                let mut flags = 0u32;
+                let handle: HANDLE = std::ptr::without_provenance_mut(value);
+                // SAFETY: si chiede solo se il valore è un handle valido di questo processo;
+                // un valore che non lo è dà un errore, nessun accesso alla memoria.
+                let ok = unsafe { GetHandleInformation(handle, &raw mut flags) };
+                // Un handle ereditato è ereditabile anche nel figlio; quelli del runtime no.
+                ok != 0 && flags & HANDLE_FLAG_INHERIT != 0
+            });
+            println!("MANIGLIA:{}", if visible { "ereditata" } else { "assente" });
+        }
+    }
+
+    /// T-D07: un handle ereditabile del padre, non in elenco, non arriva al figlio: il figlio
+    /// eredita solo stdin e stdout (`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`).
+    #[test]
+    fn child_inherits_only_stdio() {
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: struct_len::<SECURITY_ATTRIBUTES>(),
+            lpSecurityDescriptor: std::ptr::null_mut(),
+            bInheritHandle: 1,
+        };
+        // SAFETY: attributi validi per la durata della chiamata, nessun nome; l'handle
+        // restituito è posseduto solo da qui.
+        let event = unsafe { owned(CreateEventW(&raw const attributes, 1, 0, std::ptr::null())) }
+            .expect("evento ereditabile");
+        let value = event.as_raw_handle().addr();
+        let job = Job::new(256 * 1024 * 1024).expect("job");
+        let child = spawn_test_child_with(
+            "child_looks_for_a_handle",
+            &job,
+            &[format!("{HANDLE_ARG}{value}")],
+        );
+        let output = child_output(child);
+        assert_eq!(reported(&output, "MANIGLIA:"), "assente", "{output}");
+        drop(event);
+    }
+
+    #[test]
+    #[ignore = "figlio dei test del Job Object"]
+    fn child_tries_processes_and_system_settings() {
+        if is_child() {
+            let cmd = Path::new(&std::env::var_os("SystemRoot").unwrap_or_default())
+                .join("System32")
+                .join("cmd.exe");
+            let started = std::process::Command::new(cmd)
+                .args(["/d", "/c", "exit 0"])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+            println!(
+                "AVVIO:{}",
+                if started.is_ok() {
+                    "riuscito"
+                } else {
+                    "negato"
+                }
+            );
+            // Rimette il valore che c'è già, senza salvarlo né avvisare le finestre: nessun
+            // cambiamento, ma un processo con le restrizioni dell'interfaccia non può.
+            let mut beep = 0i32;
+            // SAFETY: `beep` è un BOOL scrivibile vivo fino al ritorno.
+            let read = unsafe {
+                SystemParametersInfoW(SPI_GETBEEP, 0, (&raw mut beep).cast::<c_void>(), 0)
+            };
+            let same = u32::from(beep != 0);
+            // SAFETY: SPI_SETBEEP vuole il valore in `uiParam`; nessun puntatore.
+            let written =
+                unsafe { SystemParametersInfoW(SPI_SETBEEP, same, std::ptr::null_mut(), 0) };
+            let outcome = match (read != 0, written != 0) {
+                (false, _) => "illeggibili",
+                (true, false) => "negati",
+                (true, true) => "modificabili",
+            };
+            println!("PARAMETRI:{outcome}");
+        }
+    }
+
+    /// T-D10 (D-09): un processo estrattore compromesso non avvia altri programmi
+    /// (`ActiveProcessLimit` = 1) e non cambia le impostazioni di sistema (restrizioni
+    /// dell'interfaccia del job; appunti, atomi e finestre altrui hanno le stesse, senza una
+    /// prova che non tocchi gli appunti dell'utente).
+    #[test]
+    fn job_limits_active_process_and_ui() {
+        let job = Job::new(256 * 1024 * 1024).expect("job");
+        let output = child_output(spawn_test_child(
+            "child_tries_processes_and_system_settings",
+            &job,
+        ));
+        assert_eq!(reported(&output, "AVVIO:"), "negato", "{output}");
+        assert_eq!(reported(&output, "PARAMETRI:"), "negati", "{output}");
+    }
+
+    #[test]
+    fn dangerous_file_types_by_the_system() {
+        for dangerous in ["exe", "EXE", "bat", "ins", "x\0y", &"a".repeat(65)] {
+            assert!(assoc_is_dangerous(dangerous), "{dangerous:?}");
+        }
+        for document in ["", "txt", "pdf", "docx", "odt"] {
+            assert!(!assoc_is_dangerous(document), "{document:?}");
+        }
+    }
+
+    /// La domanda sul contrasto elevato risponde senza errori (il valore dipende dal
+    /// sistema): due domande di fila danno la stessa risposta.
+    #[test]
+    fn the_high_contrast_query_answers() {
+        assert_eq!(high_contrast_active(), high_contrast_active());
     }
 
     #[test]

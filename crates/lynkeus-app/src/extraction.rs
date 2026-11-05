@@ -10,7 +10,9 @@
 //! li scrive in un file nuovo, con nome generato dal programma ed estensione della voce resa
 //! innocua ([`opened_extension`]), nella sottocartella di sessione di questa istanza
 //! ([`SessionDir`]) dentro la cartella privata dei file aperti. Un file scritto a metà si
-//! cancella.
+//! cancella. Il file riceve la zona d'origine dell'archivio sul disco (Mark-of-the-Web,
+//! [`platform::copy_mark_of_the_web`]): un documento da uno zip scaricato si apre protetto
+//! come se fosse stato scaricato da solo; se la zona non si scrive, il file si cancella.
 //!
 //! **Più istanze.** Ogni istanza ha la sua sottocartella `s-<32 cifre esadecimali>` con un
 //! file `session.lock` bloccato finché l'istanza vive. All'avvio si cancellano solo le
@@ -246,7 +248,13 @@ impl ArchiveEntryExtractor for OpenedEntries {
             &mut sink,
         );
         let result = match end {
-            EntryEnd::Extracted { .. } => sink.finish().map_err(ExtractError::from_io),
+            // La zona d'origine dell'archivio (Mark-of-the-Web) passa alla voce; se non si
+            // scrive, la voce non si apre.
+            EntryEnd::Extracted { .. } => sink
+                .finish()
+                .and_then(|()| std::path::absolute(&doc.path))
+                .and_then(|archive| platform::copy_mark_of_the_web(&archive, &path))
+                .map_err(ExtractError::from_io),
             EntryEnd::NotExtracted(kind) => Err(extract_error(WarningKind::from_extract(kind))),
             EntryEnd::Failed(failure) => Err(extract_error(failure.warning_kind())),
             // Solo la scrittura del file ferma l'estrazione.
@@ -528,6 +536,156 @@ mod tests {
         let short = shorten(unit);
         assert!(short.text.len() <= MAX_UNIT_BYTES + ELLIPSIS.len());
         assert!(short.text.ends_with(ELLIPSIS));
+    }
+
+    /// Un processo estrattore in un thread di questo processo, collegato con due pipe: il
+    /// codice dell'estrattore vero, senza l'eseguibile dell'app.
+    struct ThreadLauncher;
+
+    /// Il "processo" di [`ThreadLauncher`]: esce quando lo stdin si chiude.
+    struct ThreadWorker {
+        done: std::sync::mpsc::Receiver<bool>,
+        exited: Option<lynkeus_engine::WorkerExit>,
+    }
+
+    impl lynkeus_engine::WorkerProcess for ThreadWorker {
+        fn wait_timeout(
+            &mut self,
+            timeout: std::time::Duration,
+        ) -> io::Result<Option<lynkeus_engine::WorkerExit>> {
+            if self.exited.is_none() {
+                self.exited = match self.done.recv_timeout(timeout) {
+                    Ok(true) => Some(lynkeus_engine::WorkerExit::Success),
+                    Ok(false) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        Some(lynkeus_engine::WorkerExit::Failed { code: None })
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+                };
+            }
+            Ok(self.exited)
+        }
+
+        fn kill(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl lynkeus_engine::WorkerLauncher for ThreadLauncher {
+        fn launch(&self) -> io::Result<lynkeus_engine::LaunchedWorker> {
+            let (child_stdin, parent_stdin) = io::pipe()?;
+            let (parent_stdout, child_stdout) = io::pipe()?;
+            let (done_tx, done) = std::sync::mpsc::channel();
+            std::thread::Builder::new()
+                .name("estrattore-di-prova".to_owned())
+                .spawn(move || {
+                    let config = lynkeus_extract::worker::WorkerConfig::default();
+                    let ended = lynkeus_extract::worker::run(child_stdin, child_stdout, &config);
+                    let _sent = done_tx.send(ended.is_ok());
+                })?;
+            Ok(lynkeus_engine::LaunchedWorker {
+                stdin: Box::new(parent_stdin),
+                stdout: Box::new(parent_stdout),
+                process: Box::new(ThreadWorker { done, exited: None }),
+            })
+        }
+    }
+
+    /// Le voci aperte da `base`, con un estrattore nello stesso processo.
+    fn opened_entries(base: &Path) -> OpenedEntries {
+        let pool = ExtractorPool::new(Arc::new(ThreadLauncher), std::num::NonZeroUsize::MIN);
+        OpenedEntries::new(
+            Arc::new(DocumentSource::new(pool, None)),
+            base.to_owned(),
+            Limits::default(),
+            platform::private_fs(),
+        )
+    }
+
+    /// Uno zip con la voce `name` di contenuto `bytes`.
+    fn write_zip(path: &Path, name: &str, bytes: &[u8]) {
+        let file = File::create(path).expect("zip");
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file(name, zip::write::SimpleFileOptions::default())
+            .expect("voce");
+        zip.write_all(bytes).expect("byte della voce");
+        zip.finish().expect("zip chiuso");
+    }
+
+    /// Con l'estrattore nello stesso processo: la voce estratta ha i byte originali e
+    /// l'estensione della voce.
+    #[test]
+    fn entries_are_extracted_with_their_bytes() {
+        let dir = tempfile::tempdir().expect("cartella");
+        let archive = dir.path().join("archivio.zip");
+        write_zip(&archive, "cartella/nota.txt", b"testo della nota");
+        let entries = opened_entries(&dir.path().join("aperti"));
+        let extracted = entries
+            .extract_to_private_temp(&DocPath {
+                path: archive,
+                inner: vec!["cartella/nota.txt".to_owned()],
+            })
+            .expect("voce estratta")
+            .expect("estrazione disponibile");
+        assert_eq!(
+            fs::read(&extracted).ok(),
+            Some(b"testo della nota".to_vec())
+        );
+        assert_eq!(extracted.extension().and_then(|e| e.to_str()), Some("txt"));
+        entries.close_session();
+    }
+
+    /// T-D02: una voce estratta da un archivio scaricato (con il Mark-of-the-Web, zona
+    /// Internet) riceve la stessa zona, quindi il programma che la apre la tratta come
+    /// scaricata (vista protetta, macro bloccate); da un archivio locale nessuna zona.
+    #[cfg(windows)]
+    #[test]
+    fn extracted_entry_keeps_mark_of_the_web() {
+        let dir = tempfile::tempdir().expect("cartella");
+        let downloaded = dir.path().join("scaricato.zip");
+        write_zip(&downloaded, "fattura.docm", b"documento con macro");
+        let mut stream = downloaded.as_os_str().to_owned();
+        stream.push(":Zone.Identifier");
+        fs::write(
+            &stream,
+            "[ZoneTransfer]\r\nZoneId=3\r\nHostUrl=https://example.invalid/scaricato.zip\r\n",
+        )
+        .expect("zona dell'archivio");
+        let local = dir.path().join("locale.zip");
+        write_zip(&local, "nota.txt", b"testo");
+
+        let entries = opened_entries(&dir.path().join("aperti"));
+        let entry = DocPath {
+            path: downloaded,
+            inner: vec!["fattura.docm".to_owned()],
+        };
+        let extracted = entries
+            .extract_to_private_temp(&entry)
+            .expect("voce estratta")
+            .expect("estrazione disponibile");
+        assert_eq!(
+            fs::read(&extracted).ok(),
+            Some(b"documento con macro".to_vec())
+        );
+        let mut extracted_stream = extracted.as_os_str().to_owned();
+        extracted_stream.push(":Zone.Identifier");
+        let zone = fs::read_to_string(&extracted_stream).expect("zona sulla voce estratta");
+        assert!(zone.contains("ZoneId=3"), "{zone:?}");
+        assert!(!zone.contains("example.invalid"), "{zone:?}");
+
+        let plain = entries
+            .extract_to_private_temp(&DocPath {
+                path: local,
+                inner: vec!["nota.txt".to_owned()],
+            })
+            .expect("voce estratta")
+            .expect("estrazione disponibile");
+        let mut plain_stream = plain.as_os_str().to_owned();
+        plain_stream.push(":Zone.Identifier");
+        assert_eq!(
+            fs::read(&plain_stream).map_err(|e| e.kind()),
+            Err(io::ErrorKind::NotFound)
+        );
+        entries.close_session();
     }
 
     #[test]

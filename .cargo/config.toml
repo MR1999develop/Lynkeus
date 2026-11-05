@@ -1,6 +1,18 @@
 [alias]
 xtask = "run --package xtask --"
 
-# Mitigazioni di Windows: Control Flow Guard e compatibilità con CET (shadow stack).
+# Opzioni dell'eseguibile Windows, verificate sul file da `cargo xtask dist` (xtask/src/pe.rs):
+# - Control Flow Guard e compatibilità con CET (shadow stack);
+# - `/DEPENDENTLOADFLAG:0x800` (LOAD_LIBRARY_SEARCH_SYSTEM32): le DLL importate in modo
+#   statico (dwmapi, uxtheme, dxgi...) si cercano solo nella cartella di sistema, mai accanto
+#   all'eseguibile. `SetDefaultDllDirectories` all'inizio di `main` arriva troppo tardi per
+#   loro: il sistema le carica prima;
+# - runtime C statico (`+crt-static`): nessun VCRUNTIME140.dll da cercare, l'app parte anche
+#   dove il Visual C++ Redistributable non è installato.
 [target.x86_64-pc-windows-msvc]
-rustflags = ["-C", "control-flow-guard", "-C", "link-arg=/CETCOMPAT"]
+rustflags = [
+    "-C", "control-flow-guard",
+    "-C", "link-arg=/CETCOMPAT",
+    "-C", "link-arg=/DEPENDENTLOADFLAG:0x800",
+    "-C", "target-feature=+crt-static",
+]

@@ -1,16 +1,19 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Copyright (C) 2026 MR
 
-//! "Apri" e "Mostra nella cartella" per un risultato: che cosa fare ([`open_plan`],
-//! regole pure) e il lavoro vero ([`run`], fuori dal thread dell'interfaccia).
+//! "Apri" e "Mostra nella cartella" per un risultato: che cosa fare ([`open_plan`]: regole
+//! sul nome, più una sola domanda veloce al sistema sui tipi pericolosi) e il lavoro vero
+//! ([`run`], fuori dal thread dell'interfaccia).
 //!
 //! Regole:
 //! - un file sul disco si apre con il programma predefinito del sistema (Windows:
 //!   l'associazione dei tipi di file; Linux: il portale XDG), mai con un programma cercato
 //!   per nome;
-//! - un file che il sistema eseguirebbe invece di aprire (programmi, script, collegamenti:
-//!   [`is_executable_name`]) non si apre: i risultati vengono da cartelle qualsiasi, e un
-//!   doppio clic su "pulisci.bat" non deve eseguirlo; resta "Mostra nella cartella";
+//! - un file che il sistema eseguirebbe invece di aprire non si apre ([`would_execute`]:
+//!   l'elenco dell'app di programmi, script, collegamenti e tipi eseguiti per associazione,
+//!   più i tipi che il sistema stesso dichiara pericolosi): i risultati vengono da cartelle
+//!   qualsiasi, e un doppio clic su "pulisci.bat" o "tema.theme" non deve eseguirlo; resta
+//!   "Mostra nella cartella";
 //! - una voce dentro un archivio va prima estratta, con i suoi byte originali, in un file
 //!   con nome generato dal programma nella cartella temporanea privata
 //!   ([`ArchiveEntryExtractor`]: [`OpenedEntries`](crate::extraction::OpenedEntries)); l'estensione
@@ -90,6 +93,29 @@ const EXECUTABLE_EXTENSIONS: &[&str] = &[
     "searchconnector-ms",
     "website",
     "gadget",
+    // Eseguiti o applicati per associazione: temi (anche con risorse remote), Java Web
+    // Start, aggiornamenti e pacchetti di provisioning di Windows, estensioni di Visual
+    // Studio e componenti di Office, Python compilato e in archivio, applicazioni XAML del
+    // browser, scriptlet e oggetti della shell, pagine web archiviate (MHTML, aperte da un
+    // motore che esegue script).
+    "theme",
+    "themepack",
+    "deskthemepack",
+    "jnlp",
+    "msu",
+    "ppkg",
+    "vsix",
+    "vsto",
+    "pyc",
+    "pyo",
+    "pyz",
+    "pyzw",
+    "xbap",
+    "sct",
+    "shb",
+    "shs",
+    "mht",
+    "mhtml",
 ];
 
 /// Estensione di un file estratto che non ha un'estensione ammessa ma è testo.
@@ -114,7 +140,7 @@ pub enum OpenPlan {
 pub fn open_plan(doc: &DocPath) -> OpenPlan {
     let doc = openable(doc);
     let shown_name = doc.inner.last().map_or(doc.path.as_path(), Path::new);
-    if is_executable_name(shown_name) {
+    if would_execute(shown_name) {
         OpenPlan::Executable
     } else if doc.is_inside_archive() {
         OpenPlan::ArchiveEntry(doc)
@@ -150,7 +176,7 @@ fn openable(doc: &DocPath) -> DocPath {
 /// (che la ricerca legge come testo) e `bin` per le altre. Un programma o uno script dentro
 /// un archivio non diventa mai un file che il sistema eseguirebbe.
 pub fn opened_extension(entry_name: &str) -> String {
-    if is_executable_name(Path::new(entry_name)) {
+    if would_execute(Path::new(entry_name)) {
         return NEUTRAL_EXTENSION.to_owned();
     }
     let file = entry_name.rsplit(['/', '\\']).next().unwrap_or(entry_name);
@@ -169,21 +195,32 @@ pub fn opened_extension(entry_name: &str) -> String {
     }
 }
 
-/// Vero se il nome di `path` ha un'estensione che il sistema eseguirebbe.
+/// Vero se il nome di `path` ha un'estensione dell'elenco dell'app (programmi, script,
+/// collegamenti e tipi eseguiti per associazione).
 ///
 /// Punti e spazi finali non contano (Windows li toglie: "a.bat. " è "a.bat"), maiuscole e
 /// minuscole nemmeno.
 pub fn is_executable_name(path: &Path) -> bool {
-    let Some(name) = path.file_name() else {
-        return false;
-    };
-    let name = name.to_string_lossy();
+    extension_of(path).is_some_and(|extension| EXECUTABLE_EXTENSIONS.contains(&extension.as_str()))
+}
+
+/// Vero se il sistema eseguirebbe il file `path` invece di aprirlo come documento: un
+/// nome dell'elenco dell'app ([`is_executable_name`]) oppure un tipo che il sistema stesso
+/// considera pericoloso ([`platform::is_dangerous_file_type`]: su Windows l'elenco del
+/// sistema e i tipi registrati come sempre pericolosi). Due filtri: l'elenco non può
+/// conoscere i tipi registrati dai programmi installati.
+pub fn would_execute(path: &Path) -> bool {
+    is_executable_name(path)
+        || extension_of(path).is_some_and(|extension| platform::is_dangerous_file_type(&extension))
+}
+
+/// L'estensione del nome di `path` in minuscolo, senza i punti e gli spazi finali che
+/// Windows toglie; `None` se il nome non ne ha.
+fn extension_of(path: &Path) -> Option<String> {
+    let name = path.file_name()?.to_string_lossy();
     let trimmed = name.trim_end_matches(['.', ' ']);
-    let Some((_, extension)) = trimmed.rsplit_once('.') else {
-        return false;
-    };
-    let extension = extension.to_lowercase();
-    EXECUTABLE_EXTENSIONS.contains(&extension.as_str())
+    let (_, extension) = trimmed.rsplit_once('.')?;
+    (!extension.is_empty()).then(|| extension.to_lowercase())
 }
 
 /// Estrae una voce d'archivio in un file nuovo della cartella temporanea privata dell'app
@@ -268,6 +305,8 @@ impl EntryFailure {
 /// Esegue `task` (blocca: da chiamare in un thread di lavoro).
 pub fn run(task: &LaunchTask, extractor: &dyn ArchiveEntryExtractor) -> LaunchOutcome {
     let result = match task {
+        // Il piano l'ha già escluso; si ricontrolla dove si esegue.
+        LaunchTask::Open(path) if would_execute(path) => return LaunchOutcome::Failed,
         LaunchTask::Open(path) => {
             absolute(path).and_then(|p| platform::open_with_default_program(&p))
         }
@@ -275,7 +314,7 @@ pub fn run(task: &LaunchTask, extractor: &dyn ArchiveEntryExtractor) -> LaunchOu
         LaunchTask::OpenArchiveEntry(doc) => match extractor.extract_to_private_temp(doc) {
             // Stessa regola dei file sul disco: un file che il sistema eseguirebbe non si
             // apre (l'estrattore non dovrebbe mai crearlo).
-            Ok(Some(path)) if is_executable_name(&path) => return LaunchOutcome::Failed,
+            Ok(Some(path)) if would_execute(&path) => return LaunchOutcome::Failed,
             Ok(Some(path)) => platform::open_with_default_program(&path),
             Ok(None) => return LaunchOutcome::ArchiveUnavailable,
             Err(error) => return LaunchOutcome::EntryFailed(EntryFailure::from_error(&error)),
@@ -373,6 +412,75 @@ mod tests {
             "nota.url.txt",
         ] {
             assert!(!is_executable_name(Path::new(name)), "{name}");
+        }
+    }
+
+    /// T-D01: i tipi che Windows esegue o applica per associazione invece di aprirli come
+    /// documenti (temi, Java Web Start, Python compilato e in archivio, pacchetti di
+    /// aggiornamento e di provisioning, estensioni di Visual Studio, componenti di Office,
+    /// pagine web archiviate), anche in maiuscolo, con punti e spazi finali e dentro un
+    /// archivio: mai aperti, e la voce estratta non riceve la loro estensione.
+    #[test]
+    fn association_launchers_are_executable() {
+        for extension in [
+            "jnlp",
+            "theme",
+            "themepack",
+            "deskthemepack",
+            "msu",
+            "ppkg",
+            "vsix",
+            "vsto",
+            "pyc",
+            "pyo",
+            "pyz",
+            "pyzw",
+            "mht",
+            "mhtml",
+            "xbap",
+            "sct",
+            "shb",
+            "shs",
+        ] {
+            let upper = extension.to_uppercase();
+            for name in [
+                format!("x.{extension}"),
+                format!("X.{upper}"),
+                format!("x.{extension}. "),
+            ] {
+                assert_eq!(
+                    open_plan(&DocPath::file(&name)),
+                    OpenPlan::Executable,
+                    "{name}"
+                );
+                assert_eq!(opened_extension(&name), NEUTRAL_EXTENSION, "{name}");
+            }
+            let entry = DocPath {
+                path: "archivio.zip".into(),
+                inner: vec![format!("cartella/voce.{upper}")],
+            };
+            assert_eq!(open_plan(&entry), OpenPlan::Executable, "{extension}");
+        }
+    }
+
+    /// Il secondo filtro: un tipo che il sistema stesso dichiara pericoloso
+    /// (`AssocIsDangerous` su Windows) non si apre anche se non è nell'elenco; i documenti
+    /// comuni sì.
+    #[test]
+    fn types_the_system_calls_dangerous_are_executable() {
+        if cfg!(windows) {
+            // Nell'elenco di Windows, non nel nostro.
+            for name in ["x.ins", "x.isp", "x.ksh", "x.mde", "x.ade"] {
+                assert!(!is_executable_name(Path::new(name)), "{name}");
+                assert!(would_execute(Path::new(name)), "{name}");
+                assert_eq!(open_plan(&DocPath::file(name)), OpenPlan::Executable);
+                assert_eq!(opened_extension(name), NEUTRAL_EXTENSION, "{name}");
+            }
+        }
+        for name in [
+            "note.txt", "a.pdf", "b.docx", "c.xlsx", "d.odt", "e.csv", "f.rs",
+        ] {
+            assert!(!would_execute(Path::new(name)), "{name}");
         }
     }
 

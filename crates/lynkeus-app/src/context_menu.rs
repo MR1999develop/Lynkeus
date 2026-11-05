@@ -16,10 +16,10 @@
 //!   il guardiano dei percorsi normalizza in `C:\`). Nessun diritto di amministratore.
 //! - Linux: script `~/.local/share/nautilus/scripts/<testo>` con `exec '<exe>' --add -- "$@"`;
 //!   senza argomenti (clic sullo sfondo di una cartella) passa la cartella corrente `$PWD`.
-//! - L'eseguibile viene da `current_exe()`; un percorso con `"`, NUL o a capo, o una riga
-//!   oltre 260 caratteri, non si registra. Un eseguibile o una cartella dell'eseguibile
-//!   modificabili da altri nemmeno: la voce eseguirebbe codice altrui con l'identità
-//!   dell'utente.
+//! - L'eseguibile viene da `current_exe()`; un percorso con `"`, `%`, NUL o a capo, o una
+//!   riga oltre 260 caratteri, non si registra. Un eseguibile o una cartella
+//!   dell'eseguibile modificabili da altri nemmeno, e una voce già registrata si toglie: la
+//!   voce eseguirebbe codice altrui con l'identità dell'utente.
 //! - Una voce con lo stesso nome che non è nostra non si sovrascrive né si cancella.
 
 use std::io;
@@ -84,7 +84,7 @@ pub enum MenuError {
     /// Eseguibile senza percorso assoluto.
     #[error("eseguibile senza percorso assoluto")]
     ExeNotAbsolute,
-    /// Percorso dell'eseguibile con `"`, NUL, a capo o non UTF-8.
+    /// Percorso dell'eseguibile con `"`, `%`, NUL, a capo o non UTF-8.
     #[error("percorso dell'eseguibile con caratteri non ammessi")]
     ExeUnsafeChars,
     /// Riga di comando oltre [`MAX_COMMAND_CHARS`].
@@ -125,7 +125,9 @@ impl MenuEntry {
             return Err(MenuError::ExeNotAbsolute);
         }
         let exe_text = exe.to_str().ok_or(MenuError::ExeUnsafeChars)?.to_owned();
-        if exe_text.contains(['"', '\0', '\n', '\r']) {
+        // `%`: Explorer sostituisce `%1`, `%L`, `%V`… in tutta la riga, anche nel percorso
+        // del programma (su Linux sarebbe innocuo: la regola è una sola per semplicità).
+        if exe_text.contains(['"', '\0', '\n', '\r', '%']) {
             return Err(MenuError::ExeUnsafeChars);
         }
         let entry = MenuEntry {
@@ -328,8 +330,14 @@ pub fn enable(store: &dyn ContextMenuStore, entry: &MenuEntry) -> Result<(), Men
 
 /// Come [`enable`] (all'avvio, con l'opzione accesa); vero se ha riscritto la voce
 /// (mancante, eseguibile spostato, testo cambiato).
+///
+/// Con l'eseguibile o la sua cartella modificabili da altri la voce nostra già registrata
+/// si toglie prima di restituire [`MenuError::ExeDirWritable`] (fallire chiusi: il clic
+/// destro eseguirebbe codice altrui con l'identità dell'utente); se non si riesce a
+/// toglierla, l'errore è quello della rimozione.
 pub fn refresh(store: &dyn ContextMenuStore, entry: &MenuEntry) -> Result<bool, MenuError> {
     if store.exe_writable_by_others(entry.exe())? {
+        disable(store, entry)?;
         return Err(MenuError::ExeDirWritable);
     }
     match store.state(entry)? {
@@ -700,5 +708,38 @@ mod tests {
         let writable = FakeStore::new(MenuState::Missing, true);
         assert_eq!(enable(&writable, &entry), Err(MenuError::ExeDirWritable));
         assert!(writable.log().is_empty());
+    }
+
+    /// T-D06: con l'eseguibile (o la sua cartella) modificabile da altri, la voce nostra già
+    /// registrata si toglie (fallire chiusi: il clic destro eseguirebbe codice altrui) e
+    /// l'errore dice perché; una voce altrui resta.
+    #[test]
+    fn refresh_with_an_unsafe_exe_removes_our_entry() {
+        let entry = entry();
+        for state in [MenuState::Current, MenuState::Outdated] {
+            let store = FakeStore::new(state, true);
+            assert_eq!(refresh(&store, &entry), Err(MenuError::ExeDirWritable));
+            assert_eq!(store.log(), ["remove"], "{state:?}");
+        }
+        for state in [MenuState::Missing, MenuState::Foreign] {
+            let store = FakeStore::new(state, true);
+            assert_eq!(enable(&store, &entry), Err(MenuError::ExeDirWritable));
+            assert!(store.log().is_empty(), "{state:?}");
+        }
+    }
+
+    /// T-D13 (D-P2): un `%` nel percorso dell'eseguibile si rifiuta: Explorer sostituisce
+    /// `%1`, `%L`, `%V` anche dentro il nome del programma e la voce si romperebbe.
+    #[test]
+    fn percent_in_exe_path_is_refused() {
+        let exe = if cfg!(windows) {
+            r"C:\Strumenti\50%L\lynkeus-searcher.exe"
+        } else {
+            "/opt/50%L/lynkeus-searcher"
+        };
+        assert_eq!(
+            MenuEntry::new(Path::new(exe), "x", &[]).err(),
+            Some(MenuError::ExeUnsafeChars)
+        );
     }
 }

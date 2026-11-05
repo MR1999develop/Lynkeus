@@ -10,8 +10,9 @@
 //! (`lynkeus_extract::worker::run`), senza finestre, senza log e senza leggere le
 //! impostazioni.
 //!
-//! Con `--add <percorso>` (clic destro) la finestra si apre con quei luoghi; se un'altra
-//! istanza avviata con `--add` è già aperta, i percorsi vanno a lei e questo processo esce.
+//! Con `--add <percorso>` (clic destro) o con percorsi senza opzione (cartella trascinata
+//! sull'icona, "Invia a") la finestra si apre con quei luoghi; se un'altra istanza avviata
+//! con dei percorsi è già aperta, i percorsi vanno a lei e questo processo esce.
 
 // In release nessuna console accanto alla finestra su Windows.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
@@ -19,7 +20,7 @@
 
 use std::ffi::OsString;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
@@ -42,10 +43,16 @@ const MIN_SIZE: [f32; 2] = [800.0, 480.0];
 const APP_NAME: &str = "Lynkeus Searcher";
 /// Icona della finestra (la stessa dell'eseguibile, generata da `assets/src`).
 const WINDOW_ICON_PNG: &[u8] = include_bytes!("../../../assets/icon-256.png");
+/// Il file in cui eframe ricorda posizione e dimensione della finestra, nella cartella di
+/// configurazione accanto a `settings.toml`.
+const WINDOW_STATE_FILE: &str = "window.ron";
 
 fn main() -> ExitCode {
-    // Prima di ogni altra cosa: nessuna DLL dalla cartella dell'eseguibile o dal PATH. Se
-    // non riesce (sistema troppo vecchio) si continua con la ricerca predefinita.
+    // Prima di ogni altra cosa: le DLL caricate da qui in poi (grafica, dialoghi) solo dalla
+    // cartella di sistema, mai dalla cartella dell'eseguibile o dal PATH. Quelle importate
+    // dall'eseguibile sono già caricate, con la stessa regola (`/DEPENDENTLOADFLAG:0x800`,
+    // verificato da `cargo xtask dist`). Se non riesce (sistema troppo vecchio) si continua
+    // e lo si registra.
     let dll_search = platform::restrict_dll_search();
     let mut args = std::env::args_os().skip(1).peekable();
     if args.peek().map(OsString::as_os_str) == Some(EXTRACT_WORKER_FLAG.as_ref()) {
@@ -55,7 +62,7 @@ fn main() -> ExitCode {
     let added = match parse_added_paths(args) {
         Ok(added) => added,
         Err(error) => {
-            eprintln!("lynkeus-searcher: {error}; uso: lynkeus-searcher [--add <percorso>]…");
+            eprintln!("lynkeus-searcher: {error}; uso: lynkeus-searcher [[--add] <percorso>]…");
             return ExitCode::from(2);
         }
     };
@@ -171,13 +178,7 @@ fn run(
         Ok(icon) => viewport = viewport.with_icon(Arc::new(icon)),
         Err(error) => tracing::warn!(%error, "icona della finestra non letta"),
     }
-    let options = eframe::NativeOptions {
-        viewport,
-        // eframe ricorda solo la finestra, accanto a settings.toml.
-        persist_window: true,
-        persistence_path: dirs.config.clone(),
-        ..eframe::NativeOptions::default()
-    };
+    let options = native_options(viewport, dirs.config.as_deref());
     eframe::run_native(
         APP_NAME,
         options,
@@ -191,6 +192,24 @@ fn run(
         }),
     )
     .map_err(|error| anyhow::anyhow!("finestra non avviata: {error}"))
+}
+
+/// Le opzioni della finestra: `viewport` e, con la cartella di configurazione privata
+/// `config_dir`, posizione e dimensione ricordate da eframe nel file [`WINDOW_STATE_FILE`]
+/// (eframe vuole il percorso di un file RON, non di una cartella). Senza la cartella la
+/// finestra non si ricorda: nessun file fuori dalle cartelle private (eframe crea comunque
+/// la sua cartella predefinita, e la lascia vuota).
+fn native_options(
+    viewport: egui::ViewportBuilder,
+    config_dir: Option<&Path>,
+) -> eframe::NativeOptions {
+    let window_state = config_dir.map(|dir| dir.join(WINDOW_STATE_FILE));
+    eframe::NativeOptions {
+        viewport,
+        persist_window: window_state.is_some(),
+        persistence_path: window_state,
+        ..eframe::NativeOptions::default()
+    }
 }
 
 /// Collega la voce del clic destro (registro dell'utente o script di Nautilus) per questo
@@ -224,5 +243,26 @@ fn report(outcome: &LoadOutcome) {
         LoadOutcome::Unreadable(error) => {
             tracing::warn!(%error, "settings.toml non leggibile");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// T-D05: eframe riceve un file dentro la cartella di configurazione, non la cartella;
+    /// senza cartella la finestra non si ricorda (e nulla si scrive altrove).
+    #[test]
+    fn window_state_file_is_inside_the_config_dir() {
+        let config = std::env::temp_dir().join("lynkeus-config");
+        let options = native_options(egui::ViewportBuilder::default(), Some(&config));
+        assert!(options.persist_window);
+        assert_eq!(
+            options.persistence_path,
+            Some(config.join(WINDOW_STATE_FILE))
+        );
+        let without = native_options(egui::ViewportBuilder::default(), None);
+        assert!(!without.persist_window);
+        assert_eq!(without.persistence_path, None);
     }
 }

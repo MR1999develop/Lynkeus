@@ -130,7 +130,8 @@ toml = { version = "1.1.8", default-features = false, features = ["parse", "disp
 unicode-normalization = "0.1.26"
 # API Win32 senza involucri, solo in `lynkeus-app/src/platform/windows_ffi.rs`: processo
 # estrattore con CreateProcessW nel Job Object (limite di memoria per processo, che `win32job`
-# non offre: experiments/jobobject/ESITI.md) e SetDefaultDllDirectories.
+# non offre: experiments/jobobject/ESITI.md), SetDefaultDllDirectories, AssocIsDangerous e
+# SystemParametersInfoW.
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_Security",
@@ -142,6 +143,10 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_System_Pipes",
     "Win32_System_SystemServices",
     "Win32_System_Threading",
+    # HIGHCONTRASTW (contrasto elevato del sistema).
+    "Win32_UI_Accessibility",
+    # AssocIsDangerous (tipi di file che il sistema considera pericolosi).
+    "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
 # Voci del clic destro in HKCU\Software\Classes (solo Windows), con la stessa windows-sys.

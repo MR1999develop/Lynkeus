@@ -4,28 +4,65 @@
 //! `cargo xtask dist`: build di rilascio verificata e pacchetto per la distribuzione.
 //!
 //! Passi: build `--locked` di `lynkeus-app` con i percorsi locali riscritti
-//! (vedi [`crate::remap`]); su Windows verifica di CFG e CETCOMPAT con `dumpbin`;
-//! ricerca di nome utente e percorsi locali nei byte dell'eseguibile; zip con
-//! eseguibile, `LICENSE` e `README.md`; file `SHA256SUMS`.
+//! (vedi [`crate::remap`]), con `cargo auditable` per il rilascio ([`Mode`]); su Windows
+//! verifica delle mitigazioni lette dal file ([`crate::pe`]: ASLR, DEP, CFG, CETCOMPAT,
+//! `DependentLoadFlags` con la sola cartella di sistema, nessun runtime C dinamico) e prova
+//! sull'eseguibile con DLL finte accanto, che il sistema deve ignorare; ricerca di nome
+//! utente e percorsi locali nei byte dell'eseguibile; zip con eseguibile, `LICENSE` e
+//! `README.md`; per il rilascio lo SBOM CycloneDX, controllato allo stesso modo; file
+//! `SHA256SUMS`.
 
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use sha2::{Digest as _, Sha256};
 use zip::write::SimpleFileOptions;
 
+use crate::pe::Mitigations;
 use crate::process::{cargo, run_captured, run_inherited, workspace_root};
 use crate::remap;
 use crate::scan::{self, Needle};
 
 const APP_PACKAGE: &str = "lynkeus-app";
+/// La cartella del pacchetto dell'app, dove `cargo cyclonedx` scrive il suo SBOM.
+const APP_DIR: &str = "crates/lynkeus-app";
 const APP_BINARY: &str = "lynkeus-searcher";
 const DIST_DIR: &str = "dist";
 const CHECKSUMS_FILE: &str = "SHA256SUMS";
-const VSWHERE: &str = r"C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe";
+/// Cartella (sotto la cartella di build) della prova con le DLL finte.
+const PLANTING_DIR: &str = "xtask-dll-planting";
+/// Contenuto delle DLL finte: non è un'immagine PE, quindi se il sistema ne caricasse una
+/// il processo morirebbe con `STATUS_INVALID_IMAGE_NOT_MZ` (0xC000012F) prima di `main`.
+const FAKE_DLL_BYTES: &[u8] = b"DLL finta di cargo xtask dist: non deve essere caricata";
+/// Tempo massimo del processo estrattore nella prova con le DLL finte.
+const PLANTING_TIMEOUT: Duration = Duration::from_secs(30);
+/// Limite di memoria passato al processo estrattore nella prova (1 GiB, come nell'app).
+const PLANTING_MEMORY_LIMIT: &str = "1073741824";
+
+/// Che pacchetto si prepara.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// `cargo xtask dist`: la verifica in locale, con `cargo build`.
+    Local,
+    /// `cargo xtask release` (CI su un tag): `cargo auditable build`, cioè l'elenco delle
+    /// dipendenze dentro l'eseguibile (leggibile da `cargo audit bin`), e lo SBOM
+    /// CycloneDX accanto allo zip. Servono `cargo-auditable` e `cargo-cyclonedx`.
+    Release,
+}
+
+impl Mode {
+    /// Gli argomenti di cargo che avviano la build.
+    fn cargo_args(self) -> &'static [&'static str] {
+        match self {
+            Mode::Local => &["build"],
+            Mode::Release => &["auditable", "build"],
+        }
+    }
+}
 
 /// La piattaforma di destinazione, uguale a quella su cui gira xtask.
 struct Platform {
@@ -52,7 +89,7 @@ impl Platform {
 }
 
 /// Esegue l'intero rilascio; fallisce se un controllo sull'eseguibile non passa.
-pub fn run() -> Result<()> {
+pub fn run(mode: Mode) -> Result<()> {
     let root = workspace_root()?;
     let platform = Platform::host()?;
     reject_rustflags_env()?;
@@ -66,13 +103,20 @@ pub fn run() -> Result<()> {
     let locations = Locations::detect(&root)?;
     let config = remap::config_arg(platform.triple, &locations.remaps());
     eprintln!(
-        "xtask: build di rilascio di {APP_PACKAGE} {version} per {}",
-        platform.triple
+        "xtask: build di rilascio di {APP_PACKAGE} {version} per {} (cargo {})",
+        platform.triple,
+        mode.cargo_args().join(" ")
     );
+    if mode == Mode::Local {
+        eprintln!(
+            "xtask: verifica locale: niente elenco delle dipendenze né SBOM (cargo xtask release)"
+        );
+    }
     run_inherited(
         cargo()
             .current_dir(&root)
-            .args(["build", "--release", "--locked", "--package", APP_PACKAGE])
+            .args(mode.cargo_args())
+            .args(["--release", "--locked", "--package", APP_PACKAGE])
             .args(["--bin", APP_BINARY, "--target", platform.triple])
             .arg("--config")
             .arg(&config),
@@ -87,9 +131,12 @@ pub fn run() -> Result<()> {
         fs::read(&exe).with_context(|| format!("lettura dell'eseguibile {}", exe.display()))?;
 
     if platform.os == "windows" {
-        verify_mitigations(&exe)?;
+        let mitigations = verify_mitigations(&exe_bytes)?;
+        let planting = target_dir(&root).join(PLANTING_DIR);
+        verify_dll_planting(&exe, &mitigations.imports, &planting)?;
     }
-    verify_no_local_data(&exe_bytes, &locations.needles())?;
+    let needles = locations.needles();
+    verify_no_local_data("l'eseguibile", &exe_bytes, &needles)?;
 
     let dist = root.join(DIST_DIR);
     fs::create_dir_all(&dist).context("creazione della cartella dist")?;
@@ -97,11 +144,91 @@ pub fn run() -> Result<()> {
     let zip_name = format!("{stem}.zip");
     let zip_bytes = build_zip(&stem, &platform.exe_name, &exe_bytes, &root)?;
     write_atomically(&dist.join(&zip_name), &zip_bytes)?;
-    let sums = checksum_line(&zip_bytes, &zip_name);
+    let mut sums = checksum_line(&zip_bytes, &zip_name);
+    if mode == Mode::Release {
+        let sbom_name = format!("{stem}.cdx.json");
+        let sbom = generate_sbom(&root, platform.triple)?;
+        verify_no_local_data("lo SBOM", &sbom, &needles)?;
+        write_atomically(&dist.join(&sbom_name), &sbom)?;
+        sums.push_str(&checksum_line(&sbom, &sbom_name));
+        eprintln!("xtask: creato {DIST_DIR}/{sbom_name}");
+    }
     write_atomically(&dist.join(CHECKSUMS_FILE), sums.as_bytes())?;
 
     eprintln!("xtask: creati {DIST_DIR}/{zip_name} e {DIST_DIR}/{CHECKSUMS_FILE}");
     Ok(())
+}
+
+/// Lo SBOM CycloneDX (JSON, specifica 1.5) del pacchetto dell'app per `triple`, con il
+/// percorso del workspace sostituito da un nome neutro.
+///
+/// `cargo cyclonedx` scrive un file per ogni pacchetto del workspace, accanto al suo
+/// `Cargo.toml`, con il nome scelto qui: si legge quello dell'app e si cancellano tutti.
+fn generate_sbom(root: &Path, triple: &str) -> Result<Vec<u8>> {
+    let name = format!("xtask-sbom-{}", std::process::id());
+    let file_name = format!("{name}.json");
+    let generated = run_inherited(
+        cargo().current_dir(root).args([
+            "cyclonedx",
+            "--format",
+            "json",
+            "--spec-version",
+            "1.5",
+            "--target",
+            triple,
+            "--override-filename",
+            &name,
+            "-q",
+        ]),
+        "cargo cyclonedx (installare cargo-cyclonedx)",
+    )
+    .and_then(|()| {
+        let path = root.join(APP_DIR).join(&file_name);
+        fs::read_to_string(&path).with_context(|| format!("lettura di {}", path.display()))
+    });
+    remove_generated(root, &file_name)?;
+    Ok(neutral_paths(&generated?, root).into_bytes())
+}
+
+/// Il testo di uno SBOM con il percorso del workspace `root` (scritto da cargo come URL
+/// `path+file:///…`, con `/`) sostituito da `lynkeus`, come nei binari.
+fn neutral_paths(sbom: &str, root: &Path) -> String {
+    let native = root.display().to_string();
+    let forward = native.replace('\\', "/");
+    let escaped = native.replace('\\', "\\\\");
+    sbom.replace(&forward, "lynkeus")
+        .replace(&escaped, "lynkeus")
+        .replace(&native, "lynkeus")
+}
+
+/// Cancella i file `file_name` scritti nelle cartelle dei pacchetti del workspace (fino a
+/// due livelli sotto `root`, solo cartelle con un `Cargo.toml`).
+fn remove_generated(root: &Path, file_name: &str) -> Result<()> {
+    let first_level = subdirs(root);
+    let second_level: Vec<PathBuf> = first_level.iter().flat_map(|dir| subdirs(dir)).collect();
+    let dirs = std::iter::once(root.to_path_buf())
+        .chain(first_level)
+        .chain(second_level);
+    for dir in dirs {
+        let file = dir.join(file_name);
+        if dir.join("Cargo.toml").is_file() && file.is_file() {
+            fs::remove_file(&file).with_context(|| format!("pulizia di {}", file.display()))?;
+        }
+    }
+    Ok(())
+}
+
+/// Le sottocartelle dirette di `dir` (nessuna se non si legge).
+fn subdirs(dir: &Path) -> Vec<PathBuf> {
+    fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+                .map(|entry| entry.path())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// `RUSTFLAGS` e `CARGO_ENCODED_RUSTFLAGS` sostituirebbero i rustflags di
@@ -213,68 +340,127 @@ fn env_path(name: &str) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// Verifica CFG e CETCOMPAT con `dumpbin /headers`; se `dumpbin` non si trova lo
-/// dice e prosegue, se lo trova e un flag manca fallisce.
-fn verify_mitigations(exe: &Path) -> Result<()> {
-    let Some(dumpbin) = find_dumpbin() else {
-        eprintln!(
-            "xtask: attenzione: dumpbin non trovato tramite vswhere, CFG e CETCOMPAT non verificati"
-        );
-        return Ok(());
+/// Verifica le mitigazioni lette dal file ([`Mitigations::problems`]); fallisce se ne
+/// manca una o se il file non si legge.
+fn verify_mitigations(exe_bytes: &[u8]) -> Result<Mitigations> {
+    let mitigations = Mitigations::read(exe_bytes)?;
+    let problems = mitigations.problems();
+    if !problems.is_empty() {
+        bail!("all'eseguibile mancano: {}", problems.join("; "));
+    }
+    eprintln!(
+        "xtask: ASLR, DEP, CFG, CETCOMPAT e DependentLoadFlags {:#x} presenti; {} DLL \
+         importate, nessun runtime C dinamico",
+        mitigations.dependent_load_flags,
+        mitigations.imports.len()
+    );
+    Ok(mitigations)
+}
+
+/// Stampa le mitigazioni e le DLL importate di `exe` (`cargo xtask mitigations`) e, su
+/// Windows, fa la prova con le DLL finte accanto; errore se una mitigazione manca o la
+/// prova fallisce.
+pub fn print_mitigations(exe: &Path) -> Result<()> {
+    let bytes = fs::read(exe).with_context(|| format!("lettura di {}", exe.display()))?;
+    let mitigations = Mitigations::read(&bytes)?;
+    println!(
+        "DllCharacteristics: {:#06x}",
+        mitigations.dll_characteristics
+    );
+    println!("GuardFlags:         {:#010x}", mitigations.guard_flags);
+    println!(
+        "DependentLoadFlags: {:#06x}",
+        mitigations.dependent_load_flags
+    );
+    println!("CETCOMPAT:          {}", mitigations.cet_compatible);
+    println!("DLL importate:      {}", mitigations.imports.join(", "));
+    let mut problems = mitigations.problems();
+    if cfg!(windows) {
+        let planting = target_dir(&workspace_root()?).join(PLANTING_DIR);
+        if let Err(error) = verify_dll_planting(exe, &mitigations.imports, &planting) {
+            problems.push(format!("{error:#}"));
+        }
+    }
+    if problems.is_empty() {
+        println!("nessuna mitigazione mancante, DLL finte ignorate");
+        Ok(())
+    } else {
+        bail!("mancano: {}", problems.join("; "))
+    }
+}
+
+/// La prova del caricamento delle DLL sull'eseguibile vero: una copia in `work` con accanto
+/// una DLL finta per ogni DLL importata, avviata come processo estrattore con lo stdin
+/// chiuso. Deve uscire con successo entro [`PLANTING_TIMEOUT`]: se il sistema caricasse una
+/// DLL finta, il processo morirebbe prima di `main`.
+fn verify_dll_planting(exe: &Path, imports: &[String], work: &Path) -> Result<()> {
+    if work.exists() {
+        fs::remove_dir_all(work).with_context(|| format!("pulizia di {}", work.display()))?;
+    }
+    fs::create_dir_all(work).with_context(|| format!("creazione di {}", work.display()))?;
+    let copy = work.join(exe.file_name().context("eseguibile senza nome")?);
+    fs::copy(exe, &copy).with_context(|| format!("copia in {}", copy.display()))?;
+    for dll in imports {
+        // Solo nomi semplici: la DLL finta resta nella cartella di prova.
+        if dll.contains(['/', '\\', ':']) || dll.starts_with('.') {
+            bail!("nome di DLL importata non valido: {dll}");
+        }
+        fs::write(work.join(dll), FAKE_DLL_BYTES).with_context(|| format!("DLL finta {dll}"))?;
+    }
+    let mut child = Command::new(&copy)
+        .args([
+            "--extract-worker",
+            "--memory-limit-bytes",
+            PLANTING_MEMORY_LIMIT,
+        ])
+        .current_dir(work)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .with_context(|| format!("avvio di {}", copy.display()))?;
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().context("attesa del processo di prova")? {
+            break status;
+        }
+        if started.elapsed() > PLANTING_TIMEOUT {
+            let _killed = child.kill();
+            let _reaped = child.wait();
+            bail!("il processo estrattore con le DLL finte accanto non è uscito in tempo");
+        }
+        std::thread::sleep(Duration::from_millis(50));
     };
-    let headers = run_captured(
-        Command::new(&dumpbin)
-            .args(["/headers", "/nologo"])
-            .arg(exe),
-        "dumpbin /headers",
-    )?;
-    let mut missing = Vec::new();
-    if !headers.contains("Control Flow Guard") {
-        missing.push("Control Flow Guard");
-    }
-    if !headers.contains("CET compatible") {
-        missing.push("CETCOMPAT");
-    }
-    if !missing.is_empty() {
+    if !status.success() {
+        let code = status.code().map_or_else(
+            || "nessun codice".to_owned(),
+            |code| format!("{:#010x}", code.cast_unsigned()),
+        );
         bail!(
-            "all'eseguibile mancano le mitigazioni: {}",
-            missing.join(", ")
+            "con DLL finte accanto all'eseguibile il processo estrattore è uscito con {code}: \
+             il sistema cerca le DLL importate nella cartella dell'eseguibile"
         );
     }
-    eprintln!("xtask: CFG e CETCOMPAT presenti");
+    let _cleaned = fs::remove_dir_all(work);
+    eprintln!(
+        "xtask: {} DLL finte accanto all'eseguibile ignorate dal sistema",
+        imports.len()
+    );
     Ok(())
 }
 
-/// Percorso assoluto di `dumpbin.exe` dagli strumenti MSVC più recenti, tramite vswhere.
-fn find_dumpbin() -> Option<PathBuf> {
-    let output = Command::new(VSWHERE)
-        .args(["-latest", "-products", "*", "-requires"])
-        .arg("Microsoft.VisualStudio.Component.VC.Tools.x86.x64")
-        .args(["-find", r"VC\Tools\MSVC\**\bin\Hostx64\x64\dumpbin.exe"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(PathBuf::from)
-        .rfind(|path| path.is_absolute() && path.is_file())
-}
-
-fn verify_no_local_data(exe_bytes: &[u8], needles: &[Needle]) -> Result<()> {
-    let findings = scan::find_all(exe_bytes, needles);
+/// Cerca nome utente e percorsi locali nei byte di `what` (l'eseguibile, lo SBOM).
+fn verify_no_local_data(what: &str, bytes: &[u8], needles: &[Needle]) -> Result<()> {
+    let findings = scan::find_all(bytes, needles);
     if findings.is_empty() {
-        eprintln!("xtask: nessun nome utente o percorso locale nell'eseguibile");
+        eprintln!("xtask: nessun nome utente o percorso locale ({what})");
         return Ok(());
     }
     let report: Vec<String> = findings
         .iter()
         .map(|f| format!("{} ({}, offset {:#x})", f.label, f.encoding, f.offset))
         .collect();
-    bail!("l'eseguibile contiene dati locali: {}", report.join("; "));
+    bail!("{what} contiene dati locali: {}", report.join("; "));
 }
 
 /// Zip con una cartella `<stem>/` che contiene eseguibile, `LICENSE` e `README.md`.
@@ -348,6 +534,26 @@ mod tests {
             parse_pkgid_version("path+file:///x/crates/lynkeus-app"),
             None
         );
+    }
+
+    /// Il percorso del workspace nello SBOM (URL con `/`, JSON con `\\` o testo nativo)
+    /// diventa `lynkeus`.
+    #[test]
+    fn sbom_paths_become_neutral() {
+        let (root, sbom) = if cfg!(windows) {
+            (
+                Path::new(r"D:\progetti\lynkeus"),
+                r#"{"bom-ref":"path+file:///D:/progetti/lynkeus/crates/app#0.1.0","p":"D:\\progetti\\lynkeus\\x"}"#,
+            )
+        } else {
+            (
+                Path::new("/home/u/progetti/lynkeus"),
+                r#"{"bom-ref":"path+file:///home/u/progetti/lynkeus/crates/app#0.1.0"}"#,
+            )
+        };
+        let neutral = neutral_paths(sbom, root);
+        assert!(!neutral.contains("progetti"), "{neutral}");
+        assert!(neutral.contains("lynkeus/crates/app#0.1.0"), "{neutral}");
     }
 
     #[test]

@@ -43,6 +43,11 @@ pub const MAX_PATHS: usize = 256;
 pub const MAX_PATH_CHARS: usize = 32_767;
 /// Tempo massimo per leggere un messaggio o la risposta.
 pub const READ_TIMEOUT: Duration = Duration::from_secs(2);
+/// Tempo massimo di un client per consegnare un messaggio: connessione, invio e conferma.
+/// Il server serve una connessione alla volta e ne dedica al più due volte
+/// [`READ_TIMEOUT`] a ciascuna (messaggio e chiusura): il client aspetta di più, così un
+/// client lento davanti in coda non fa aprire una seconda finestra.
+const DELIVERY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Tempo massimo che un client aspetta il file dell'istanza (Explorer avvia un processo per
 /// elemento selezionato, quasi insieme: il primo può non averlo ancora scritto).
 const INSTANCE_FILE_WAIT: Duration = Duration::from_secs(2);
@@ -490,7 +495,8 @@ fn open_lock(path: &Path) -> io::Result<File> {
 }
 
 /// Consegna `paths` alla prima istanza: legge il file dell'istanza (aspettandolo al più
-/// [`INSTANCE_FILE_WAIT`]), si connette e manda i messaggi, ognuno confermato.
+/// [`INSTANCE_FILE_WAIT`]), si connette e manda i messaggi, ognuno confermato entro
+/// [`DELIVERY_TIMEOUT`].
 fn deliver(instance_file: &Path, paths: &[PathBuf]) -> io::Result<()> {
     let started = Instant::now();
     let instance = loop {
@@ -501,7 +507,7 @@ fn deliver(instance_file: &Path, paths: &[PathBuf]) -> io::Result<()> {
         }
     };
     for message in encode_messages(&instance.token, paths) {
-        let deadline = Instant::now() + READ_TIMEOUT;
+        let deadline = Instant::now() + DELIVERY_TIMEOUT;
         let mut channel = platform::connect_instance(&instance.endpoint, deadline)?;
         channel.write_all(&message, deadline)?;
         let mut reply = [0u8; 1];
@@ -560,7 +566,14 @@ impl InstanceServer {
             .spawn(move || {
                 // Chiuso all'uscita dal thread, anche con un panic.
                 let _finished = finished_tx;
-                listen(&listener, &token, &sender, &thread_waker);
+                let end = listen(
+                    &listener,
+                    &token,
+                    &sender,
+                    &thread_waker,
+                    ACCEPT_RETRY_PAUSE,
+                );
+                tracing::debug!(?end, "istanza unica: server fermo");
             })?;
         Ok(InstanceServer {
             instance_file,
@@ -621,15 +634,48 @@ fn bind_new_endpoint() -> io::Result<InstanceListener> {
     Err(last_error.unwrap_or_else(|| io::Error::other("canale non creato")))
 }
 
+/// Chi aspetta i client del server: il canale vero ([`InstanceListener`]) o, nei test, uno
+/// finto.
+trait Listener {
+    /// Una connessione accettata.
+    type Connection<'a>: Channel
+    where
+        Self: 'a;
+
+    /// Aspetta un client; `None` dopo lo stop.
+    fn accept(&self) -> io::Result<Option<Self::Connection<'_>>>;
+}
+
+impl Listener for InstanceListener {
+    type Connection<'a> = platform::InstanceConnection<'a>;
+
+    fn accept(&self) -> io::Result<Option<Self::Connection<'_>>> {
+        InstanceListener::accept(self)
+    }
+}
+
+/// Perché il ciclo del server è finito.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServerEnd {
+    /// Lo stop (uscita dell'app).
+    Stopped,
+    /// Il thread dell'interfaccia non riceve più.
+    Disconnected,
+    /// [`MAX_ACCEPT_ERRORS`] errori di fila nell'attesa di un client: canale rotto.
+    TooManyErrors,
+}
+
 /// Il ciclo del server: una connessione alla volta finché non arriva lo stop. Un errore
-/// nell'attesa di un client si registra e si riprova dopo [`ACCEPT_RETRY_PAUSE`]; solo dopo
-/// [`MAX_ACCEPT_ERRORS`] errori di fila il server si ferma, registrandolo.
-fn listen(
-    listener: &InstanceListener,
+/// nell'attesa di un client si registra e si riprova dopo `retry_pause`; solo dopo
+/// [`MAX_ACCEPT_ERRORS`] errori di fila il server si ferma, registrandolo come errore (il
+/// canale si chiude con il thread: i prossimi avvii con `--add` aprono la loro finestra).
+fn listen<L: Listener>(
+    listener: &L,
     token: &Token,
     sender: &SyncSender<Vec<PathBuf>>,
     waker: &Mutex<Option<Notify>>,
-) {
+    retry_pause: Duration,
+) -> ServerEnd {
     let mut errors_in_a_row = 0u32;
     loop {
         let mut connection = match listener.accept() {
@@ -637,15 +683,15 @@ fn listen(
                 errors_in_a_row = 0;
                 connection
             }
-            Ok(None) => return,
+            Ok(None) => return ServerEnd::Stopped,
             Err(error) => {
                 errors_in_a_row += 1;
                 if errors_in_a_row >= MAX_ACCEPT_ERRORS {
                     tracing::error!(%error, errors_in_a_row, "istanza unica: canale fermato");
-                    return;
+                    return ServerEnd::TooManyErrors;
                 }
                 tracing::warn!(%error, errors_in_a_row, "istanza unica: attesa non riuscita");
-                thread::sleep(ACCEPT_RETRY_PAUSE);
+                thread::sleep(retry_pause);
                 continue;
             }
         };
@@ -663,7 +709,7 @@ fn listen(
                     Err(TrySendError::Full(_)) => {
                         tracing::warn!("istanza unica: troppi messaggi in attesa, scartato");
                     }
-                    Err(TrySendError::Disconnected(_)) => return,
+                    Err(TrySendError::Disconnected(_)) => return ServerEnd::Disconnected,
                 }
             }
             Err(error) => tracing::warn!(%error, "istanza unica: messaggio rifiutato"),
@@ -1021,6 +1067,106 @@ mod tests {
             start_or_deliver(&data, &fs, &[]),
             Startup::Server(_)
         ));
+    }
+
+    /// T-D08: un client che si connette e non scrive tiene il canale al più
+    /// [`READ_TIMEOUT`]; la consegna del client successivo, avviata subito dopo, aspetta e
+    /// riesce (nessuna seconda finestra).
+    #[test]
+    fn a_slow_client_does_not_block_the_next() {
+        let (_dir, base) = existing_dir();
+        let data = base.join("dati");
+        let fs: Arc<dyn PrivateFs> = platform::private_fs();
+        fs.create_dir(&data).expect("cartella dati");
+        let server = match start_or_deliver(&data, &fs, &[]) {
+            Startup::Server(server) => server,
+            other => {
+                // Linux senza `$XDG_RUNTIME_DIR`: istanza unica spenta.
+                assert!(
+                    !cfg!(windows) && std::env::var_os("XDG_RUNTIME_DIR").is_none(),
+                    "{other:?}"
+                );
+                return;
+            }
+        };
+        let instance = InstanceFile::read(&data.join(INSTANCE_FILE)).expect("file");
+        let slow = platform::connect_instance(&instance.endpoint, Instant::now() + READ_TIMEOUT)
+            .expect("client lento connesso");
+        let delivered = start_or_deliver(&data, &fs, std::slice::from_ref(&base));
+        assert!(matches!(delivered, Startup::Delivered), "{delivered:?}");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut received = Vec::new();
+        while received.is_empty() && Instant::now() < deadline {
+            received = server.take_paths();
+            thread::yield_now();
+        }
+        assert_eq!(received, std::slice::from_ref(&base));
+        drop(slow);
+    }
+
+    /// Un canale finto: ogni attesa dà il prossimo esito della lista (dopo l'ultimo, lo
+    /// stop), e conta le attese.
+    struct ScriptedListener {
+        outcomes: Mutex<std::collections::VecDeque<Option<Vec<u8>>>>,
+        accepts: std::sync::atomic::AtomicU32,
+    }
+
+    impl ScriptedListener {
+        /// `None` = errore nell'attesa; `Some(byte)` = un client che manda quei byte.
+        fn new(outcomes: Vec<Option<Vec<u8>>>) -> ScriptedListener {
+            ScriptedListener {
+                outcomes: Mutex::new(outcomes.into()),
+                accepts: std::sync::atomic::AtomicU32::new(0),
+            }
+        }
+
+        fn accepts(&self) -> u32 {
+            self.accepts.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    impl Listener for ScriptedListener {
+        type Connection<'a> = MemoryChannel;
+
+        fn accept(&self) -> io::Result<Option<MemoryChannel>> {
+            self.accepts
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let next = self
+                .outcomes
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .pop_front();
+            match next {
+                None => Ok(None),
+                Some(None) => Err(io::Error::other("pipe rotta")),
+                Some(Some(bytes)) => Ok(Some(MemoryChannel::new(bytes))),
+            }
+        }
+    }
+
+    /// T-D09: venti errori di fila nell'attesa fermano il server, che lo dichiara; un
+    /// client servito in mezzo azzera il conto.
+    #[test]
+    fn twenty_accept_errors_stop_the_server() {
+        let (sender, received) = mpsc::sync_channel(4);
+        let waker = Mutex::new(None);
+        let errors = |count: u32| (0..count).map(|_| None).collect::<Vec<_>>();
+
+        let broken = ScriptedListener::new(errors(MAX_ACCEPT_ERRORS + 5));
+        let end = listen(&broken, &token(1), &sender, &waker, Duration::ZERO);
+        assert_eq!(end, ServerEnd::TooManyErrors);
+        assert_eq!(broken.accepts(), MAX_ACCEPT_ERRORS);
+
+        let (_dir, existing) = existing_dir();
+        let message = encode_messages(&token(1), std::slice::from_ref(&existing)).remove(0);
+        let mut outcomes = errors(MAX_ACCEPT_ERRORS - 1);
+        outcomes.push(Some(message));
+        outcomes.extend(errors(MAX_ACCEPT_ERRORS - 1));
+        let flaky = ScriptedListener::new(outcomes);
+        let end = listen(&flaky, &token(1), &sender, &waker, Duration::ZERO);
+        assert_eq!(end, ServerEnd::Stopped);
+        assert_eq!(flaky.accepts(), 2 * MAX_ACCEPT_ERRORS);
+        assert_eq!(received.try_recv().ok(), Some(vec![existing]));
     }
 
     proptest! {
