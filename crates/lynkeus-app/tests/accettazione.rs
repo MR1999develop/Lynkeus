@@ -4,7 +4,8 @@
 //! Test d'accettazione: l'app costruita da `Application::build`, collegata al processo
 //! estrattore vero (questo stesso binario con `--extract-worker`), cerca "ar" in
 //! `fixtures/demo` e trova le parole attese anche nei documenti e negli archivi (vedi
-//! `fixtures/README.md`); anteprima, apertura delle voci d'archivio e cache.
+//! `fixtures/README.md`); anteprima, apertura delle voci d'archivio e cache. Poi le opzioni
+//! di ricerca (jolly, frasi, OR/AND, accenti, maiuscole) e i file di `fixtures/malevoli`.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -17,8 +18,8 @@ use lynkeus_app::i18n::Language;
 use lynkeus_app::launch::ArchiveEntryExtractor;
 use lynkeus_app::preview::{self, Loaded, PreviewRequest};
 use lynkeus_app::{Application, Pump, SearchStatus, Settings};
-use lynkeus_core::Location;
-use lynkeus_engine::{DocPath, Hit, Limits, Outcome};
+use lynkeus_core::{AccentMode, CaseMode, Combine, Location, MatchOptions};
+use lynkeus_engine::{DocPath, Hit, LimitKind, Limits, Outcome, WarningKind};
 
 const TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -43,8 +44,15 @@ fn setup(dir: &Path) -> ExtractionSetup {
 
 /// Un'app in italiano collegata al processo estrattore, con le cartelle in `dir`.
 fn connected_app(dir: &Path) -> Application {
+    connected_app_with(dir, MatchOptions::default(), Combine::default())
+}
+
+/// Come [`connected_app`], con le opzioni di confronto e la combinazione dei termini date.
+fn connected_app_with(dir: &Path, options: MatchOptions, combine: Combine) -> Application {
     let settings = Settings {
         language: Some(Language::Italian),
+        options,
+        combine,
         ..Settings::default()
     };
     let mut app = Application::build(settings).expect("app costruita");
@@ -56,8 +64,13 @@ fn connected_app(dir: &Path) -> Application {
 /// Avvia la ricerca e pompa gli eventi finché finisce, aspettando i segnali del worker
 /// con una scadenza (nessuna attesa a vuoto).
 fn search_in(app: &mut Application, root: &Path, term: &str) {
+    search_terms_in(app, root, &[term]);
+}
+
+/// Come [`search_in`], con più termini.
+fn search_terms_in(app: &mut Application, root: &Path, terms: &[&str]) {
     app.set_root(root);
-    app.set_term(term);
+    app.set_terms(terms);
     let (wake_tx, wake_rx) = mpsc::channel::<()>();
     let notify = Arc::new(move || {
         // A ricerca finita il test non ascolta più: un segnale perso non conta.
@@ -302,4 +315,262 @@ fn without_the_extractor_documents_are_skipped_not_misread() {
     let hits = &app.results().hits;
     assert!(hits.iter().all(|h| file_name(h) != "note.docx"));
     assert!(hits.iter().all(|h| !h.doc.is_inside_archive()));
+}
+
+// --- Opzioni di ricerca su `fixtures/demo` (valori attesi da `fixtures/README.md`) ---
+
+/// Una riga come (file, parola, posizione).
+type Row = (String, String, Location);
+
+/// Cerca `terms` in `fixtures/demo` con le opzioni date, controlla che la ricerca sia
+/// finita senza avvisi e restituisce le righe ordinate per file e parola.
+fn demo_rows(options: MatchOptions, combine: Combine, terms: &[&str]) -> Vec<Row> {
+    let dir = tempfile::tempdir().expect("cartella temporanea");
+    let mut app = connected_app_with(dir.path(), options, combine);
+    search_terms_in(&mut app, &demo_dir(), terms);
+    let SearchStatus::Finished(summary) = app.status() else {
+        panic!("ricerca non finita: {:?}", app.status());
+    };
+    assert_eq!(summary.outcome, Outcome::Completed);
+    assert!(
+        app.results().warnings.is_empty(),
+        "{:?}",
+        app.results().warnings
+    );
+    let mut rows: Vec<Row> = app
+        .results()
+        .hits
+        .iter()
+        .map(|h| (file_name(h), h.word.clone(), h.location.clone()))
+        .collect();
+    // L'ordine di arrivo dipende dai thread: si confronta un ordine fisso.
+    rows.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+    rows
+}
+
+fn row(file: &str, word: &str, location: Location) -> Row {
+    (file.to_owned(), word.to_owned(), location)
+}
+
+fn with_accents(accents: AccentMode) -> MatchOptions {
+    MatchOptions {
+        accents,
+        ..MatchOptions::default()
+    }
+}
+
+fn with_case(case: CaseMode) -> MatchOptions {
+    MatchOptions {
+        case,
+        ..MatchOptions::default()
+    }
+}
+
+/// "c" + un carattere + "rt" + qualsiasi cosa: "carta" nel testo UTF-16 e nel docx, non
+/// "carità" (c-a-r-i).
+#[test]
+fn wildcards_question_and_star_find_carta_in_text_and_docx() {
+    let rows = demo_rows(MatchOptions::default(), Combine::Any, &["c?rt*"]);
+    assert_eq!(
+        rows,
+        [
+            row("note.docx", "carta", Location::Paragraph(3)),
+            row("utf16.txt", "carta", Location::Line(1)),
+        ]
+    );
+}
+
+/// Un termine con uno spazio è una frase: "la car" trova "la carta" del docx e nient'altro.
+#[test]
+fn phrase_with_a_space_finds_the_whole_phrase_in_docx() {
+    let rows = demo_rows(MatchOptions::default(), Combine::Any, &["la car"]);
+    assert_eq!(rows, [row("note.docx", "la carta", Location::Paragraph(3))]);
+}
+
+/// OR: ogni riga con almeno un termine, da file diversi.
+#[test]
+fn or_terms_in_different_files_finds_each() {
+    let rows = demo_rows(
+        MatchOptions::default(),
+        Combine::Any,
+        &["carta", "aragosta"],
+    );
+    assert_eq!(
+        rows,
+        [
+            row("mare.txt", "l'aragosta", Location::Line(12)),
+            row("note.docx", "carta", Location::Paragraph(3)),
+            row("utf16.txt", "carta", Location::Line(1)),
+        ]
+    );
+}
+
+/// AND: nessun file contiene sia "carta" sia "aragosta".
+#[test]
+fn and_terms_in_different_files_finds_nothing() {
+    let rows = demo_rows(
+        MatchOptions::default(),
+        Combine::All,
+        &["carta", "aragosta"],
+    );
+    assert_eq!(rows, []);
+}
+
+/// AND: "carta" e "stampante" stanno nella stessa frase del docx.
+#[test]
+fn and_terms_in_the_same_file_finds_both() {
+    let rows = demo_rows(
+        MatchOptions::default(),
+        Combine::All,
+        &["carta", "stampante"],
+    );
+    assert_eq!(
+        rows,
+        [
+            row("note.docx", "carta", Location::Paragraph(3)),
+            row("note.docx", "stampante", Location::Paragraph(3)),
+        ]
+    );
+}
+
+/// "città" in citta.txt: riga 1 in forma composta (U+00E0) e riga 4 in forma NFD
+/// (`a` + U+0300), con la parola com'è scritta nel testo.
+fn assert_citta_lines(rows: &[Row]) {
+    assert_eq!(
+        rows,
+        [
+            row("citta.txt", "citta\u{300}", Location::Line(4)),
+            row("citta.txt", "citt\u{e0}", Location::Line(1)),
+        ]
+    );
+}
+
+/// Accenti distinti (predefinito): "citta" non trova "città".
+#[test]
+fn accents_distinct_unaccented_term_finds_nothing() {
+    let rows = demo_rows(with_accents(AccentMode::Distinct), Combine::Any, &["citta"]);
+    assert_eq!(rows, []);
+}
+
+/// Accenti distinti: "città" trova anche la forma decomposta della riga 4.
+#[test]
+fn accents_distinct_accented_term_finds_the_nfd_form_too() {
+    let rows = demo_rows(with_accents(AccentMode::Distinct), Combine::Any, &["città"]);
+    assert_citta_lines(&rows);
+}
+
+/// Accenti ignorati: "citta" e "città" trovano entrambe le forme di "città".
+#[test]
+fn accents_ignored_both_spellings_find_both_forms() {
+    for term in ["citta", "città"] {
+        let rows = demo_rows(with_accents(AccentMode::Ignored), Combine::Any, &[term]);
+        assert_citta_lines(&rows);
+    }
+}
+
+/// Maiuscole ignorate (predefinito): "ARMADIO" trova "ARMADIO".
+#[test]
+fn case_insensitive_uppercase_term_finds_armadio() {
+    let rows = demo_rows(with_case(CaseMode::Insensitive), Combine::Any, &["ARMADIO"]);
+    assert_eq!(rows, [row("citta.txt", "ARMADIO", Location::Line(3))]);
+}
+
+/// Maiuscole distinte: "armadio" non trova "ARMADIO".
+#[test]
+fn case_sensitive_lowercase_term_finds_nothing() {
+    let rows = demo_rows(with_case(CaseMode::Sensitive), Combine::Any, &["armadio"]);
+    assert_eq!(rows, []);
+}
+
+// --- File malevoli ---
+
+/// I percorsi sotto `dir`, ricorsivamente, in ordine.
+fn tree(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(current) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&current) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path.clone());
+            }
+            out.push(path);
+        }
+    }
+    out.sort();
+    out
+}
+
+/// I motivi degli avvisi sul file `file`, nell'ordine di arrivo.
+fn warning_kinds(app: &Application, file: &str) -> Vec<WarningKind> {
+    app.results()
+        .warnings
+        .iter()
+        .filter(|w| {
+            w.doc
+                .path
+                .file_name()
+                .is_some_and(|n| n.to_string_lossy() == file)
+        })
+        .map(|w| w.kind)
+        .collect()
+}
+
+/// La ricerca su `fixtures/malevoli` finisce entro la scadenza di [`search_in`], dà gli
+/// avvisi attesi e non scrive file fuori dalla cartella temporanea del test.
+#[test]
+fn malicious_files_end_with_the_expected_warnings_and_write_nothing_outside() {
+    let fixtures_before = tree(&fixtures(""));
+    let dir = tempfile::tempdir().expect("cartella temporanea");
+    let mut app = connected_app(dir.path());
+    search_in(&mut app, &fixtures("malevoli"), "aragosta");
+    let SearchStatus::Finished(summary) = app.status() else {
+        panic!("ricerca non finita: {:?}", app.status());
+    };
+    assert_eq!(summary.outcome, Outcome::Completed);
+
+    let all = &app.results().warnings;
+    let expected = [
+        (
+            "bomba.zip",
+            WarningKind::LimitExceeded(LimitKind::CompressionRatio),
+        ),
+        (
+            "annidato-profondo.zip",
+            WarningKind::LimitExceeded(LimitKind::ArchiveDepth),
+        ),
+        ("immagine-finta.pdf", WarningKind::ContentMismatch),
+        ("entita.docx", WarningKind::Corrupt),
+        ("troncato.pdf", WarningKind::Corrupt),
+    ];
+    for (file, kind) in expected {
+        assert_eq!(warning_kinds(&app, file), [kind], "{file}: {all:?}");
+    }
+    // Nessun altro avviso: percorsi.zip e riga-lunga.txt si leggono.
+    assert_eq!(all.len(), expected.len(), "{all:?}");
+
+    let hits = &app.results().hits;
+    assert!(
+        hits.iter()
+            .all(|h| !h.doc.inner.iter().any(|n| n == "fondo.txt")),
+        "fondo.txt è oltre il limite di profondità"
+    );
+    let long_line = find(hits, "riga-lunga.txt", "aragosta").expect("aragosta in riga-lunga.txt");
+    assert_eq!(long_line.location, Location::Line(2));
+
+    // Nessun file nuovo tra le fixture né dove puntano i nomi delle voci di percorsi.zip.
+    app.shutdown_extraction();
+    assert_eq!(tree(&fixtures("")), fixtures_before);
+    let repo = fixtures("..");
+    for escaped in [
+        repo.join("evil.txt"),
+        repo.join("../evil.txt"),
+        PathBuf::from("/assoluto/evil.txt"),
+        PathBuf::from("C:/Windows/evil.txt"),
+    ] {
+        assert!(!escaped.exists(), "{}", escaped.display());
+    }
 }
