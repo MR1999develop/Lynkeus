@@ -250,6 +250,24 @@ pub enum TermRowError {
 pub enum PathInputError {
     /// Nessun file o cartella con quel percorso.
     NotFound,
+    /// L'elenco dei luoghi ha già [`MAX_ROOTS`] voci.
+    TooManyRoots,
+}
+
+/// Luoghi di ricerca al più: un elenco più lungo non si legge più e non viene da un uso
+/// normale (vale per ogni via d'ingresso: dialoghi, trascinamento, campo, clic destro,
+/// impostazioni salvate).
+pub const MAX_ROOTS: usize = 256;
+
+/// Esito di [`SearchForm::add_root`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RootAdded {
+    /// Aggiunta in fondo.
+    Added,
+    /// C'era già.
+    Duplicate,
+    /// Non aggiunta: l'elenco ha già [`MAX_ROOTS`] voci.
+    LimitReached,
 }
 
 /// Stato del campo del percorso scritto a mano.
@@ -349,7 +367,7 @@ impl SearchForm {
             combine: settings.combine,
             filters: FilterForm::from_settings(&settings.filters),
         };
-        for path in &settings.roots {
+        for path in settings.roots.iter().take(MAX_ROOTS) {
             form.add_root(path.clone(), probe(path));
         }
         for term in settings.terms.iter().take(Query::MAX_TERMS) {
@@ -373,15 +391,24 @@ impl SearchForm {
         settings.filters = self.filters.to_settings();
     }
 
-    /// Aggiunge una radice in fondo, resa assoluta ([`absolute_root`]); falso se c'era già.
-    pub fn add_root(&mut self, path: PathBuf, kind: RootKind) -> bool {
+    /// Aggiunge una radice in fondo, resa assoluta ([`absolute_root`]), se non c'è già e se
+    /// l'elenco non ha già [`MAX_ROOTS`] voci.
+    pub fn add_root(&mut self, path: PathBuf, kind: RootKind) -> RootAdded {
         let path = absolute_root(path);
         if self.roots.iter().any(|r| r.path == path) {
-            return false;
+            return RootAdded::Duplicate;
+        }
+        if self.roots_full() {
+            return RootAdded::LimitReached;
         }
         self.roots.push(RootEntry { path, kind });
         self.show_roots_error = false;
-        true
+        RootAdded::Added
+    }
+
+    /// Vero se l'elenco dei luoghi ha già [`MAX_ROOTS`] voci.
+    pub fn roots_full(&self) -> bool {
+        self.roots.len() >= MAX_ROOTS
     }
 
     /// Registra che cosa è `path` sul disco, per tutte le radici con quel percorso.
@@ -686,11 +713,51 @@ mod tests {
     #[test]
     fn roots_are_unique_and_removable() {
         let mut form = form_with(&["a", "b"], &["x"]);
-        assert!(!form.add_root(PathBuf::from("a"), RootKind::Folder));
+        assert_eq!(
+            form.add_root(PathBuf::from("a"), RootKind::Folder),
+            RootAdded::Duplicate
+        );
         form.remove_root(0);
         form.remove_root(7);
         let paths: Vec<&Path> = form.roots.iter().map(|r| r.path.as_path()).collect();
         assert_eq!(paths, [absolute_root(PathBuf::from("b")).as_path()]);
+    }
+
+    /// Al più [`MAX_ROOTS`] luoghi: l'ultimo entra, il successivo no (un doppione resta un
+    /// doppione); anche dalle impostazioni salvate.
+    #[test]
+    fn roots_stop_at_the_limit() {
+        let mut form = form_with(&[], &["x"]);
+        for i in 0..MAX_ROOTS {
+            assert_eq!(
+                form.add_root(PathBuf::from(format!("r{i}")), RootKind::Folder),
+                RootAdded::Added
+            );
+        }
+        assert!(form.roots_full());
+        assert_eq!(
+            form.add_root(PathBuf::from("oltre"), RootKind::Folder),
+            RootAdded::LimitReached
+        );
+        assert_eq!(
+            form.add_root(PathBuf::from("r0"), RootKind::Folder),
+            RootAdded::Duplicate
+        );
+        assert_eq!(form.roots.len(), MAX_ROOTS);
+        form.remove_root(0);
+        assert_eq!(
+            form.add_root(PathBuf::from("oltre"), RootKind::Folder),
+            RootAdded::Added
+        );
+
+        let settings = Settings {
+            roots: (0..MAX_ROOTS + 10)
+                .map(|i| PathBuf::from(format!("s{i}")))
+                .collect(),
+            ..Settings::default()
+        };
+        let loaded = SearchForm::from_settings(&settings, |_| RootKind::Pending);
+        assert_eq!(loaded.roots.len(), MAX_ROOTS);
     }
 
     #[test]

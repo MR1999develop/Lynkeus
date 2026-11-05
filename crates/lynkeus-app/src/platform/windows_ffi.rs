@@ -19,7 +19,7 @@
 //! - Identità e descrittori: SID dell'utente dal token ([`current_user`], [`process_user`]),
 //!   cartelle e file privati con descrittore esplicito e protetto (solo utente e SYSTEM:
 //!   [`create_private_dir`], [`create_new_private_file`], [`WindowsPrivateFs`]), lettura di
-//!   proprietario e DACL ([`read_security`], [`dir_writable_by_others`]).
+//!   proprietario e DACL ([`read_security`], [`exe_writable_by_others`]).
 //! - Istanza unica: named pipe con `FILE_FLAG_FIRST_PIPE_INSTANCE`, solo client locali, DACL
 //!   con il solo utente e I/O sovrapposto con tempi limite ([`PipeServer`], [`PipeClient`],
 //!   aperto con SQoS Identification); [`allow_set_foreground`].
@@ -41,10 +41,10 @@ use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
-    ERROR_ACCESS_DENIED, ERROR_BROKEN_PIPE, ERROR_IO_PENDING, ERROR_NO_DATA, ERROR_PIPE_BUSY,
-    ERROR_PIPE_CONNECTED, ERROR_PIPE_NOT_CONNECTED, GENERIC_ALL, GENERIC_WRITE, HANDLE,
-    HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, LocalFree, SetHandleInformation, WAIT_OBJECT_0,
-    WAIT_TIMEOUT,
+    ERROR_ACCESS_DENIED, ERROR_BROKEN_PIPE, ERROR_IO_INCOMPLETE, ERROR_IO_PENDING, ERROR_NO_DATA,
+    ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, ERROR_PIPE_NOT_CONNECTED, GENERIC_ALL, GENERIC_WRITE,
+    HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, LocalFree, SetHandleInformation,
+    WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
@@ -1030,27 +1030,49 @@ const WRITE_RIGHTS: u32 = 0x2 // FILE_ADD_FILE
     | GENERIC_WRITE
     | GENERIC_ALL;
 
-/// Vero se `info` concede scrittura sulla cartella stessa a un SID fuori da `trusted`.
+/// Vero se `info` lascia modificare l'oggetto stesso (file o cartella) a chi non è in
+/// `trusted`: proprietario fuori da `trusted` (il proprietario può sempre cambiare la DACL),
+/// DACL nulla, o una voce non solo ereditabile che concede scrittura a un SID fuori da
+/// `trusted`.
 fn writable_by_others(info: &SecurityInfo, trusted: &[Sid]) -> bool {
     let Some(dacl) = &info.dacl else {
         return true;
     };
-    dacl.iter().any(|ace| {
-        ace.allows
-            && !ace.inherit_only
-            && ace.mask & WRITE_RIGHTS != 0
-            && !trusted.contains(&ace.sid)
-    })
+    !trusted.contains(&info.owner)
+        || dacl.iter().any(|ace| {
+            ace.allows
+                && !ace.inherit_only
+                && ace.mask & WRITE_RIGHTS != 0
+                && !trusted.contains(&ace.sid)
+        })
 }
 
-/// Vero se la cartella `dir` è scrivibile da utenti diversi da questo, dagli
-/// amministratori, da SYSTEM e da TrustedInstaller (cartella dell'eseguibile, prima di
-/// registrare il clic destro).
-pub fn dir_writable_by_others(dir: &Path) -> io::Result<bool> {
-    let info = read_security(dir)?;
-    let mut trusted = trusted_sids(&current_user()?)?;
-    trusted.push(Sid::from_sddl(TRUSTED_INSTALLER_SDDL)?);
-    Ok(writable_by_others(&info, &trusted))
+/// Chi può modificare il programma senza che sia un problema: l'utente, SYSTEM, gli
+/// amministratori e TrustedInstaller. Non i segnaposto CREATOR OWNER e OWNER RIGHTS, che
+/// valgono per chi crea o possiede un oggetto (anche un altro utente).
+fn program_trusted_sids(user: &Sid) -> io::Result<Vec<Sid>> {
+    Ok(vec![
+        user.clone(),
+        Sid::well_known(KnownSid::LocalSystem)?,
+        Sid::well_known(KnownSid::Administrators)?,
+        Sid::from_sddl(TRUSTED_INSTALLER_SDDL)?,
+    ])
+}
+
+/// Vero se l'eseguibile `exe` o la sua cartella sono modificabili da utenti diversi da
+/// questo, dagli amministratori, da SYSTEM e da TrustedInstaller (prima di registrare il
+/// clic destro): proprietario estraneo o scrittura concessa ad altri.
+pub fn exe_writable_by_others(exe: &Path) -> io::Result<bool> {
+    let dir = exe
+        .parent()
+        .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+    let trusted = program_trusted_sids(&current_user()?)?;
+    for object in [exe, dir] {
+        if writable_by_others(&read_security(object)?, &trusted) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Errore di "cartella non privata" (lo stesso tipo dell'engine).
@@ -1195,11 +1217,66 @@ impl StopSignal {
         // SAFETY: handle dell'evento valido preso in prestito.
         unsafe { SetEvent(self.event.handle.as_raw_handle()) };
     }
+
+    /// Vero se il segnale è stato dato.
+    fn is_set(&self) -> bool {
+        // SAFETY: handle dell'evento valido preso in prestito; attesa nulla.
+        unsafe { WaitForSingleObject(self.event.handle.as_raw_handle(), 0) == WAIT_OBJECT_0 }
+    }
+}
+
+/// Esito di un tentativo di connessione del server.
+enum Connection {
+    /// Un client è connesso.
+    Connected,
+    /// Lo stop è arrivato.
+    Stopped,
+    /// Un client si era connesso e ha già chiuso: la connessione va chiusa.
+    ClientGone,
+}
+
+/// Vero se `error` è l'errore di sistema `code`.
+fn is_os_error(error: &io::Error, code: u32) -> bool {
+    error.raw_os_error() == i32::try_from(code).ok()
+}
+
+/// Annulla l'operazione sovrapposta di `overlapped` (se è ancora in corso) e ne attende la
+/// fine; restituisce l'esito finale (byte trasferiti o errore). Dopo il ritorno il sistema non
+/// tocca più `overlapped` né il buffer dell'operazione: solo allora si possono liberare.
+///
+/// Regola del modulo: ogni operazione sovrapposta avviata (esito `ERROR_IO_PENDING` o
+/// completata) che non si è vista finire con un'attesa riuscita passa da qui prima che
+/// struttura, evento o buffer escano di scope, qualunque sia l'errore visto.
+fn cancel_and_wait(handle: HANDLE, overlapped: &OVERLAPPED) -> io::Result<u32> {
+    let mut transferred = 0u32;
+    // SAFETY: `handle` è l'handle su cui l'operazione è stata avviata e `overlapped` la sua
+    // struttura, viva fino al ritorno. `CancelIoEx` su un'operazione già finita fallisce con
+    // `ERROR_NOT_FOUND` senza effetti; `GetOverlappedResult` con attesa (`bWait` = 1) ritorna
+    // solo a operazione finita (completata o annullata).
+    let done = unsafe {
+        CancelIoEx(handle, overlapped);
+        GetOverlappedResult(handle, overlapped, &raw mut transferred, 1)
+    };
+    if done == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(transferred)
+    }
+}
+
+/// Vero se `error` dice che l'attesa di un'operazione sovrapposta è scaduta (`WAIT_TIMEOUT`,
+/// o `ERROR_IO_INCOMPLETE` quando il tempo rimasto era zero).
+fn wait_expired(error: &io::Error) -> bool {
+    [WAIT_TIMEOUT, ERROR_IO_INCOMPLETE]
+        .iter()
+        .any(|code| error.raw_os_error() == i32::try_from(*code).ok())
 }
 
 /// Esegue un'operazione sovrapposta su `handle` e ne attende la fine al massimo `timeout`;
-/// allo scadere la annulla e ne aspetta la chiusura (la struttura OVERLAPPED non deve
-/// sparire con l'operazione in corso). Restituisce i byte trasferiti.
+/// se non la si vede finire (tempo scaduto, anche con `timeout` zero, o qualunque errore
+/// dell'attesa) la annulla e ne aspetta la chiusura ([`cancel_and_wait`]): la struttura
+/// OVERLAPPED, l'evento e il buffer non spariscono mai con l'operazione in corso.
+/// Restituisce i byte trasferiti; `TimedOut` se il tempo è scaduto senza trasferimento.
 fn overlapped_io(
     handle: HANDLE,
     timeout: Duration,
@@ -1212,6 +1289,7 @@ fn overlapped_io(
     if start(&raw mut overlapped) == 0 {
         let error = io::Error::last_os_error();
         if error.raw_os_error() != i32::try_from(ERROR_IO_PENDING).ok() {
+            // L'operazione non è partita: nulla da attendere.
             return Err(error);
         }
     }
@@ -1219,8 +1297,8 @@ fn overlapped_io(
         .unwrap_or(INFINITE - 1)
         .min(INFINITE - 1);
     let mut transferred = 0u32;
-    // SAFETY: handle valido; `overlapped` vivo fino alla fine dell'operazione (anche in caso
-    // di timeout, sotto).
+    // SAFETY: handle valido; `overlapped` vivo fino alla fine dell'operazione (sotto, in ogni
+    // caso diverso dal completamento visto qui, `cancel_and_wait`).
     let done = unsafe {
         GetOverlappedResultEx(
             handle,
@@ -1234,16 +1312,15 @@ fn overlapped_io(
         return Ok(transferred);
     }
     let error = io::Error::last_os_error();
-    let timed_out = error.raw_os_error() == i32::try_from(WAIT_TIMEOUT).ok();
-    if !timed_out {
-        return Err(error);
+    let expired = wait_expired(&error);
+    let finished = cancel_and_wait(handle, &overlapped);
+    match finished {
+        // Finita proprio mentre la si annullava: il trasferimento è avvenuto e conta.
+        Ok(transferred) if transferred > 0 => Ok(transferred),
+        _ if expired => Err(io::Error::from(io::ErrorKind::TimedOut)),
+        Ok(transferred) => Ok(transferred),
+        Err(final_error) => Err(final_error),
     }
-    // SAFETY: annulla l'operazione di questa OVERLAPPED, poi ne attende la fine.
-    unsafe {
-        CancelIoEx(handle, &raw const overlapped);
-        GetOverlappedResult(handle, &raw const overlapped, &raw mut transferred, 1);
-    }
-    Err(io::Error::from(io::ErrorKind::TimedOut))
 }
 
 /// Legge esattamente `buffer.len()` byte da una pipe sovrapposta entro `deadline`.
@@ -1335,21 +1412,50 @@ impl PipeServer {
     }
 
     /// Aspetta un client finché non arriva (vero) o finché `stop` non è dato (falso).
+    ///
+    /// Un client che si è connesso e ha già chiuso (`ERROR_NO_DATA`) non ferma l'attesa: la
+    /// connessione morta si chiude e si aspetta il prossimo. Gli altri errori (anche
+    /// dell'attesa, `WAIT_FAILED`) chiudono la connessione e tornano al chiamante, che decide
+    /// se riprovare; la pipe resta pronta.
     pub fn accept(&self, stop: &StopSignal) -> io::Result<bool> {
+        loop {
+            if stop.is_set() {
+                return Ok(false);
+            }
+            match self.connect_once(stop) {
+                Ok(Connection::Connected) => return Ok(true),
+                Ok(Connection::Stopped) => return Ok(false),
+                Ok(Connection::ClientGone) => self.disconnect(),
+                Err(error) => {
+                    self.disconnect();
+                    return Err(error);
+                }
+            }
+        }
+    }
+
+    /// Un tentativo di `ConnectNamedPipe` sovrapposto, atteso insieme a `stop`.
+    fn connect_once(&self, stop: &StopSignal) -> io::Result<Connection> {
         let handle = self.handle.as_raw_handle();
         let event = Event::new()?;
         // SAFETY: struttura C di interi e puntatori, lo zero è un valore valido.
         let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
         overlapped.hEvent = event.handle.as_raw_handle();
-        // SAFETY: handle della pipe valido; `overlapped` vivo fino alla fine (sotto).
-        if unsafe { ConnectNamedPipe(handle, &raw mut overlapped) } == 0 {
-            let error = io::Error::last_os_error();
-            if error.raw_os_error() == i32::try_from(ERROR_PIPE_CONNECTED).ok() {
-                return Ok(true);
-            }
-            if error.raw_os_error() != i32::try_from(ERROR_IO_PENDING).ok() {
-                return Err(error);
-            }
+        // SAFETY: handle della pipe valido; `overlapped` vivo fino alla fine dell'operazione
+        // (sotto: completamento atteso o `cancel_and_wait`).
+        if unsafe { ConnectNamedPipe(handle, &raw mut overlapped) } != 0 {
+            return Ok(Connection::Connected);
+        }
+        let error = io::Error::last_os_error();
+        if is_os_error(&error, ERROR_PIPE_CONNECTED) {
+            return Ok(Connection::Connected);
+        }
+        if is_os_error(&error, ERROR_NO_DATA) {
+            return Ok(Connection::ClientGone);
+        }
+        if !is_os_error(&error, ERROR_IO_PENDING) {
+            // Nessuna operazione partita.
+            return Err(error);
         }
         let waited: [HANDLE; 2] = [
             event.handle.as_raw_handle(),
@@ -1357,25 +1463,25 @@ impl PipeServer {
         ];
         // SAFETY: due handle di eventi validi; attesa senza limite, ma lo stop la interrompe.
         let which = unsafe { WaitForMultipleObjects(2, waited.as_ptr(), 0, INFINITE) };
-        let mut transferred = 0u32;
         if which == WAIT_OBJECT_0 {
-            // SAFETY: operazione finita; si legge l'esito.
-            let ok = unsafe {
-                GetOverlappedResult(handle, &raw const overlapped, &raw mut transferred, 0)
-            };
-            return if ok == 0 {
-                Err(io::Error::last_os_error())
-            } else {
-                Ok(true)
+            // Operazione finita: si legge l'esito (attesa immediata).
+            return match cancel_and_wait(handle, &overlapped) {
+                Ok(_) => Ok(Connection::Connected),
+                Err(error) if is_os_error(&error, ERROR_NO_DATA) => Ok(Connection::ClientGone),
+                Err(error) => Err(error),
             };
         }
-        // Stop (o errore dell'attesa): si annulla l'attesa e se ne aspetta la fine.
-        // SAFETY: annulla l'operazione di questa OVERLAPPED, poi ne attende la fine.
-        unsafe {
-            CancelIoEx(handle, &raw const overlapped);
-            GetOverlappedResult(handle, &raw const overlapped, &raw mut transferred, 1);
+        // Stop, o attesa fallita: in ogni caso l'operazione si annulla e se ne aspetta la
+        // fine prima di liberare struttura ed evento.
+        let wait_error = (which == WAIT_FAILED).then(io::Error::last_os_error);
+        let _finished = cancel_and_wait(handle, &overlapped);
+        match wait_error {
+            Some(error) => Err(error),
+            None if which == WAIT_OBJECT_0 + 1 => Ok(Connection::Stopped),
+            None => Err(io::Error::other(format!(
+                "attesa della pipe: esito {which}"
+            ))),
         }
-        Ok(false)
     }
 
     /// Legge esattamente `buffer.len()` byte dal client connesso entro `deadline`.
@@ -1692,7 +1798,10 @@ mod tests {
         icacls(&dir, &["/grant", "*S-1-5-32-545:(OI)(CI)M"]);
         let refused = create_private_dir(&dir).expect_err("rifiutata");
         assert!(lynkeus_engine::NotPrivate::is(&refused), "{refused:?}");
-        assert!(dir_writable_by_others(&dir).expect("DACL letta"));
+        assert!(writable_by_others(
+            &read_security(&dir).expect("DACL letta"),
+            &program_trusted_sids(&current_user().expect("utente")).expect("SID")
+        ));
         let users = Sid::from_sddl("S-1-5-32-545").expect("SID");
         let info = read_security(&dir).expect("sicurezza");
         assert!(
@@ -1740,6 +1849,60 @@ mod tests {
         assert!(!is_private(&inherited, &trusted));
         let writable = info(&user, Some(vec![ace(&everyone, true, false, 0x2)]));
         assert!(writable_by_others(&writable, &trusted));
+    }
+
+    /// Le regole per l'eseguibile e la sua cartella: proprietario fidato, segnaposti del
+    /// proprietario non fidati.
+    #[test]
+    fn program_rules_on_owners_and_placeholders() {
+        let user = current_user().expect("utente");
+        let trusted = program_trusted_sids(&user).expect("SID fidati");
+        let full = |sid: &Sid| Ace {
+            allows: true,
+            inherit_only: false,
+            flags: 0x3,
+            mask: 0x1F_01FF,
+            sid: sid.clone(),
+        };
+        let info = |owner: &Sid, aces: Vec<Ace>| SecurityInfo {
+            owner: owner.clone(),
+            dacl: Some(aces),
+            protected: true,
+        };
+        let installer = Sid::from_sddl(TRUSTED_INSTALLER_SDDL).expect("TrustedInstaller");
+        let admins = Sid::well_known(KnownSid::Administrators).expect("Administrators");
+        for owner in [&user, &system(), &admins, &installer] {
+            let ok = info(owner, vec![full(&user), full(&installer)]);
+            assert!(!writable_by_others(&ok, &trusted), "{owner:?}");
+        }
+        // Proprietario estraneo con una DACL innocua: può cambiarla, quindi modificabile.
+        let users = Sid::from_sddl("S-1-5-32-545").expect("Users");
+        assert!(writable_by_others(
+            &info(&users, vec![full(&user)]),
+            &trusted
+        ));
+        // OWNER RIGHTS e CREATOR OWNER applicati all'oggetto stesso non sono fidati.
+        for placeholder in [KnownSid::OwnerRights, KnownSid::CreatorOwner] {
+            let sid = Sid::well_known(placeholder).expect("segnaposto");
+            assert!(
+                writable_by_others(&info(&user, vec![full(&sid)]), &trusted),
+                "{placeholder:?}"
+            );
+        }
+    }
+
+    /// Un eseguibile in una cartella privata non è modificabile da altri; con una voce di
+    /// scrittura per `Users` sul solo file sì.
+    #[test]
+    fn an_exe_writable_by_users_is_detected() {
+        let base = scratch();
+        let dir = base.path().join("programma");
+        create_private_dir(&dir).expect("cartella");
+        let exe = dir.join("lynkeus-searcher.exe");
+        drop(create_new_private_file(&exe).expect("file"));
+        assert!(!exe_writable_by_others(&exe).expect("controllo"));
+        icacls(&exe, &["/grant", "*S-1-5-32-545:(M)"]);
+        assert!(exe_writable_by_others(&exe).expect("controllo"));
     }
 
     #[test]
@@ -1841,5 +2004,66 @@ mod tests {
         // Lo stop interrompe l'attesa di un client.
         stop.set();
         assert!(!server.accept(&stop).expect("attesa interrotta"));
+    }
+
+    /// Una lettura con la scadenza già passata finisce con `TimedOut` e annulla davvero
+    /// l'operazione: i byte scritti dopo dal client arrivano alla lettura successiva (con
+    /// l'operazione rimasta in corso li avrebbe presi il buffer già liberato).
+    #[test]
+    fn an_expired_deadline_cancels_the_pending_read() {
+        let name = pipe_name();
+        let server = PipeServer::create(&name).expect("pipe");
+        let stop = StopSignal::new().expect("stop");
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let client = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let client = PipeClient::connect(&name, deadline).expect("connesso");
+            go_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("via libera");
+            client.write_all(b"dopo", deadline).expect("scritto");
+            let mut reply = [0u8; 1];
+            client.read_exact(&mut reply, deadline).expect("risposta");
+        });
+        assert!(server.accept(&stop).expect("accettato"));
+        let mut early = [0u8; 4];
+        for _ in 0..3 {
+            let expired = server
+                .read_exact(&mut early, Instant::now())
+                .map_err(|e| e.kind());
+            assert_eq!(expired, Err(io::ErrorKind::TimedOut));
+        }
+        go_tx.send(()).expect("client vivo");
+        let mut message = [0u8; 4];
+        let deadline = Instant::now() + Duration::from_secs(5);
+        server.read_exact(&mut message, deadline).expect("letto");
+        assert_eq!(&message, b"dopo");
+        server.write_all(&[1], deadline).expect("risposta");
+        client.join().expect("client");
+        server.disconnect();
+    }
+
+    /// Un client che si connette e chiude prima che il server lo accetti
+    /// (`ERROR_NO_DATA`) non ferma il server: il client successivo viene accettato.
+    #[test]
+    fn a_client_that_closes_at_once_does_not_stop_the_server() {
+        let name = pipe_name();
+        let server = PipeServer::create(&name).expect("pipe");
+        let stop = StopSignal::new().expect("stop");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        drop(PipeClient::connect(&name, deadline).expect("primo client"));
+        let second = std::thread::spawn(move || {
+            let client = PipeClient::connect(&name, deadline).expect("secondo client");
+            client.write_all(b"x", deadline).expect("scritto");
+            let mut reply = [0u8; 1];
+            client.read_exact(&mut reply, deadline).expect("risposta");
+        });
+        assert!(server.accept(&stop).expect("il server continua"));
+        let mut byte = [0u8; 1];
+        server.read_exact(&mut byte, deadline).expect("letto");
+        assert_eq!(&byte, b"x");
+        server.write_all(&[1], deadline).expect("risposta");
+        second.join().expect("client");
+        server.disconnect();
     }
 }

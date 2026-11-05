@@ -14,7 +14,7 @@ use lynkeus_engine::{
 };
 
 use crate::app::SearchStatus;
-use crate::form::{ExtensionInputError, PathInputError, TermRowError};
+use crate::form::{ExtensionInputError, MAX_ROOTS, PathInputError, TermRowError};
 use crate::i18n::I18n;
 
 /// Carattere aggiunto dove una parola o un contesto è stato troncato.
@@ -135,6 +135,9 @@ pub fn extension_error(i18n: &I18n, error: &ExtensionInputError) -> String {
 pub fn path_error(i18n: &I18n, error: PathInputError) -> String {
     match error {
         PathInputError::NotFound => i18n.tr("error-path-not-found"),
+        PathInputError::TooManyRoots => {
+            i18n.tr_args("error-path-too-many-roots", &[("max", count(MAX_ROOTS))])
+        }
     }
 }
 

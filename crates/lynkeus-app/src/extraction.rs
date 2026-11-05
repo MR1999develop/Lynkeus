@@ -8,15 +8,21 @@
 //! **Voci d'archivio da aprire.** Il processo estrattore manda i byte originali della voce
 //! (con gli stessi limiti degli archivi nella ricerca, e al più il massimo per voce); l'app
 //! li scrive in un file nuovo, con nome generato dal programma ed estensione della voce resa
-//! innocua ([`opened_extension`]), nella cartella privata dei file aperti, che si svuota
-//! all'avvio e all'uscita. Un file scritto a metà si cancella.
+//! innocua ([`opened_extension`]), nella sottocartella di sessione di questa istanza
+//! ([`SessionDir`]) dentro la cartella privata dei file aperti. Un file scritto a metà si
+//! cancella.
+//!
+//! **Più istanze.** Ogni istanza ha la sua sottocartella `s-<32 cifre esadecimali>` con un
+//! file `session.lock` bloccato finché l'istanza vive. All'avvio si cancellano solo le
+//! sottocartelle il cui lock non è tenuto da nessuno ([`clean_stale_sessions`]); all'uscita
+//! l'istanza cancella la propria. I file di un'altra istanza in corso non si toccano mai.
 
 use std::fs;
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use lynkeus_core::{ByteSize, Location, TextUnit};
@@ -162,29 +168,57 @@ fn shorten(unit: TextUnit) -> TextUnit {
     }
 }
 
-/// Apre le voci d'archivio estraendone i byte in un file della cartella privata.
-#[derive(Debug, Clone)]
+/// Apre le voci d'archivio estraendone i byte in un file della sottocartella di sessione.
+#[derive(Debug)]
 pub struct OpenedEntries {
     source: Arc<DocumentSource>,
-    dir: PathBuf,
+    base: PathBuf,
     limits: Limits,
     private_fs: Arc<dyn PrivateFs>,
+    // Creata al primo uso; tolta da `close_session`.
+    session: Mutex<Option<SessionDir>>,
 }
 
 impl OpenedEntries {
-    /// Voci estratte in `dir` (creata privata al primo uso con `private_fs`), con i limiti
-    /// delle ricerche.
+    /// Voci estratte in una sottocartella di sessione di `base` (create private al primo
+    /// uso con `private_fs`), con i limiti delle ricerche.
     pub fn new(
         source: Arc<DocumentSource>,
-        dir: PathBuf,
+        base: PathBuf,
         limits: Limits,
         private_fs: Arc<dyn PrivateFs>,
     ) -> OpenedEntries {
         OpenedEntries {
             source,
-            dir,
+            base,
             limits,
             private_fs,
+            session: Mutex::new(None),
+        }
+    }
+
+    /// La sottocartella di sessione, creata se manca.
+    fn session_path(&self) -> io::Result<PathBuf> {
+        let mut session = self.session.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(dir) = session.as_ref() {
+            return Ok(dir.path().to_owned());
+        }
+        let created = SessionDir::create(&self.base, self.private_fs.as_ref())?;
+        let path = created.path().to_owned();
+        *session = Some(created);
+        Ok(path)
+    }
+
+    /// Cancella la sottocartella di questa sessione (all'uscita); i file ancora aperti da
+    /// altri programmi restano e li toglie un avvio successivo.
+    pub fn close_session(&self) {
+        let session = self
+            .session
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(session) = session {
+            session.remove();
         }
     }
 }
@@ -194,8 +228,9 @@ impl ArchiveEntryExtractor for OpenedEntries {
         let Some(name) = doc.inner.last() else {
             return Ok(None);
         };
+        let dir = self.session_path().map_err(ExtractError::from_io)?;
         let (path, file) =
-            create_new_entry_file(self.private_fs.as_ref(), &self.dir, &opened_extension(name))
+            create_new_entry_file(self.private_fs.as_ref(), &dir, &opened_extension(name))
                 .map_err(ExtractError::from_io)?;
         let mut sink = FileSink {
             file: BufWriter::new(file),
@@ -298,16 +333,121 @@ fn unique_number() -> u64 {
     u64::from_le_bytes(first)
 }
 
-/// Cancella i file della cartella dei file aperti (all'avvio e all'uscita). Un file ancora
-/// aperto da un altro programma resta e si riprova la volta dopo.
-pub fn clean_opened_entries(dir: &Path) {
-    let Ok(listing) = fs::read_dir(dir) else {
+/// Prefisso delle sottocartelle di sessione.
+const SESSION_PREFIX: &str = "s-";
+/// Il file di lock dentro ogni sottocartella di sessione.
+const SESSION_LOCK: &str = "session.lock";
+/// Tentativi di creare una sottocartella di sessione.
+const SESSION_ATTEMPTS: usize = 4;
+
+/// La sottocartella dei file aperti di questa istanza: nome casuale e `session.lock`
+/// bloccato finché il valore vive (il sistema rilascia il lock anche se il processo muore).
+#[derive(Debug)]
+pub struct SessionDir {
+    path: PathBuf,
+    // Tenuto aperto e bloccato: dice alle altre istanze che la sessione è viva.
+    lock: File,
+}
+
+impl SessionDir {
+    /// Crea in `base` (creata privata se manca) una sottocartella nuova con il lock già
+    /// preso. Se una pulizia concorrente la toglie prima che il lock sia preso, si riprova
+    /// con un altro nome, al più [`SESSION_ATTEMPTS`] volte.
+    pub fn create(base: &Path, private_fs: &dyn PrivateFs) -> io::Result<SessionDir> {
+        for _ in 0..SESSION_ATTEMPTS {
+            let path = base.join(format!("{SESSION_PREFIX}{}", random_hex()?));
+            private_fs.create_dir(&path)?;
+            let lock_path = path.join(SESSION_LOCK);
+            let lock = match private_fs.create_new_file(&lock_path) {
+                Ok(lock) => lock,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::NotFound | io::ErrorKind::AlreadyExists
+                    ) =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            match lock.try_lock() {
+                Ok(()) => {}
+                Err(fs::TryLockError::WouldBlock) => continue,
+                Err(fs::TryLockError::Error(error)) => return Err(error),
+            }
+            // Il lock preso su un file già tolto da una pulizia non protegge nulla.
+            if fs::symlink_metadata(&lock_path).is_ok() {
+                return Ok(SessionDir { path, lock });
+            }
+        }
+        Err(io::Error::other("sottocartella di sessione non creata"))
+    }
+
+    /// La sottocartella.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Rilascia il lock e cancella la sottocartella con il suo contenuto. Se qualcosa resta
+    /// (file aperto da un altro programma), lo toglie la pulizia di un avvio successivo.
+    pub fn remove(self) {
+        let SessionDir { path, lock } = self;
+        drop(lock);
+        let _removed = fs::remove_dir_all(&path);
+    }
+}
+
+/// 32 cifre esadecimali dal generatore del sistema.
+fn random_hex() -> io::Result<String> {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).map_err(|error| io::Error::other(error.to_string()))?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Pulizia all'avvio della cartella dei file aperti `base`: cancella le sottocartelle di
+/// sessione il cui lock non è tenuto da nessuno (istanze finite, anche in modo anomalo) e
+/// i file sciolti lasciati dalle versioni che non usavano le sottocartelle. Le sottocartelle
+/// con il lock preso (altre istanze in corso, o questa) restano. Un file ancora aperto da
+/// un altro programma resta e si riprova la volta dopo. I collegamenti non si seguono.
+pub fn clean_stale_sessions(base: &Path) {
+    let Ok(listing) = fs::read_dir(base) else {
         return;
     };
     for item in listing.flatten() {
-        if item.file_type().is_ok_and(|t| t.is_file()) {
-            let _removed = fs::remove_file(item.path());
+        let Ok(kind) = item.file_type() else {
+            continue;
+        };
+        let path = item.path();
+        if kind.is_file() {
+            let _removed = fs::remove_file(&path);
+        } else if kind.is_dir() && is_session_name(&item.file_name()) && session_is_stale(&path) {
+            let _removed = fs::remove_dir_all(&path);
         }
+    }
+}
+
+/// Vero per un nome `s-<32 cifre esadecimali>`.
+fn is_session_name(name: &std::ffi::OsStr) -> bool {
+    name.to_str()
+        .and_then(|n| n.strip_prefix(SESSION_PREFIX))
+        .is_some_and(|hex| hex.len() == 32 && hex.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
+/// Vero se nessuna istanza tiene il lock della sottocartella `dir`. Senza file di lock:
+/// abbandonata solo se non è vuota (un'istanza crea il lock prima di qualunque file; una
+/// cartella vuota può essere appena nata, e si lascia).
+fn session_is_stale(dir: &Path) -> bool {
+    match fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(dir.join(SESSION_LOCK))
+    {
+        // Il lock si rilascia chiudendo il file, prima di cancellare.
+        Ok(lock) => lock.try_lock().is_ok(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => fs::read_dir(dir)
+            .map(|mut items| items.next().is_some())
+            .unwrap_or(false),
+        Err(_) => false,
     }
 }
 
@@ -334,10 +474,49 @@ mod tests {
             assert_eq!(path.parent(), Some(target.as_path()));
         }
         assert_eq!(fs::read(&first).ok(), Some(b"%PDF".to_vec()));
-        clean_opened_entries(&target);
-        assert!(!first.exists() && !second.exists());
+    }
+
+    /// La pulizia all'avvio toglie le sessioni finite e i file sciolti, mai i file della
+    /// sessione di un'altra istanza in corso; all'uscita la sessione toglie sé stessa.
+    #[test]
+    fn startup_cleaning_spares_the_files_of_a_running_instance() {
+        let base_dir = tempfile::tempdir().expect("cartella");
+        let base = base_dir.path().join("temp");
+        let fs_impl = platform::private_fs();
+        let running = SessionDir::create(&base, fs_impl.as_ref()).expect("sessione in corso");
+        let (open_file, _) =
+            create_new_entry_file(fs_impl.as_ref(), running.path(), "pdf").expect("file");
+        let ended = SessionDir::create(&base, fs_impl.as_ref()).expect("sessione finita");
+        let ended_path = ended.path().to_owned();
+        let (left_over, _) =
+            create_new_entry_file(fs_impl.as_ref(), &ended_path, "txt").expect("file");
+        // Il lock rilasciato senza cancellare: come un'istanza terminata in modo anomalo.
+        drop(ended);
+        let loose = base.join("voce-0123456789abcdef.txt");
+        drop(fs_impl.create_new_file(&loose).expect("file sciolto"));
+        let foreign = base.join("non-una-sessione");
+        fs::create_dir(&foreign).expect("cartella estranea");
+
+        clean_stale_sessions(&base);
+        assert!(open_file.exists(), "file di un'istanza in corso cancellato");
+        assert!(!left_over.exists() && !ended_path.exists());
+        assert!(!loose.exists());
+        assert!(foreign.exists(), "cartella non di sessione toccata");
+
+        let running_path = running.path().to_owned();
+        running.remove();
+        assert!(!running_path.exists());
         // Una cartella che non c'è non è un errore.
-        clean_opened_entries(&dir.path().join("mai"));
+        clean_stale_sessions(&base_dir.path().join("mai"));
+    }
+
+    #[test]
+    fn session_names_are_recognized() {
+        let valid = format!("s-{}", "a1".repeat(16));
+        assert!(is_session_name(std::ffi::OsStr::new(&valid)));
+        for name in ["s-", "s-xyz", "sessione", &format!("s-{}", "a".repeat(33))] {
+            assert!(!is_session_name(std::ffi::OsStr::new(name)), "{name}");
+        }
     }
 
     #[test]

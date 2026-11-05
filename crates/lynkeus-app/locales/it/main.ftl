@@ -133,6 +133,8 @@ dialog-export = Esporta i risultati
 
 error-no-folder = Aggiungi almeno una cartella o un file in cui cercare.
 error-path-not-found = Nessun file o cartella con questo percorso.
+# $max: numero massimo di luoghi nell'elenco.
+error-path-too-many-roots = L'elenco ha già { $max } luoghi, il massimo. Togline qualcuno per aggiungerne altri.
 error-term-empty = Scrivi il testo da cercare, o togli questa riga.
 error-term-only-wildcards = Il termine contiene solo * e ?: aggiungi almeno una lettera o una cifra.
 # $max (numero): caratteri ammessi.
@@ -357,10 +359,12 @@ reason-no-context-menu = La voce del clic destro non è disponibile su questo si
 reason-context-menu-updating = La voce del clic destro si sta aggiornando.
 notice-context-menu-exe-path = Errore: la voce del clic destro non è stata aggiunta perché il percorso del programma contiene caratteri non ammessi. Sposta Lynkeus Searcher in una cartella con un nome semplice e riprova.
 notice-context-menu-too-long = Errore: la voce del clic destro non è stata aggiunta perché il percorso del programma è troppo lungo. Sposta Lynkeus Searcher in una cartella più vicina alla radice del disco e riprova.
-notice-context-menu-exe-dir = Errore: la voce del clic destro non è stata aggiunta perché altri utenti possono modificare la cartella del programma. Sposta Lynkeus Searcher nella tua cartella utente o in Programmi e riprova.
+notice-context-menu-exe-dir = Errore: la voce del clic destro non è stata aggiunta perché altri utenti possono modificare il programma o la sua cartella. Sposta Lynkeus Searcher nella tua cartella utente o in Programmi e riprova.
 notice-context-menu-foreign = Errore: nel clic destro c'è già una voce con lo stesso nome di un altro programma; non è stata modificata.
 notice-context-menu-io = Errore: la voce del clic destro non è stata aggiornata. Riprova; se succede ancora, controlla i permessi del tuo profilo.
 # $count (numero): cartelle rifiutate.
+# $max: numero massimo di luoghi nell'elenco.
+notice-roots-limit = Attenzione: l'elenco dei luoghi ha già { $max } voci, il massimo, e gli altri luoghi non sono stati aggiunti. Togline qualcuno e riprova.
 notice-private-dirs = { $count ->
         [one] Attenzione: una cartella dell'app è accessibile ad altri utenti e per sicurezza non viene usata in questa sessione (cache, log o impostazioni potrebbero non essere salvati). Controlla i permessi delle cartelle di Lynkeus Searcher nel tuo profilo.
        *[other] Attenzione: { $count } cartelle dell'app sono accessibili ad altri utenti e per sicurezza non vengono usate in questa sessione (cache, log o impostazioni potrebbero non essere salvati). Controlla i permessi delle cartelle di Lynkeus Searcher nel tuo profilo.

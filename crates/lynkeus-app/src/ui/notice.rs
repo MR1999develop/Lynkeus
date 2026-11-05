@@ -76,6 +76,10 @@ pub(super) fn bar(app: &Application, ui: &mut Ui, actions: &mut Vec<Action>) {
             i18n.tr_args("notice-private-dirs", &[("count", (*count).into())]),
             true,
         ),
+        Notice::RootsLimit { max } => (
+            i18n.tr_args("notice-roots-limit", &[("max", (*max).into())]),
+            false,
+        ),
     };
     ui.add_space(SPACE[0]);
     // Da destra: Chiudi, l'eventuale azione, poi il testo nello spazio che resta.

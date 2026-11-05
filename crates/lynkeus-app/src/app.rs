@@ -29,7 +29,8 @@ use crate::instance::InstanceServer;
 use crate::export::{self, ExportScope, ExportSettings};
 use crate::extraction::{self, ExtractionSetup, OpenedEntries, PoolDocumentUnits};
 use crate::form::{
-    FormErrors, PathInputError, PathInputStatus, RootKind, SearchForm, TermRowError, absolute_root,
+    FormErrors, MAX_ROOTS, PathInputError, PathInputStatus, RootAdded, RootKind, SearchForm,
+    TermRowError, absolute_root,
 };
 use crate::i18n::{I18n, Language};
 use crate::launch::{
@@ -236,6 +237,11 @@ pub enum Notice {
         /// Quante cartelle.
         count: usize,
     },
+    /// Luoghi non aggiunti: l'elenco ha già il massimo di voci.
+    RootsLimit {
+        /// Il massimo ([`MAX_ROOTS`]).
+        max: usize,
+    },
 }
 
 /// Una modifica della voce del clic destro in corso.
@@ -335,7 +341,7 @@ pub struct Application {
     /// documenti).
     document_source: Option<Arc<DocumentSource>>,
     /// Cartella privata dei file estratti dagli archivi per aprirli.
-    opened_entries_dir: Option<PathBuf>,
+    opened_entries: Option<Arc<OpenedEntries>>,
     cache_job: Option<Receiver<io::Result<ByteSize>>>,
     /// Cartelle e file privati (descrittore esplicito su Windows).
     private_fs: Arc<dyn PrivateFs>,
@@ -387,7 +393,7 @@ impl Application {
             export_job: None,
             notice: None,
             document_source: None,
-            opened_entries_dir: None,
+            opened_entries: None,
             cache_job: None,
             private_fs: platform::private_fs(),
             instance: None,
@@ -457,14 +463,20 @@ impl Application {
     }
 
     /// Aggiunge una radice "da verificare" e ne avvia la verifica sul disco; falso se
-    /// c'era già.
+    /// c'era già o se l'elenco è pieno ([`MAX_ROOTS`], con un avviso).
     pub fn add_root(&mut self, root: PathBuf) -> bool {
         let root = absolute_root(root);
-        let added = self.form.add_root(root.clone(), RootKind::Pending);
-        if added {
-            self.root_checks.request(root);
+        match self.form.add_root(root.clone(), RootKind::Pending) {
+            RootAdded::Added => {
+                self.root_checks.request(root);
+                true
+            }
+            RootAdded::Duplicate => false,
+            RootAdded::LimitReached => {
+                self.notice = Some(Notice::RootsLimit { max: MAX_ROOTS });
+                false
+            }
         }
-        added
     }
 
     /// Verifica il percorso scritto nel campo apposito, senza bloccare: intanto
@@ -481,6 +493,8 @@ impl Application {
         if self.form.roots.iter().any(|r| r.path == path) {
             self.form.path_input.clear();
             self.form.path_status = PathInputStatus::Idle;
+        } else if self.form.roots_full() {
+            self.form.path_status = PathInputStatus::Error(PathInputError::TooManyRoots);
         } else if self.root_checks.request(path.clone()) {
             self.form.path_status = PathInputStatus::Checking(path);
         } else {
@@ -512,8 +526,9 @@ impl Application {
             }
             if kind == RootKind::Missing {
                 self.form.path_status = PathInputStatus::Error(PathInputError::NotFound);
+            } else if self.form.add_root(path, kind) == RootAdded::LimitReached {
+                self.form.path_status = PathInputStatus::Error(PathInputError::TooManyRoots);
             } else {
-                self.form.add_root(path, kind);
                 self.form.path_input.clear();
                 self.form.path_status = PathInputStatus::Idle;
             }
@@ -1021,8 +1036,9 @@ impl Application {
 
     /// Collega i documenti: pool dei processi estrattori (`setup.worker_exe` con
     /// `--extract-worker`), cache e apertura delle voci d'archivio. Le ricerche successive
-    /// leggono anche PDF, Office e archivi; l'anteprima e "Apri" li usano. La cartella dei
-    /// file aperti si svuota subito (avanzi di un'uscita anomala), in un thread.
+    /// leggono anche PDF, Office e archivi; l'anteprima e "Apri" li usano. Nella cartella
+    /// dei file aperti si cancellano subito, in un thread, le sessioni finite (avanzi di
+    /// un'uscita anomala); quelle di altre istanze in corso restano.
     ///
     /// Errore se il lanciatore non si può creare (eseguibile senza percorso assoluto): l'app
     /// resta senza documenti.
@@ -1030,19 +1046,21 @@ impl Application {
         let source = extraction::document_source(setup, self.settings.cache, &self.private_fs)?;
         self.documents = Arc::new(PoolDocumentUnits::new(Arc::clone(&source), self.limits));
         if let Some(dir) = &setup.opened_entries_dir {
-            self.archive_extractor = Arc::new(OpenedEntries::new(
+            let opened = Arc::new(OpenedEntries::new(
                 Arc::clone(&source),
                 dir.clone(),
                 self.limits,
                 Arc::clone(&self.private_fs),
             ));
+            self.archive_extractor = Arc::clone(&opened) as Arc<dyn ArchiveEntryExtractor>;
+            self.opened_entries = Some(opened);
             let dir = dir.clone();
-            // Se il thread non parte, si ripulirà all'uscita.
+            // Solo le sessioni finite: quelle di altre istanze in corso restano. Se il thread
+            // non parte, ci penserà un avvio successivo.
             let _cleaning = thread::Builder::new()
                 .name("pulizia".to_owned())
-                .spawn(move || extraction::clean_opened_entries(&dir));
+                .spawn(move || extraction::clean_stale_sessions(&dir));
         }
-        self.opened_entries_dir = setup.opened_entries_dir.clone();
         self.document_source = Some(source);
         Ok(())
     }
@@ -1052,13 +1070,14 @@ impl Application {
         self.document_source.as_ref()
     }
 
-    /// Chiude i processi estrattori liberi e svuota la cartella dei file aperti (all'uscita).
+    /// Chiude i processi estrattori liberi e cancella la sottocartella dei file aperti di
+    /// questa sessione (all'uscita).
     pub fn shutdown_extraction(&mut self) {
         if let Some(source) = &self.document_source {
             source.pool().shutdown();
         }
-        if let Some(dir) = &self.opened_entries_dir {
-            extraction::clean_opened_entries(dir);
+        if let Some(opened) = &self.opened_entries {
+            opened.close_session();
         }
     }
 
@@ -1455,6 +1474,30 @@ mod tests {
         assert_eq!(app.form.roots[1].kind, RootKind::File);
     }
 
+    /// Con l'elenco pieno, i luoghi in arrivo (clic destro, dialoghi) non entrano e un
+    /// avviso lo dice; il percorso scritto mostra l'errore sotto il campo.
+    #[test]
+    fn a_full_list_of_places_refuses_more_with_a_notice() {
+        let mut app = Application::build(Settings::default()).expect("app");
+        for i in 0..MAX_ROOTS {
+            app.form
+                .add_root(PathBuf::from(format!("luogo-{i}")), RootKind::Folder);
+        }
+        assert!(app.notice().is_none());
+        assert!(app.add_external_roots(vec![std::path::absolute("src").expect("assoluto")]));
+        assert_eq!(app.form.roots.len(), MAX_ROOTS);
+        assert!(matches!(
+            app.notice(),
+            Some(Notice::RootsLimit { max: MAX_ROOTS })
+        ));
+        app.form.path_input = "Cargo.toml".to_owned();
+        app.add_typed_path();
+        assert_eq!(
+            app.form.path_status,
+            PathInputStatus::Error(PathInputError::TooManyRoots)
+        );
+    }
+
     #[test]
     fn a_refused_start_keeps_the_previous_search() {
         let mut app = Application::build(Settings::default()).expect("app");
@@ -1620,7 +1663,7 @@ mod tests {
             fn remove(&self, _entry: &MenuEntry) -> io::Result<()> {
                 Ok(())
             }
-            fn exe_dir_writable_by_others(&self, _exe: &Path) -> io::Result<bool> {
+            fn exe_writable_by_others(&self, _exe: &Path) -> io::Result<bool> {
                 Ok(self.writable.load(Ordering::Relaxed))
             }
         }

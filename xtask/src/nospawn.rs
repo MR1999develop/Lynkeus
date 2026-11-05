@@ -6,8 +6,10 @@
 //! I sorgenti di `crates/lynkeus-extract/src` non devono nominare le API che avviano
 //! processi: un decoder compromesso o ingannato non deve trovare nel proprio codice un modo
 //! pronto per eseguire programmi. L'unico avvio è in `lynkeus-engine` (`launcher.rs`) e
-//! nell'app. Le righe di commento (`//`, `///`, `//!`) non contano. Le eccezioni sono in
-//! [`ALLOWED_FILES`], per percorso relativo alla cartella controllata: oggi nessuna.
+//! nell'app. Le righe di commento (`//`, `///`, `//!`) non contano. Un `use` con un gruppo
+//! su una riga (`use nix::unistd::{fork, execv};`) si controlla anche percorso per percorso,
+//! come se fosse scritto per esteso. Le eccezioni sono in [`ALLOWED_FILES`], per percorso
+//! relativo alla cartella controllata: oggi nessuna.
 
 use std::path::{Path, PathBuf};
 
@@ -38,6 +40,9 @@ const FORBIDDEN: &[(&str, Match)] = &[
     ("libc::fork", Match::Anywhere),
     ("libc::vfork", Match::Anywhere),
     ("libc::system", Match::Anywhere),
+    ("unistd::fork", Match::Anywhere),
+    ("unistd::exec", Match::Anywhere),
+    ("std::os::unix::process", Match::Anywhere),
     ("posix_spawn", Match::Anywhere),
     ("CreateProcess", Match::Anywhere),
     ("ShellExecute", Match::Anywhere),
@@ -54,17 +59,20 @@ pub struct Finding {
 }
 
 /// Gli usi vietati in `source`, nell'ordine delle righe; le righe di commento si saltano.
+/// Ogni testo vietato si segnala al più una volta per riga.
 pub fn find_spawn_uses(source: &str) -> Vec<Finding> {
     let mut findings = Vec::new();
     for (index, line) in source.lines().enumerate() {
         if line.trim_start().starts_with("//") {
             continue;
         }
+        let mut forms = vec![line.to_owned()];
+        forms.extend(expand_use_group(line));
         for &(pattern, how) in FORBIDDEN {
-            let found = match how {
-                Match::Anywhere => line.contains(pattern),
-                Match::Word => contains_word(line, pattern),
-            };
+            let found = forms.iter().any(|form| match how {
+                Match::Anywhere => form.contains(pattern),
+                Match::Word => contains_word(form, pattern),
+            });
             if found {
                 findings.push(Finding {
                     line: index + 1,
@@ -74,6 +82,32 @@ pub fn find_spawn_uses(source: &str) -> Vec<Finding> {
         }
     }
     findings
+}
+
+/// I percorsi per esteso di un `use` con un gruppo su una riga:
+/// `use std::{process, fs::File};` dà `std::process` e `std::fs::File`. Gruppi annidati e
+/// `use` su più righe non si espandono (restano controllati come testo).
+fn expand_use_group(line: &str) -> Vec<String> {
+    let trimmed = line.trim_start();
+    let Some(rest) = trimmed
+        .strip_prefix("pub use ")
+        .or_else(|| trimmed.strip_prefix("use "))
+    else {
+        return Vec::new();
+    };
+    let Some((prefix, group)) = rest.split_once('{') else {
+        return Vec::new();
+    };
+    let Some((items, _)) = group.split_once('}') else {
+        return Vec::new();
+    };
+    let prefix = prefix.trim();
+    items
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(|item| format!("{prefix}{item}"))
+        .collect()
 }
 
 /// Vero se `word` compare in `line` senza lettere, cifre o `_` subito prima o dopo.
@@ -178,6 +212,31 @@ mod tests {
         assert_eq!(patterns("unsafe { libc::execv(p, a) }"), ["libc::exec"]);
         assert_eq!(patterns("let pid = libc::fork();"), ["libc::fork"]);
         assert_eq!(patterns("CreateProcessW(...)"), ["CreateProcess"]);
+        assert_eq!(
+            patterns("let child = nix::unistd::fork()?;"),
+            ["unistd::fork"]
+        );
+        assert_eq!(patterns("nix::unistd::execv(&p, &a)?;"), ["unistd::exec"]);
+        assert_eq!(
+            patterns("use std::os::unix::process::CommandExt;"),
+            ["process::", "std::os::unix::process"]
+        );
+    }
+
+    /// I `use` con un gruppo su una riga si controllano come scritti per esteso.
+    #[test]
+    fn grouped_uses_are_expanded() {
+        assert_eq!(
+            patterns("use nix::unistd::{fork, execv};"),
+            ["unistd::fork", "unistd::exec"]
+        );
+        assert_eq!(patterns("use std::{fs, process};"), ["std::process"]);
+        assert_eq!(
+            patterns("    pub use std::os::unix::{fs::PermissionsExt, process};"),
+            ["std::os::unix::process"]
+        );
+        assert!(patterns("use std::{fs, io::Read};").is_empty());
+        assert!(patterns("use nix::unistd::{getpid, Pid};").is_empty());
     }
 
     #[test]

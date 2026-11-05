@@ -220,7 +220,9 @@ fn archive_entries_open_from_a_private_copy() {
         .extract_to_private_temp(&entry)
         .expect("voce leggibile")
         .expect("voce estratta");
-    assert_eq!(path.parent(), Some(opened_dir.as_path()));
+    // Nella sottocartella di sessione di questa istanza, dentro la cartella privata.
+    let session_dir = path.parent().expect("sottocartella di sessione").to_owned();
+    assert_eq!(session_dir.parent(), Some(opened_dir.as_path()));
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
     assert!(
         name.starts_with("voce-") && name.ends_with(".txt"),
@@ -254,7 +256,7 @@ fn archive_entries_open_from_a_private_copy() {
             .expect("voce estratta");
         let name = opened.file_name().and_then(|n| n.to_str()).unwrap_or("");
         assert!(name.ends_with(extension), "{name}");
-        assert_eq!(opened.parent(), Some(opened_dir.as_path()));
+        assert_eq!(opened.parent(), Some(session_dir.as_path()));
         assert_eq!(
             std::fs::read(&opened).ok(),
             Some(zip_entry(&archive, inner))
@@ -262,22 +264,23 @@ fn archive_entries_open_from_a_private_copy() {
     }
 
     // Una voce che non c'è: errore, e nessun file lasciato a metà.
-    let before = std::fs::read_dir(&opened_dir).map_or(0, Iterator::count);
+    let before = std::fs::read_dir(&session_dir).map_or(0, Iterator::count);
     let missing = DocPath {
         path: demo_dir().join("musica/archivio.zip"),
         inner: vec!["manca.pdf".to_owned()],
     };
     assert!(entries.extract_to_private_temp(&missing).is_err());
     assert_eq!(
-        std::fs::read_dir(&opened_dir).map_or(0, Iterator::count),
+        std::fs::read_dir(&session_dir).map_or(0, Iterator::count),
         before
     );
 
     let mut app = app;
     app.shutdown_extraction();
+    entries.close_session();
     assert!(
-        !path.exists(),
-        "cartella dei file aperti svuotata all'uscita"
+        !path.exists() && !session_dir.exists(),
+        "sottocartella di sessione cancellata all'uscita"
     );
 }
 

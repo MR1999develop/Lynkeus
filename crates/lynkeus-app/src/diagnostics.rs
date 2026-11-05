@@ -200,9 +200,32 @@ fn source_file(file: &str) -> String {
     format!("…/{}", tail.join("/"))
 }
 
-/// Il messaggio di un panic senza dati personali: i testi tra virgolette diventano `"…"`,
-/// le parole che sembrano percorsi `<percorso>`; al più [`MAX_MESSAGE_CHARS`] caratteri.
+/// Il messaggio di un panic senza dati personali: i testi tra virgolette diventano `"…"`;
+/// dalla prima parola che sembra un percorso o un nome di file ([`looks_like_path`],
+/// [`looks_like_file_name`]) fino alla fine della riga tutto diventa `<percorso>` (un
+/// percorso può contenere spazi: `C:\Users\Nome Cognome\x`, e dopo il primo spazio non si
+/// sa dove finisce). Le righe si uniscono con uno spazio; al più [`MAX_MESSAGE_CHARS`]
+/// caratteri.
 pub fn redact(message: &str) -> String {
+    let unquoted = mask_quoted(message);
+    let lines: Vec<String> = unquoted
+        .lines()
+        .map(mask_from_first_path)
+        .filter(|line| !line.is_empty())
+        .collect();
+    let joined = lines.join(" ");
+    if joined.chars().count() > MAX_MESSAGE_CHARS {
+        let mut cut: String = joined.chars().take(MAX_MESSAGE_CHARS).collect();
+        cut.push('…');
+        cut
+    } else {
+        joined
+    }
+}
+
+/// `message` con il contenuto dei testi tra `"` o tra `` ` `` sostituito da `…` (anche un
+/// testo aperto e mai chiuso).
+fn mask_quoted(message: &str) -> String {
     let mut unquoted = String::with_capacity(message.len());
     let mut quote: Option<char> = None;
     for c in message.chars() {
@@ -223,24 +246,21 @@ pub fn redact(message: &str) -> String {
     if quote.is_some() {
         unquoted.push('…');
     }
-    let words: Vec<&str> = unquoted
-        .split_whitespace()
-        .map(|word| {
-            if looks_like_path(word) {
-                "<percorso>"
-            } else {
-                word
-            }
-        })
-        .collect();
-    let joined = words.join(" ");
-    if joined.chars().count() > MAX_MESSAGE_CHARS {
-        let mut cut: String = joined.chars().take(MAX_MESSAGE_CHARS).collect();
-        cut.push('…');
-        cut
-    } else {
-        joined
+    unquoted
+}
+
+/// Le parole di `line` fino alla prima che sembra un percorso o un nome di file, poi
+/// `<percorso>` al posto di tutto il resto della riga.
+fn mask_from_first_path(line: &str) -> String {
+    let mut kept: Vec<&str> = Vec::new();
+    for word in line.split_whitespace() {
+        if looks_like_path(word) || looks_like_file_name(word) {
+            kept.push("<percorso>");
+            break;
+        }
+        kept.push(word);
     }
+    kept.join(" ")
 }
 
 /// Vero per una parola con un separatore di percorso, `~` iniziale o una lettera di unità.
@@ -248,6 +268,19 @@ fn looks_like_path(word: &str) -> bool {
     let bytes = word.as_bytes();
     let drive = bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
     word.contains(['/', '\\']) || word.starts_with('~') || drive
+}
+
+/// Vero per una parola come `bilancio.xlsx` o `note.txt:`: un nome, un punto e
+/// un'estensione da 1 a 5 lettere o cifre con almeno una lettera (non `1.5`).
+fn looks_like_file_name(word: &str) -> bool {
+    let trimmed = word.trim_end_matches([':', ',', ';', ')', ']', '}', '.']);
+    let Some((name, extension)) = trimmed.rsplit_once('.') else {
+        return false;
+    };
+    !name.is_empty()
+        && (1..=5).contains(&extension.len())
+        && extension.chars().all(|c| c.is_ascii_alphanumeric())
+        && extension.chars().any(|c| c.is_ascii_alphabetic())
 }
 
 /// Scrive `report` in un file nuovo e privato di `dir` (creata se manca), dopo aver tolto i
@@ -336,17 +369,41 @@ mod tests {
         assert_eq!(redact("indice 5 oltre la fine"), "indice 5 oltre la fine");
         assert_eq!(
             redact(r"file C:\Users\utente\note.txt non trovato"),
-            "file <percorso> non trovato"
+            "file <percorso>"
         );
-        assert_eq!(redact("in /home/utente/x: errore"), "in <percorso> errore");
+        assert_eq!(redact("in /home/utente/x: errore"), "in <percorso>");
         assert_eq!(redact("~/segreti"), "<percorso>");
         assert_eq!(
             redact(r#"Corrupt { reason: "testo privato del documento" }"#),
             r#"Corrupt { reason: "…" }"#
         );
         assert_eq!(redact("aperto \"senza fine"), "aperto \"…");
+        assert_eq!(redact("versione 1.5 attesa"), "versione 1.5 attesa");
         let long = "parola ".repeat(200);
         assert!(redact(&long).chars().count() <= MAX_MESSAGE_CHARS + 1);
+    }
+
+    /// Un percorso con spazi non lascia parti del nome dopo il primo spazio; un nome di file
+    /// senza virgolette né cartelle non resta; la riga successiva si legge di nuovo.
+    #[test]
+    fn paths_with_spaces_and_bare_file_names_are_masked() {
+        let redacted = redact(r"C:\Users\Mario Rossi Bianchi\x");
+        assert_eq!(redacted, "<percorso>");
+        for name in ["Rossi", "Bianchi"] {
+            assert!(!redacted.contains(name), "{redacted}");
+        }
+        assert_eq!(
+            redact("impossibile aprire Rossi.xlsx adesso"),
+            "impossibile aprire <percorso>"
+        );
+        assert_eq!(
+            redact("errore in note.txt: riga 3\nseconda riga senza dati"),
+            "errore in <percorso> seconda riga senza dati"
+        );
+        assert_eq!(
+            redact("cartella /home/mario rossi/documenti mancante"),
+            "cartella <percorso>"
+        );
     }
 
     #[test]

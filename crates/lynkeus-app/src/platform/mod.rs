@@ -609,10 +609,14 @@ mod instance_unix {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Instant;
 
+    use rustix::event::{PollFd, PollFlags, Timespec};
     use rustix::fs::{Mode, OFlags};
 
     use super::ENDPOINT_PREFIX;
     use crate::instance::Channel;
+
+    /// Ogni quanto l'attesa di un client controlla lo stop (meno di un secondo).
+    const STOP_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
 
     /// `$XDG_RUNTIME_DIR` se è una cartella dell'utente senza permessi per altri; altrimenti
     /// l'istanza unica resta spenta (fallire chiusi).
@@ -655,8 +659,10 @@ mod instance_unix {
             let previous = rustix::process::umask(Mode::from_bits_truncate(0o177));
             let bound = UnixListener::bind(&path);
             rustix::process::umask(previous);
+            let listener = bound?;
+            listener.set_nonblocking(true)?;
             Ok(InstanceListener {
-                listener: bound?,
+                listener,
                 path,
                 endpoint,
                 stop: Arc::new(AtomicBool::new(false)),
@@ -677,12 +683,41 @@ mod instance_unix {
         }
 
         /// Aspetta un client dello stesso utente (`SO_PEERCRED`); `None` dopo lo stop.
+        ///
+        /// Il socket in ascolto è non bloccante e l'attesa è un `poll` di al più
+        /// [`STOP_CHECK_INTERVAL`]: lo stop si vede entro quel tempo anche se la connessione
+        /// di sveglia di [`InstanceStopper::stop`] non riesce.
         pub fn accept(&self) -> io::Result<Option<InstanceConnection<'_>>> {
             loop {
-                let (stream, _) = self.listener.accept()?;
                 if self.stop.load(Ordering::Relaxed) {
                     return Ok(None);
                 }
+                let mut fds = [PollFd::new(&self.listener, PollFlags::IN)];
+                let timeout = Timespec::try_from(STOP_CHECK_INTERVAL)
+                    .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+                match rustix::event::poll(&mut fds, Some(&timeout)) {
+                    Ok(_) => {}
+                    Err(rustix::io::Errno::INTR) => continue,
+                    Err(error) => return Err(error.into()),
+                }
+                let stream = match self.listener.accept() {
+                    Ok((stream, _)) => stream,
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                        ) =>
+                    {
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
+                if self.stop.load(Ordering::Relaxed) {
+                    return Ok(None);
+                }
+                // La connessione accettata non eredita il non bloccante su Linux, ma lo si
+                // dice esplicitamente: le letture usano i tempi limite del socket.
+                stream.set_nonblocking(false)?;
                 let peer = rustix::net::sockopt::socket_peercred(&stream)?;
                 if peer.uid != rustix::process::geteuid() {
                     tracing::warn!("istanza unica: connessione di un altro utente rifiutata");
@@ -878,11 +913,8 @@ mod context_menu_windows {
             Ok(())
         }
 
-        fn exe_dir_writable_by_others(&self, exe: &Path) -> io::Result<bool> {
-            let dir = exe
-                .parent()
-                .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
-            super::windows_ffi::dir_writable_by_others(dir)
+        fn exe_writable_by_others(&self, exe: &Path) -> io::Result<bool> {
+            super::windows_ffi::exe_writable_by_others(exe)
         }
     }
 
@@ -960,7 +992,7 @@ mod context_menu_windows {
                 .key(r"Directory\Background\shell\LynkeusSearcher\command")
                 .and_then(|k| k.get_value::<String, _>(""))
                 .expect("comando");
-            assert_eq!(background, format!("\"{exe}\" --add \"%V\""));
+            assert_eq!(background, format!(r#""{exe}" --add "%V\.""#));
             assert!(root.key(r"*\shell\LynkeusSearcher\command").is_ok());
 
             // Eseguibile spostato: la voce si riconosce come nostra e si riscrive.
@@ -1028,7 +1060,7 @@ mod context_menu_windows {
             fn remove(&self, entry: &MenuEntry) -> io::Result<()> {
                 self.0.remove(entry)
             }
-            fn exe_dir_writable_by_others(&self, _exe: &Path) -> io::Result<bool> {
+            fn exe_writable_by_others(&self, _exe: &Path) -> io::Result<bool> {
                 Ok(false)
             }
         }
@@ -1173,13 +1205,19 @@ mod context_menu_nautilus {
             Ok(())
         }
 
-        fn exe_dir_writable_by_others(&self, exe: &Path) -> io::Result<bool> {
+        fn exe_writable_by_others(&self, exe: &Path) -> io::Result<bool> {
             let dir = exe
                 .parent()
                 .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
-            let meta = fs::metadata(dir)?;
-            let owner_ok = meta.uid() == 0 || meta.uid() == rustix::process::geteuid().as_raw();
-            Ok(!owner_ok || meta.mode() & 0o022 != 0)
+            let me = rustix::process::geteuid().as_raw();
+            for object in [exe, dir] {
+                let meta = fs::metadata(object)?;
+                let owner_ok = meta.uid() == 0 || meta.uid() == me;
+                if !owner_ok || meta.mode() & 0o022 != 0 {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
         }
     }
 
@@ -1239,6 +1277,23 @@ mod context_menu_nautilus {
             let mut expected: Vec<&[u8]> = vec![b"--add", b"--"];
             expected.extend(names.iter().map(|n| n.as_bytes()));
             assert_eq!(received, expected);
+
+            // Senza argomenti (sfondo di una cartella): la cartella corrente.
+            let here = fs::canonicalize(&bin).expect("cartella corrente");
+            let status = Command::new("/bin/sh")
+                .arg(&script)
+                .current_dir(&here)
+                .status()
+                .expect("script eseguito");
+            assert!(status.success());
+            let received = fs::read(&out).expect("argomenti");
+            let received: Vec<&[u8]> = received
+                .split(|b| *b == 0)
+                .filter(|a| !a.is_empty())
+                .collect();
+            let here_bytes = here.as_os_str().as_encoded_bytes();
+            assert_eq!(received, [b"--add".as_slice(), b"--", here_bytes]);
+
             menu.remove(&entry).expect("tolto");
             assert_eq!(menu.state(&entry).expect("stato"), MenuState::Missing);
         }

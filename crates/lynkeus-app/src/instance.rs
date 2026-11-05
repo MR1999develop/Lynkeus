@@ -63,11 +63,21 @@ const TOKEN_BYTES: usize = 16;
 const ACK: u8 = 1;
 /// Byte massimi del file dell'istanza.
 const MAX_INSTANCE_FILE_BYTES: u64 = 1024;
+/// Errori di fila nell'attesa di un client oltre i quali il server si ferma (registrandolo):
+/// un canale rotto non diventa un ciclo senza fine.
+const MAX_ACCEPT_ERRORS: u32 = 20;
+/// Pausa dopo un errore nell'attesa di un client.
+const ACCEPT_RETRY_PAUSE: Duration = Duration::from_millis(100);
+/// Tempo massimo per cui l'uscita aspetta il thread del server dopo lo stop: oltre una
+/// connessione in corso ([`READ_TIMEOUT`] per il messaggio e per la chiusura) e l'intervallo
+/// con cui l'attesa controlla lo stop.
+const SERVER_JOIN_TIMEOUT: Duration = Duration::from_secs(6);
 /// Messaggi ricevuti in attesa del thread dell'interfaccia; oltre si scartano.
 const PENDING_MESSAGES: usize = 64;
 
-/// Il segreto che autentica i client: 128 bit dal generatore del sistema. Non si stampa.
-#[derive(Clone, PartialEq, Eq)]
+/// Il segreto che autentica i client: 128 bit dal generatore del sistema. Non si stampa e
+/// non ha `PartialEq`: si confronta solo in tempo costante (`Token::matches`).
+#[derive(Clone)]
 pub struct Token([u8; TOKEN_BYTES]);
 
 impl std::fmt::Debug for Token {
@@ -355,7 +365,7 @@ pub fn serve_connection(
 }
 
 /// Il file privato con nome del canale e token.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct InstanceFile {
     /// Nome del canale (pipe o socket).
     pub endpoint: String,
@@ -510,6 +520,8 @@ pub struct InstanceServer {
     instance_file: PathBuf,
     stopper: InstanceStopper,
     thread: Option<JoinHandle<()>>,
+    // Si chiude (senza messaggi) quando il thread finisce: attesa con scadenza nel `Drop`.
+    finished: Receiver<()>,
     received: Receiver<Vec<PathBuf>>,
     waker: Arc<Mutex<Option<Notify>>>,
     // Tenuto aperto (e bloccato) finché l'istanza vive.
@@ -542,13 +554,19 @@ impl InstanceServer {
         let (sender, received) = mpsc::sync_channel(PENDING_MESSAGES);
         let waker: Arc<Mutex<Option<Notify>>> = Arc::new(Mutex::new(None));
         let thread_waker = Arc::clone(&waker);
+        let (finished_tx, finished) = mpsc::channel::<()>();
         let thread = thread::Builder::new()
             .name("istanza".to_owned())
-            .spawn(move || listen(&listener, &token, &sender, &thread_waker))?;
+            .spawn(move || {
+                // Chiuso all'uscita dal thread, anche con un panic.
+                let _finished = finished_tx;
+                listen(&listener, &token, &sender, &thread_waker);
+            })?;
         Ok(InstanceServer {
             instance_file,
             stopper,
             thread: Some(thread),
+            finished,
             received,
             waker,
             _lock: lock,
@@ -567,10 +585,21 @@ impl InstanceServer {
 }
 
 impl Drop for InstanceServer {
+    /// Ferma il server e lo aspetta al più [`SERVER_JOIN_TIMEOUT`]: oltre, il thread si
+    /// lascia andare (registrandolo) e l'uscita continua.
     fn drop(&mut self) {
         self.stopper.stop();
         if let Some(thread) = self.thread.take() {
-            let _joined = thread.join();
+            match self.finished.recv_timeout(SERVER_JOIN_TIMEOUT) {
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    tracing::warn!("istanza unica: il server non si è fermato in tempo");
+                }
+                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    if thread.join().is_err() {
+                        tracing::error!("istanza unica: il server è terminato con un panic");
+                    }
+                }
+            }
         }
         let _removed = std::fs::remove_file(&self.instance_file);
     }
@@ -592,20 +621,32 @@ fn bind_new_endpoint() -> io::Result<InstanceListener> {
     Err(last_error.unwrap_or_else(|| io::Error::other("canale non creato")))
 }
 
-/// Il ciclo del server: una connessione alla volta finché non arriva lo stop.
+/// Il ciclo del server: una connessione alla volta finché non arriva lo stop. Un errore
+/// nell'attesa di un client si registra e si riprova dopo [`ACCEPT_RETRY_PAUSE`]; solo dopo
+/// [`MAX_ACCEPT_ERRORS`] errori di fila il server si ferma, registrandolo.
 fn listen(
     listener: &InstanceListener,
     token: &Token,
     sender: &SyncSender<Vec<PathBuf>>,
     waker: &Mutex<Option<Notify>>,
 ) {
+    let mut errors_in_a_row = 0u32;
     loop {
         let mut connection = match listener.accept() {
-            Ok(Some(connection)) => connection,
+            Ok(Some(connection)) => {
+                errors_in_a_row = 0;
+                connection
+            }
             Ok(None) => return,
             Err(error) => {
-                tracing::warn!(%error, "istanza unica: canale chiuso");
-                return;
+                errors_in_a_row += 1;
+                if errors_in_a_row >= MAX_ACCEPT_ERRORS {
+                    tracing::error!(%error, errors_in_a_row, "istanza unica: canale fermato");
+                    return;
+                }
+                tracing::warn!(%error, errors_in_a_row, "istanza unica: attesa non riuscita");
+                thread::sleep(ACCEPT_RETRY_PAUSE);
+                continue;
             }
         };
         match serve_connection(&mut connection, token) {
@@ -672,6 +713,19 @@ mod tests {
 
     fn token(byte: u8) -> Token {
         Token([byte; TOKEN_BYTES])
+    }
+
+    /// Stesso canale e stesso token (confronto in tempo costante).
+    fn same_instance(a: &InstanceFile, b: &InstanceFile) -> bool {
+        a.endpoint == b.endpoint && a.token.matches(&b.token.0)
+    }
+
+    #[test]
+    fn tokens_match_only_themselves() {
+        assert!(token(7).matches(&token(7).0));
+        assert!(!token(7).matches(&token(8).0));
+        assert!(!token(7).matches(&token(7).0[..TOKEN_BYTES - 1]));
+        assert!(!token(7).matches(&[]));
     }
 
     fn existing_dir() -> (tempfile::TempDir, PathBuf) {
@@ -880,11 +934,12 @@ mod tests {
             endpoint: r"\\.\pipe\lynkeus-searcher-0123".to_owned(),
             token: token(9),
         };
-        assert_eq!(InstanceFile::decode(&file.encode()), Some(file.clone()));
+        let decoded = InstanceFile::decode(&file.encode()).expect("decodificato");
+        assert!(same_instance(&decoded, &file));
         let mut truncated = file.encode();
         truncated.pop();
-        assert_eq!(InstanceFile::decode(&truncated), None);
-        assert_eq!(InstanceFile::decode(b"LKSI"), None);
+        assert!(InstanceFile::decode(&truncated).is_none());
+        assert!(InstanceFile::decode(b"LKSI").is_none());
         assert_eq!(format!("{:?}", file.token), "Token(…)");
     }
 
@@ -905,7 +960,10 @@ mod tests {
             token: token(2),
         };
         newer.write(&path, fs.as_ref()).expect("riscritto");
-        assert_eq!(InstanceFile::read(&path).expect("letto"), newer);
+        assert!(same_instance(
+            &InstanceFile::read(&path).expect("letto"),
+            &newer
+        ));
     }
 
     /// Il canale vero (pipe o socket): la seconda "istanza" consegna i percorsi alla prima,

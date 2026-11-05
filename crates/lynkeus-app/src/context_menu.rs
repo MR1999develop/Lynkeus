@@ -10,12 +10,16 @@
 //! [`ContextMenuStore`]; il registro e la cartella degli script sono in `platform`.
 //!
 //! - Windows: `HKCU\Software\Classes\{*,Directory,Directory\Background}\shell\LynkeusSearcher`
-//!   con testo, icona = eseguibile e comando `"<exe>" --add "%1"` (`"%V"` per lo sfondo di
-//!   una cartella). Nessun diritto di amministratore.
-//! - Linux: script `~/.local/share/nautilus/scripts/<testo>` con `exec '<exe>' --add -- "$@"`.
+//!   con testo, icona = eseguibile e comando `"<exe>" --add "%1"` (`"%V\."` per lo sfondo
+//!   di una cartella: `"%V"` sulla radice di un'unità darebbe `"C:\"`, dove `\"` è una
+//!   virgoletta letterale per `CommandLineToArgvW`; con `\.` l'argomento resta `C:\\.`, che
+//!   il guardiano dei percorsi normalizza in `C:\`). Nessun diritto di amministratore.
+//! - Linux: script `~/.local/share/nautilus/scripts/<testo>` con `exec '<exe>' --add -- "$@"`;
+//!   senza argomenti (clic sullo sfondo di una cartella) passa la cartella corrente `$PWD`.
 //! - L'eseguibile viene da `current_exe()`; un percorso con `"`, NUL o a capo, o una riga
-//!   oltre 260 caratteri, non si registra. Una cartella dell'eseguibile scrivibile da altri
-//!   nemmeno: la voce eseguirebbe codice altrui con l'identità dell'utente.
+//!   oltre 260 caratteri, non si registra. Un eseguibile o una cartella dell'eseguibile
+//!   modificabili da altri nemmeno: la voce eseguirebbe codice altrui con l'identità
+//!   dell'utente.
 //! - Una voce con lo stesso nome che non è nostra non si sovrascrive né si cancella.
 
 use std::io;
@@ -61,7 +65,15 @@ impl MenuTarget {
     fn placeholder(self) -> &'static str {
         match self {
             MenuTarget::Files | MenuTarget::Folders => "%1",
-            MenuTarget::FolderBackground => "%V",
+            MenuTarget::FolderBackground => r"%V\.",
+        }
+    }
+
+    /// I segnaposti delle versioni precedenti: voci da riconoscere come nostre e riscrivere.
+    fn legacy_placeholders(self) -> &'static [&'static str] {
+        match self {
+            MenuTarget::Files | MenuTarget::Folders => &[],
+            MenuTarget::FolderBackground => &["%V"],
         }
     }
 }
@@ -78,8 +90,8 @@ pub enum MenuError {
     /// Riga di comando oltre [`MAX_COMMAND_CHARS`].
     #[error("riga di comando troppo lunga")]
     CommandTooLong,
-    /// La cartella dell'eseguibile è scrivibile da altri utenti.
-    #[error("cartella dell'eseguibile scrivibile da altri utenti")]
+    /// L'eseguibile o la sua cartella sono modificabili da altri utenti.
+    #[error("eseguibile o cartella dell'eseguibile modificabili da altri utenti")]
     ExeDirWritable,
     /// Una voce con lo stesso nome appartiene a un altro programma.
     #[error("voce di un altro programma")]
@@ -152,7 +164,7 @@ impl MenuEntry {
         &self.other_labels
     }
 
-    /// Il valore di `command` per `target`: `"<exe>" --add "%1"` (`"%V"` per lo sfondo).
+    /// Il valore di `command` per `target`: `"<exe>" --add "%1"` (`"%V\."` per lo sfondo).
     pub fn windows_command(&self, target: MenuTarget) -> String {
         windows_command(&self.exe_text, target)
     }
@@ -169,12 +181,15 @@ pub fn windows_command(exe: &str, target: MenuTarget) -> String {
 }
 
 /// Vero se `command` è una riga di questo programma per `target`, anche con l'eseguibile
-/// in un'altra cartella (spostato): `"<…\nome dell'exe>" --add "%1"`.
+/// in un'altra cartella (spostato) o con il segnaposto di una versione precedente:
+/// `"<…\nome dell'exe>" --add "%1"`.
 pub fn is_own_command(command: &str, target: MenuTarget, exe_file_name: &str) -> bool {
-    let suffix = format!("\" --add \"{}\"", target.placeholder());
-    let Some(quoted) = command
-        .strip_prefix('"')
-        .and_then(|rest| rest.strip_suffix(suffix.as_str()))
+    let Some(rest) = command.strip_prefix('"') else {
+        return false;
+    };
+    let Some(quoted) = std::iter::once(target.placeholder())
+        .chain(target.legacy_placeholders().iter().copied())
+        .find_map(|placeholder| rest.strip_suffix(format!("\" --add \"{placeholder}\"").as_str()))
     else {
         return false;
     };
@@ -191,13 +206,17 @@ pub fn sh_quote(text: &str) -> String {
 }
 
 /// Lo script di Nautilus per `exe` (percorso già controllato: niente NUL né a capo). Nessun
-/// `eval`, nessuna espansione senza virgolette; `--` chiude le opzioni.
+/// `eval`, nessuna espansione senza virgolette; `--` chiude le opzioni. Senza argomenti
+/// (clic sullo sfondo di una cartella aperta) passa la cartella corrente, `$PWD`.
 pub fn nautilus_script(exe: &str) -> String {
     format!(
-        "#!/bin/sh\n{SCRIPT_MARKER}\nexec {} --add -- \"$@\"\n",
+        "#!/bin/sh\n{SCRIPT_MARKER}\n{NO_ARGUMENTS_MEANS_PWD}\nexec {} --add -- \"$@\"\n",
         sh_quote(exe)
     )
 }
+
+/// Riga dello script: senza argomenti, la cartella corrente.
+const NO_ARGUMENTS_MEANS_PWD: &str = r#"if [ "$#" -eq 0 ]; then set -- "$PWD"; fi"#;
 
 /// Come sta la voce rispetto a quella attesa.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -296,11 +315,12 @@ pub trait ContextMenuStore: Send + Sync {
     fn install(&self, entry: &MenuEntry) -> io::Result<()>;
     /// Toglie le voci nostre (solo quelle).
     fn remove(&self, entry: &MenuEntry) -> io::Result<()>;
-    /// Vero se la cartella dell'eseguibile è scrivibile da altri utenti.
-    fn exe_dir_writable_by_others(&self, exe: &Path) -> io::Result<bool>;
+    /// Vero se l'eseguibile `exe` o la sua cartella sono modificabili da altri utenti
+    /// (proprietario estraneo o scrittura concessa ad altri).
+    fn exe_writable_by_others(&self, exe: &Path) -> io::Result<bool>;
 }
 
-/// Accende la voce: controlla la cartella dell'eseguibile, non tocca una voce altrui,
+/// Accende la voce: controlla l'eseguibile e la sua cartella, non tocca una voce altrui,
 /// scrive se manca o è diversa.
 pub fn enable(store: &dyn ContextMenuStore, entry: &MenuEntry) -> Result<(), MenuError> {
     refresh(store, entry).map(|_| ())
@@ -309,7 +329,7 @@ pub fn enable(store: &dyn ContextMenuStore, entry: &MenuEntry) -> Result<(), Men
 /// Come [`enable`] (all'avvio, con l'opzione accesa); vero se ha riscritto la voce
 /// (mancante, eseguibile spostato, testo cambiato).
 pub fn refresh(store: &dyn ContextMenuStore, entry: &MenuEntry) -> Result<bool, MenuError> {
-    if store.exe_dir_writable_by_others(entry.exe())? {
+    if store.exe_writable_by_others(entry.exe())? {
         return Err(MenuError::ExeDirWritable);
     }
     match store.state(entry)? {
@@ -363,7 +383,7 @@ mod tests {
         );
         assert_eq!(
             entry.windows_command(MenuTarget::FolderBackground),
-            format!("\"{exe}\" --add \"%V\"")
+            format!(r#""{exe}" --add "%V\.""#)
         );
         assert_eq!(MenuTarget::Files.key_path(), r"*\shell\LynkeusSearcher");
         assert_eq!(
@@ -389,8 +409,12 @@ mod tests {
             refused(&format!("{base}\0b.exe")),
             Some(MenuError::ExeUnsafeChars)
         );
-        // Al limite: la riga più lunga (con `"%V"` o `"%1"`) di 260 caratteri passa, 261 no.
-        let overhead = windows_command("", MenuTarget::Files).chars().count();
+        // Al limite: la riga più lunga (quella con `"%V\."`) di 260 caratteri passa, 261 no.
+        let overhead = MenuTarget::ALL
+            .iter()
+            .map(|target| windows_command("", *target).chars().count())
+            .max()
+            .unwrap_or(0);
         let fit = MAX_COMMAND_CHARS - overhead;
         let path_of = |len: usize| format!("{base}{}", "x".repeat(len - base.len()));
         assert!(MenuEntry::new(Path::new(&path_of(fit)), "x", &[]).is_ok());
@@ -419,6 +443,117 @@ mod tests {
         ] {
             assert!(!is_own_command(foreign, target, name), "{foreign}");
         }
+    }
+
+    /// La voce dello sfondo delle versioni precedenti (`"%V"`) è nostra, da riscrivere; su
+    /// un'altra voce `"%V"` resta estraneo.
+    #[test]
+    fn legacy_background_entries_are_ours_and_outdated() {
+        let entry = entry();
+        let exe = exe().display().to_string();
+        let legacy = format!("\"{exe}\" --add \"%V\"");
+        assert!(is_own_command(
+            &legacy,
+            MenuTarget::FolderBackground,
+            "lynkeus-searcher.exe"
+        ));
+        assert!(!is_own_command(
+            &legacy,
+            MenuTarget::Folders,
+            "lynkeus-searcher.exe"
+        ));
+        let mut found = found(entry.label(), |t| entry.windows_command(t));
+        found[2] = Some(FoundItem {
+            label: Some(entry.label().to_owned()),
+            command: Some(legacy),
+        });
+        assert_eq!(classify_windows(&found, &entry), MenuState::Outdated);
+    }
+
+    /// Argomento che segna il figlio avviato dal test della riga di comando.
+    #[cfg(windows)]
+    const CHILD_MARKER: &str = "lynkeus-figlio-riga-di-comando-41b9";
+
+    /// Prefisso della riga con gli argomenti stampata dal figlio.
+    #[cfg(windows)]
+    const ARGS_LINE: &str = "ARGOMENTI:";
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "figlio del test della riga di comando"]
+    fn child_prints_its_arguments() {
+        let args: Vec<String> = std::env::args().collect();
+        if let Some(at) = args.iter().position(|a| a == CHILD_MARKER) {
+            let rest = args.get(at + 1..).unwrap_or_default();
+            println!("{ARGS_LINE}{}", rest.join("\u{1f}"));
+        }
+    }
+
+    /// Il comando registrato per lo sfondo, con `%V` sostituito come fa Explorer, diviso dal
+    /// vero `CommandLineToArgvW` di un processo figlio: la radice di un'unità e una cartella
+    /// con spazi arrivano intere, e il guardiano dei percorsi le normalizza.
+    #[cfg(windows)]
+    #[test]
+    fn the_background_command_survives_the_real_command_line_split() {
+        use std::os::windows::process::CommandExt;
+
+        let entry = entry();
+        let command = entry.windows_command(MenuTarget::FolderBackground);
+        let quoted_exe = format!("\"{}\" ", exe().display());
+        let arguments = command
+            .strip_prefix(&quoted_exe)
+            .expect("comando dell'eseguibile");
+        let folder = tempfile::tempdir().expect("cartella");
+        let with_spaces = std::path::absolute(folder.path().join("Dati utente")).expect("assoluto");
+        std::fs::create_dir(&with_spaces).expect("cartella con spazi");
+        let drive_root = PathBuf::from(r"C:\");
+        let test_exe = std::env::current_exe().expect("eseguibile del test");
+        for clicked in [drive_root, with_spaces] {
+            let substituted = arguments.replace("%V", &clicked.display().to_string());
+            let output = std::process::Command::new(&test_exe)
+                .args([
+                    "context_menu::tests::child_prints_its_arguments",
+                    "--exact",
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                    "--",
+                    CHILD_MARKER,
+                ])
+                .raw_arg(&substituted)
+                .output()
+                .expect("figlio avviato");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let line = stdout
+                .lines()
+                .find_map(|l| l.split_once(ARGS_LINE).map(|(_, rest)| rest))
+                .unwrap_or_else(|| panic!("nessun argomento stampato: {stdout}"));
+            let received: Vec<std::ffi::OsString> =
+                line.split('\u{1f}').map(std::ffi::OsString::from).collect();
+            let paths = crate::cli::parse_added_paths(received).expect("argomenti validi");
+            assert_eq!(paths.len(), 1, "{line}");
+            assert_eq!(
+                crate::instance::accept_path(&paths[0]),
+                Ok(clicked.clone()),
+                "{line}"
+            );
+        }
+    }
+
+    /// Senza argomenti (sfondo di una cartella) lo script passa `$PWD`.
+    #[test]
+    fn the_script_passes_the_current_folder_without_arguments() {
+        let script = nautilus_script("/opt/lynkeus-searcher");
+        let lines: Vec<&str> = script.lines().collect();
+        assert_eq!(
+            lines,
+            [
+                "#!/bin/sh",
+                SCRIPT_MARKER,
+                r#"if [ "$#" -eq 0 ]; then set -- "$PWD"; fi"#,
+                r#"exec '/opt/lynkeus-searcher' --add -- "$@""#,
+            ]
+        );
     }
 
     /// Le voci trovate: testo e comando per ogni posto.
@@ -465,7 +600,7 @@ mod tests {
         assert_eq!(
             script,
             format!(
-                "#!/bin/sh\n{SCRIPT_MARKER}\nexec '/opt/l'\\''k/lynkeus-searcher' --add -- \"$@\"\n"
+                "#!/bin/sh\n{SCRIPT_MARKER}\n{NO_ARGUMENTS_MEANS_PWD}\nexec '/opt/l'\\''k/lynkeus-searcher' --add -- \"$@\"\n"
             )
         );
     }
@@ -540,7 +675,7 @@ mod tests {
             Ok(())
         }
 
-        fn exe_dir_writable_by_others(&self, _exe: &Path) -> io::Result<bool> {
+        fn exe_writable_by_others(&self, _exe: &Path) -> io::Result<bool> {
             Ok(self.writable)
         }
     }

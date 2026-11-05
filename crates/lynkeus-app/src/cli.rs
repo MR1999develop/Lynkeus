@@ -7,7 +7,8 @@
 //!   inizia con `-` (un file chiamato `-r` o `--add` resta un file): così lo passa Explorer
 //!   (`"<exe>" --add "%1"`).
 //! - `--add -- <percorsi…>`: tutto ciò che segue è un percorso (script di Nautilus,
-//!   `--add -- "$@"`).
+//!   `--add -- "$@"`; senza elementi selezionati lo script passa la cartella corrente,
+//!   quindi `--add --` senza percorsi resta un uso scorretto).
 //!
 //! I percorsi qui sono solo raccolti; li valida il guardiano unico
 //! [`crate::instance::accept_path`] dopo averli resi assoluti.

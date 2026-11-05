@@ -106,7 +106,7 @@ rlimit = "0.11.0"
 # Solo Linux, API safe sopra le chiamate di sistema (già nell'albero tramite zbus e
 # async-io): `geteuid`, `fstat` su descrittore aperto con `O_NOFOLLOW` (cartelle private),
 # `umask` e `SO_PEERCRED` (socket dell'istanza unica).
-rustix = { version = "1.1.6", default-features = false, features = ["std", "fs", "process", "net"] }
+rustix = { version = "1.1.6", default-features = false, features = ["std", "event", "fs", "process", "net"] }
 # Dialoghi nativi per scegliere cartelle e file; su Linux tramite il portale XDG (nessuna libreria GTK).
 rfd = { version = "0.17.2", default-features = false, features = ["xdg-portal", "wayland"] }
 # Archivi 7z: solo lettura (niente `compress`), niente AES (le voci cifrate danno un avviso),
