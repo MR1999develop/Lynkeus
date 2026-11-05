@@ -4,9 +4,9 @@ Target di `cargo-fuzz` (libFuzzer) per i parser propri, il decodificatore del pr
 
 | Target | Cosa prova | Oracolo oltre al crash |
 |---|---|---|
-| `doc_piece_table` | piece table e FIB dei .doc | nessuno |
-| `ppt_records` | scansione dei record dei .ppt | nessuno; il tempo (`-timeout`) per le catene di modifiche |
-| `rtf` | tokenizer RTF | nessuno |
+| `doc_piece_table` | piece table e FIB dei .doc | due letture uguali; paragrafi con testo e senza caratteri di controllo; al più un carattere per CP del testo principale |
+| `ppt_records` | scansione dei record dei .ppt | due letture uguali; numeri delle diapositive crescenti da 1; testi senza caratteri di controllo; il tempo (`-timeout`) per le catene di modifiche |
+| `rtf` | tokenizer RTF | due letture uguali; paragrafi con testo e senza caratteri di controllo; al più un carattere per byte dell'input |
 | `protocol_frame` | lettura dei frame del protocollo (richieste e risposte) | andata e ritorno: ogni messaggio letto, riscritto, si rilegge uguale |
 | `find_words` | ricerca su termini e testo qualsiasi | gli invarianti di `crates/lynkeus-core/tests/proprieta.rs`, compreso "a blocchi di righe = intero" |
 | `xml_reader` | lettore XML (pacchetti e capitoli XHTML) | chiusure corrispondenti alle aperture, due letture uguali |

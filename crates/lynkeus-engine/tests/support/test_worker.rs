@@ -20,7 +20,10 @@
 //!   vuoto;
 //! - `lucchetto-occupato.*`: come `lucchetto`, ma dopo l'inizio del documento gira a vuoto
 //!   sulla CPU per sempre, senza leggere stdin;
-//! - `unita-grande.*`: un documento con un'unità da 2 MiB (oltre il massimo del protocollo);
+//! - `unita-grande.*`: un documento con un'unità di 1 MiB e 64 KiB (oltre il massimo di
+//!   un'unità, dentro un frame valido);
+//! - `frame-enorme.*`: l'intestazione di un frame che dichiara 16 MiB (oltre il massimo del
+//!   protocollo), poi non risponde più;
 //! - `troppo-profondo.*`: un avviso con più voci annidate della profondità massima;
 //! - `inonda.*`: un documento con unità valide senza fine;
 //! - `chiacchierone.*`: un documento vuoto, poi un secondo `Done` non richiesto;
@@ -37,10 +40,10 @@
 //! [`BUSY_ORPHAN_PARENT_FLAG`] il figlio, dopo il lock, resta occupato (`lucchetto-occupato`).
 //!
 //! Come il processo estrattore vero, all'avvio sorveglia il padre con
-//! `lynkeus_extract::worker::watch_parent` (Linux; su Windows lo chiude il Job Object o il
-//! pool). Il processo vero controlla il segnale a ogni evento; qui lo controllano le attese
-//! dei comportamenti scorretti: chi dorme o gira a vuoto esce appena il padre non c'è più,
-//! così nessun processo di prova resta orfano.
+//! `lynkeus_extract::worker::watch_parent`, con il pid ricevuto dal lanciatore, ed esce
+//! quando il padre non c'è più (Linux; su Windows lo chiude il Job Object o il pool): anche
+//! chi dorme o gira a vuoto senza controllare nulla, come un decodificatore occupato. Così
+//! nessun processo di prova resta orfano.
 //!
 //! Non fa parte del pacchetto distribuito.
 
@@ -51,7 +54,6 @@ use std::num::NonZeroUsize;
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use lynkeus_core::{Location, TextUnit};
@@ -78,8 +80,12 @@ const DEAF_FLAG: &str = "--deaf";
 /// Voci del file `molti.*`.
 const MANY_DOCUMENTS: usize = 400;
 
-/// Byte dell'unità di `unita-grande.*`: oltre il massimo di un'unità (1 MiB).
-const OVERSIZED_UNIT_BYTES: usize = 2 * 1024 * 1024;
+/// Byte dell'unità di `unita-grande.*`: oltre il massimo di un'unità (1 MiB), dentro il
+/// massimo di un frame.
+const OVERSIZED_UNIT_BYTES: usize = 1024 * 1024 + 64 * 1024;
+
+/// Lunghezza dichiarata dal frame di `frame-enorme.*`: il vecchio massimo del protocollo.
+const HUGE_FRAME_BYTES: u32 = 16 * 1024 * 1024;
 
 /// Byte di ogni unità di `inonda.*`.
 const FLOOD_UNIT_BYTES: usize = 64 * 1024;
@@ -88,9 +94,6 @@ const FLOOD_UNIT_BYTES: usize = 64 * 1024;
 /// dorme o gira a vuoto: su Windows `watch_parent` non fa nulla (lì i processi li chiude il
 /// pool), e un processo di prova rimasto senza padre esce comunque.
 const FOREVER: Duration = Duration::from_secs(3600);
-
-/// Ogni quanto un processo che dorme guarda se il padre c'è ancora.
-const ORPHAN_POLL: Duration = Duration::from_millis(50);
 
 /// Codice d'uscita di un processo rimasto senza padre, o che non riesce a sorvegliarlo.
 const ORPHAN_EXIT: i32 = 4;
@@ -110,50 +113,47 @@ fn main() -> ExitCode {
     if first != Some(OsString::from("--extract-worker")) {
         return ExitCode::from(2);
     }
-    let parent_gone = Arc::new(AtomicBool::new(false));
-    if watch_parent(Arc::clone(&parent_gone)).is_err() {
+    let deaf = args.peek() == Some(&OsString::from(DEAF_FLAG));
+    if deaf {
+        args.next();
+    }
+    let Ok(config) = WorkerConfig::from_args(args) else {
+        return ExitCode::from(2);
+    };
+    if watch_parent(config.parent_pid, || std::process::exit(ORPHAN_EXIT)).is_err() {
         std::process::exit(ORPHAN_EXIT);
     }
-    if args.peek() == Some(&OsString::from(DEAF_FLAG)) {
-        idle_until_orphaned(&parent_gone);
-    }
-    if WorkerConfig::from_args(args).is_err() {
-        return ExitCode::from(2);
+    if deaf {
+        idle();
     }
     let stdin = io::stdin().lock();
     let stdout = io::stdout().lock();
-    match serve(stdin, stdout, &parent_gone) {
+    match serve(stdin, stdout) {
         Ok(()) => ExitCode::SUCCESS,
         Err(_) => ExitCode::FAILURE,
     }
 }
 
-/// Dorme finché il padre c'è (per il test, per sempre; al più [`FOREVER`]), poi esce: un
-/// processo che non risponde più, ma non resta orfano.
-fn idle_until_orphaned(parent_gone: &AtomicBool) -> ! {
-    let deadline = Instant::now() + FOREVER;
-    while !parent_gone.load(Ordering::Relaxed) && Instant::now() < deadline {
-        std::thread::sleep(ORPHAN_POLL);
-    }
+/// Dorme (per il test, per sempre; al più [`FOREVER`]), poi esce: un processo che non
+/// risponde più. Se il padre muore lo termina la sorveglianza.
+fn idle() -> ! {
+    std::thread::sleep(FOREVER);
     std::process::exit(ORPHAN_EXIT);
 }
 
-/// Gira a vuoto sulla CPU senza leggere stdin finché il padre c'è (al più [`FOREVER`]),
-/// poi esce: come il processo vero, che a ogni evento guarda il segnale di `watch_parent`.
-fn spin_until_orphaned(parent_gone: &AtomicBool) -> ! {
+/// Gira a vuoto sulla CPU senza leggere stdin e senza controllare nulla (al più
+/// [`FOREVER`]), come un decodificatore occupato: se il padre muore lo termina la
+/// sorveglianza.
+fn spin() -> ! {
     let deadline = Instant::now() + FOREVER;
     let mut counter = 0_u64;
-    while !parent_gone.load(Ordering::Relaxed) && Instant::now() < deadline {
+    while Instant::now() < deadline {
         counter = std::hint::black_box(counter.wrapping_add(1));
     }
     std::process::exit(ORPHAN_EXIT);
 }
 
-fn serve(
-    input: impl io::Read,
-    output: impl Write,
-    parent_gone: &AtomicBool,
-) -> Result<(), ProtocolError> {
+fn serve(input: impl io::Read, output: impl Write) -> Result<(), ProtocolError> {
     let mut reader = FrameReader::new(BufReader::new(input));
     let mut writer = FrameWriter::new(BufWriter::new(output));
     // I file bloccati da `lucchetto.*`: restano aperti fino all'uscita del processo.
@@ -176,7 +176,7 @@ fn serve(
             "lento" => {
                 writer.write(&event(id, start()))?;
                 writer.flush()?;
-                idle_until_orphaned(parent_gone);
+                idle();
             }
             "muore" => {
                 writer.write(&event(id, start()))?;
@@ -189,7 +189,7 @@ fn serve(
                 out.write_all(b"ciao, sono un messaggio di log\n")
                     .and_then(|()| out.flush())
                     .map_err(ProtocolError::Io)?;
-                idle_until_orphaned(parent_gone);
+                idle();
             }
             "fuori-sequenza" => {
                 writer.write(&event(id, unit(1, "carta")))?;
@@ -216,9 +216,19 @@ fn serve(
                 writer.write(&event(id, start()))?;
                 if stem == "lucchetto-occupato" {
                     writer.flush()?;
-                    spin_until_orphaned(parent_gone);
+                    spin();
                 }
                 finish(&mut writer, id)?;
+            }
+            "frame-enorme" => {
+                writer.flush()?;
+                let mut out = writer.into_inner();
+                let mut frame = HUGE_FRAME_BYTES.to_le_bytes().to_vec();
+                frame.extend_from_slice(&[0; 64 * 1024]);
+                out.write_all(&frame)
+                    .and_then(|()| out.flush())
+                    .map_err(ProtocolError::Io)?;
+                idle();
             }
             "unita-grande" => {
                 writer.write(&event(id, start()))?;
@@ -267,7 +277,7 @@ fn serve(
                     writer.write(&event(id, unit(line, &format!("riga {line} carta"))))?;
                 }
                 writer.flush()?;
-                idle_until_orphaned(parent_gone);
+                idle();
             }
             "molti" => {
                 for n in 0..MANY_DOCUMENTS {

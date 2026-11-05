@@ -178,10 +178,11 @@ fn an_orphaned_worker_exits_when_its_parent_dies() {
     kill_parent_and_wait_for_the_child(parent, &lock);
 }
 
-/// Come sopra, ma il figlio è occupato (un ciclo sulla CPU) e non legge stdin: non vede la
-/// fine del flusso, quindi lo ferma solo la sorveglianza del padre
-/// (`lynkeus_extract::worker::watch_parent`, la stessa del processo estrattore vero), che il
-/// ciclo controlla come il processo vero la controlla a ogni evento.
+/// Come sopra, ma il figlio è occupato (un ciclo sulla CPU che non controlla nulla, come un
+/// decodificatore fermo su un file) e non legge stdin: non vede la fine del flusso, quindi
+/// lo ferma solo la sorveglianza del padre (`lynkeus_extract::worker::watch_parent`, la
+/// stessa del processo estrattore vero, con il pid del padre ricevuto dal lanciatore), che
+/// termina il processo come fa l'app.
 #[cfg(target_os = "linux")]
 #[test]
 fn busy_orphan_exits_with_its_parent() {

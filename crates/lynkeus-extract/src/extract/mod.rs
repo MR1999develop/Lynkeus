@@ -39,6 +39,7 @@ pub(crate) mod ppt;
 pub(crate) mod rtf;
 pub(crate) mod sevenz;
 pub(crate) mod sheet;
+pub(crate) mod sheet_memory;
 pub(crate) mod tarball;
 pub(crate) mod word97;
 pub(crate) mod xml;
@@ -634,6 +635,29 @@ fn panic_error() -> ExtractError {
     }
 }
 
+/// Oracolo dei target di fuzzing che danno paragrafi: ognuno ha testo oltre agli spazi,
+/// nessun carattere di controllo salvo tabulazione e a capo, e in tutto al più `max_chars`
+/// caratteri (un parser non inventa testo: ogni carattere viene da almeno un'unità
+/// dell'input). La prima violazione trovata, se c'è.
+#[cfg(any(test, feature = "fuzzing"))]
+pub(crate) fn paragraph_violation(paragraphs: &[String], max_chars: usize) -> Option<&'static str> {
+    if paragraphs.iter().any(|p| p.trim().is_empty()) {
+        return Some("paragrafo vuoto");
+    }
+    let control = |c: char| c.is_control() && c != '\t' && c != '\n';
+    if paragraphs.iter().any(|p| p.chars().any(control)) {
+        return Some("carattere di controllo in un paragrafo");
+    }
+    let chars = paragraphs
+        .iter()
+        .map(|p| p.chars().count())
+        .fold(0_usize, usize::saturating_add);
+    if chars > max_chars {
+        return Some("più caratteri di quanti l'input ne possa dare");
+    }
+    None
+}
+
 /// Punto d'iniezione dei test: un panic forzato quando si legge la voce con un certo nome,
 /// per provare che un panic dentro un archivio non sposta le etichette delle voci seguenti.
 #[cfg(test)]
@@ -660,6 +684,21 @@ pub(crate) mod test_hook {
 mod tests {
     use super::*;
     use crate::event::SequenceCheck;
+
+    /// L'oracolo dei paragrafi riconosce ogni violazione (e un oracolo che non scatta mai
+    /// non prova nulla).
+    #[test]
+    fn paragraph_oracle_partitions() {
+        let owned = |items: &[&str]| items.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        assert_eq!(paragraph_violation(&owned(&["città", "a\tb\nc"]), 11), None);
+        assert_eq!(paragraph_violation(&owned(&[]), 0), None);
+        assert!(paragraph_violation(&owned(&["testo", " \t"]), 100).is_some());
+        assert!(paragraph_violation(&owned(&["a\rb"]), 100).is_some());
+        assert!(paragraph_violation(&owned(&["a\u{0}b"]), 100).is_some());
+        // On e off point del numero di caratteri (non di byte: "città" ne ha 5).
+        assert_eq!(paragraph_violation(&owned(&["città"]), 5), None);
+        assert!(paragraph_violation(&owned(&["città"]), 4).is_some());
+    }
 
     fn run(name: &str, bytes: &[u8]) -> Vec<ExtractEvent> {
         let mut events = Vec::new();

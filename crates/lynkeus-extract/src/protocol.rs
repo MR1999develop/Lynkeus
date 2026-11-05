@@ -53,11 +53,16 @@ use crate::extract::{EntryOutcome, ExtractOptions};
 ///
 /// 2: richiesta di una voce d'archivio ([`Request::ExtractEntry`]) ed etichette uniche per
 /// le voci con lo stesso nome (cambiano gli `inner` degli eventi già in cache).
-pub const PROTOCOL_VERSION: u16 = 2;
+///
+/// 3: frame al più di [`MAX_FRAME_BYTES`] (1,25 MiB; prima 16 MiB).
+pub const PROTOCOL_VERSION: u16 = 3;
 
-/// Byte massimi di un frame dopo la lunghezza (16 MiB): ben oltre un'unità di testo
-/// ([`MAX_UNIT_TEXT_BYTES`](crate::MAX_UNIT_TEXT_BYTES)) con la sua posizione.
-pub const MAX_FRAME_BYTES: u32 = 16 * 1024 * 1024;
+/// Byte massimi di un frame dopo la lunghezza (1,25 MiB): il messaggio più grande è
+/// un'unità di testo ([`MAX_UNIT_TEXT_BYTES`](crate::MAX_UNIT_TEXT_BYTES), 1 MiB) o un pezzo
+/// di voce ([`ENTRY_CHUNK_BYTES`](crate::ENTRY_CHUNK_BYTES), 1 MiB), più posizione,
+/// etichette o percorso, che stanno nel margine di 256 KiB. Chi legge non tiene di più per
+/// messaggio, anche se l'altra parte non rispetta i suoi limiti.
+pub const MAX_FRAME_BYTES: u32 = 1024 * 1024 + 256 * 1024;
 
 /// Byte di versione in testa al corpo.
 const VERSION_BYTES: usize = 2;
@@ -518,6 +523,48 @@ mod tests {
             read_one::<Response>(&trailing),
             Err(ProtocolError::Malformed)
         ));
+    }
+
+    /// Il frame massimo sta di poco sopra il messaggio più grande che il protocollo ammette:
+    /// chi legge (il thread del pool, con 16 messaggi in coda) non tiene molto più di quanto
+    /// serve, anche se il figlio non rispetta i suoi limiti. I messaggi più grandi ci stanno:
+    /// un'unità di testo massima con un'etichetta massima, un inizio documento alla profondità
+    /// massima con etichette massime, una richiesta di una voce con un percorso lungo.
+    #[test]
+    fn frame_limit_is_close_to_the_largest_message() {
+        let limit = usize::try_from(MAX_FRAME_BYTES).unwrap_or(usize::MAX);
+        assert!(limit <= crate::MAX_UNIT_TEXT_BYTES + 512 * 1024, "{limit}");
+        let label = "è".repeat(crate::extract::archive::MAX_LABEL_BYTES / 2);
+        let depth = usize::try_from(crate::extract::budget::MAX_DEPTH_CEILING).unwrap_or(0) + 1;
+        let unit = Response::Event {
+            id: u64::MAX,
+            event: ExtractEvent::Unit(TextUnit {
+                location: Location::Cell {
+                    sheet: label.clone(),
+                    row: u32::MAX,
+                    col: u32::MAX,
+                },
+                text: "a".repeat(crate::MAX_UNIT_TEXT_BYTES),
+            }),
+        };
+        let start = Response::Event {
+            id: u64::MAX,
+            event: ExtractEvent::DocumentStart {
+                inner: vec![label.clone(); depth],
+                format: Format::Docx,
+            },
+        };
+        let entry = Request::ExtractEntry(EntryRequest {
+            id: u64::MAX,
+            path: PathBuf::from("è".repeat(32_767)),
+            inner: vec![label; depth],
+            max_bytes: u64::MAX,
+            options: ExtractOptions::default(),
+        });
+        let mut out = Vec::new();
+        assert!(encode_frame(&unit, &mut out).is_ok());
+        assert!(encode_frame(&start, &mut out).is_ok());
+        assert!(encode_frame(&entry, &mut out).is_ok());
     }
 
     #[test]

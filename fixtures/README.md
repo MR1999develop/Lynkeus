@@ -49,6 +49,7 @@ da LibreOffice, senza autore. Le date interne dei PDF possono variare tra le gen
 | `spesa.xlsx` | `spesa.fods` -> xlsx | foglio `Spesa`, cella B7; `città` in C2 |
 | `bilancio.ods` | `bilancio.fods` -> ods | foglio `Conti`, cella C4; `città` in C3 |
 | `vecchia-spesa.xls` | `vecchia-spesa.fods` -> xls (Excel 97-2003) | foglio `Spesa`, cella B7; `città` in C2 |
+| `registro-lungo.xls` | `registro-lungo.fods` -> xls (Excel 97-2003): 501 righe per 3 colonne, tutte piene (flusso BIFF ben oltre 4 KB) | foglio `Registro`, cella C501; `città` in C250; 1503 celle |
 | `presentazione.pptx` | `presentazione.fodp` -> pptx | diapositiva 2 ("Stasera aragosta e vino."); `città` diapositiva 3 |
 | `lezione.odp` | `lezione.fodp` -> odp | diapositiva 2; `città` diapositiva 1 |
 | `vecchia-presentazione.ppt` | `vecchia-presentazione.fodp` -> ppt (PowerPoint 97-2003) | diapositiva 3; `città` diapositiva 2 |
@@ -87,3 +88,4 @@ I file seguenti si rigenerano con `python -I fixtures/src/genera_malevoli.py` (s
 | `sparso.zip` | `sparso.xlsx` seguito da `nota.txt` (`aragosta in nota`) | il processo estrattore non termina, `nota.txt` letta |
 | `slide-ripetute.pptx` | presentazione con 10.000 `p:sldId` verso la stessa diapositiva (`Stasera aragosta`) | una sola diapositiva letta (diapositiva 1) |
 | `dizionario-enorme.7z` | 7z di 7-Zip (LZMA2, intestazione non compressa) con `nota.txt` (`aragosta nel dizionario enorme`), dizionario dichiarato riscritto a 2 GiB e CRC ricalcolati | voce letta; il dizionario non si alloca in anticipo |
+| `testo-ripetuto.ods` | foglio `Ripetuto`: una cella di testo di 300 caratteri (`aragosta` ripetuta) con `number-columns-repeated` 16.384 e `number-rows-repeated` 255; meno di 1 KB | avviso "limite superato" (memoria) sul file, nessuna cella letta: il testo clonato per ogni ripetizione supererebbe 1 GB |

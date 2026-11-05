@@ -545,6 +545,10 @@ fn malicious_files_end_with_the_expected_warnings_and_write_nothing_outside() {
         ("immagine-finta.pdf", WarningKind::ContentMismatch),
         ("entita.docx", WarningKind::Corrupt),
         ("troncato.pdf", WarningKind::Corrupt),
+        (
+            "testo-ripetuto.ods",
+            WarningKind::LimitExceeded(LimitKind::Memory),
+        ),
     ];
     for (file, kind) in expected {
         assert_eq!(warning_kinds(&app, file), [kind], "{file}: {all:?}");

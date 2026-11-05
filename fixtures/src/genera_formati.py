@@ -132,6 +132,12 @@ def fodp(slides):
 SPESA = [["Voce", "Importo", "Nota"], ["Pane", 2, "città"], ["Latte", 1], ["Uova", 3],
          ["Mele", 4], ["Riso", 2], ["Totale", "aragosta", "fine"]]
 
+# Registro lungo: 501 righe per 3 colonne, tutte piene (flusso BIFF ben oltre 4 KB, oltre la
+# soglia dei settori piccoli del file composto). `città` in C250, `aragosta` in C501.
+REGISTRO = [["Voce", "Importo", "Nota"]] + [
+    [f"Voce {n}", n, "città" if n == 250 else ("aragosta" if n == 501 else f"nota {n}")]
+    for n in range(2, 502)]
+
 TESTI = {
     # docx: paragrafo 4
     "relazione": fodt(["Relazione della settimana", "Siamo andati in città per il mercato.",
@@ -156,6 +162,7 @@ TESTI = {
     # xlsx/xls/ods: foglio, cella
     "spesa": fods("Spesa", SPESA),
     "vecchia-spesa": fods("Spesa", SPESA),
+    "registro-lungo": fods("Registro", REGISTRO),
     "bilancio": fods("Conti", [["Mese", "Entrate", "Note"], ["Gennaio", 100, "ok"], ["Febbraio", 120, "città"],
                                ["Marzo", 90, "aragosta"]]),
     # pptx: diapositiva 2; ppt: diapositiva 3; odp: diapositiva 2
@@ -210,6 +217,7 @@ def main():
         conv("spesa", "xlsx", "xlsx", clean_ooxml)
         conv("bilancio", "ods", "ods", clean_odf)
         conv("vecchia-spesa", "xls", "xls")
+        conv("registro-lungo", "xls", "xls")
         conv("presentazione", "pptx", "pptx", clean_ooxml)
         conv("lezione", "odp", "odp", clean_odf)
         conv("vecchia-presentazione", "ppt", "ppt")

@@ -5,10 +5,10 @@
 //! installa log e rapporti di crash, legge le impostazioni, decide l'istanza unica per gli
 //! avvii con `--add`, costruisce l'app e apre la finestra.
 //!
-//! Con l'opzione nascosta `--extract-worker` (seguita da `--memory-limit-bytes N`) lo stesso
-//! eseguibile è il processo estrattore: legge le richieste da stdin e risponde su stdout
-//! (`lynkeus_extract::worker::run`), senza finestre, senza log e senza leggere le
-//! impostazioni.
+//! Con l'opzione nascosta `--extract-worker` (seguita da `--memory-limit-bytes N` e
+//! `--parent-pid P`) lo stesso eseguibile è il processo estrattore: legge le richieste da
+//! stdin e risponde su stdout (`lynkeus_extract::worker::run`), senza finestre, senza log e
+//! senza leggere le impostazioni; se il processo principale termina, esce subito.
 //!
 //! Con `--add <percorso>` (clic destro) o con percorsi senza opzione (cartella trascinata
 //! sull'icona, "Invia a") la finestra si apre con quei luoghi; se un'altra istanza avviata
@@ -89,13 +89,18 @@ fn main() -> ExitCode {
     }
 }
 
+/// Codice d'uscita del processo estrattore quando il processo principale non c'è più.
+const EXIT_PARENT_GONE: i32 = 3;
+
 /// Il processo estrattore: nessuna finestra, nessun file scritto; esce quando il processo
-/// principale chiude lo stdin.
+/// principale chiude lo stdin, o subito quando il processo principale termina (anche a metà
+/// di un file: un decodificatore occupato non controlla nulla, e non c'è niente da salvare).
 fn extract_worker(args: impl Iterator<Item = OsString>) -> ExitCode {
     let Ok(config) = WorkerConfig::from_args(args) else {
         return ExitCode::from(2);
     };
-    match worker::run(io::stdin().lock(), io::stdout().lock(), &config) {
+    let exit = || std::process::exit(EXIT_PARENT_GONE);
+    match worker::run(io::stdin().lock(), io::stdout().lock(), &config, exit) {
         Ok(()) => ExitCode::SUCCESS,
         Err(_) => ExitCode::FAILURE,
     }

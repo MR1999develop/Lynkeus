@@ -330,7 +330,9 @@ impl Paragraphs {
 }
 
 /// Punto d'ingresso per il fuzzing: i primi 4 byte (LE) sono la lunghezza del flusso
-/// `WordDocument`, il resto la tabella. Non deve mai andare in panic.
+/// `WordDocument`, il resto la tabella. Non deve mai andare in panic. Oracoli: due letture
+/// danno gli stessi paragrafi; ogni paragrafo ha testo e nessun carattere di controllo
+/// (salvo tabulazione e a capo); in tutto al più `ccp_text` caratteri (un carattere per CP).
 #[cfg(any(test, feature = "fuzzing"))]
 pub(crate) fn fuzz(data: &[u8]) {
     let Some(split) = u32_at(data, 0) else {
@@ -345,7 +347,18 @@ pub(crate) fn fuzz(data: &[u8]) {
     let Ok(pieces) = piece_table(table, &fib) else {
         return;
     };
-    let _ignored = main_text_paragraphs(word, &pieces, fib.ccp_text, &mut |_| Ok(()));
+    let read = || {
+        let mut paragraphs = Vec::new();
+        let ended = main_text_paragraphs(word, &pieces, fib.ccp_text, &mut |p| {
+            paragraphs.push(p.to_owned());
+            Ok(())
+        });
+        (paragraphs, ended.is_ok())
+    };
+    let first = read();
+    assert_eq!(first, read(), "due letture diverse");
+    let violation = super::paragraph_violation(&first.0, to_usize(fib.ccp_text));
+    assert_eq!(violation, None, "{:?}", first.0);
 }
 
 #[cfg(test)]
@@ -630,6 +643,11 @@ mod tests {
                 });
                 prop_assert!(total <= word.len() * 3);
             }
+            // Gli oracoli del fuzzing su input plausibili, che raggiungono più codice.
+            let mut input = u32::try_from(word.len()).unwrap_or(u32::MAX).to_le_bytes().to_vec();
+            input.extend_from_slice(&word);
+            input.extend_from_slice(&table);
+            fuzz(&input);
         }
     }
 }

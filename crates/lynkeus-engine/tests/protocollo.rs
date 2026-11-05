@@ -25,8 +25,40 @@ const EXTRACT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Margine oltre una scadenza attesa, per l'arresto e la raccolta del processo.
 const STOP_SLACK: Duration = Duration::from_secs(2);
 
-/// Tempo massimo di un'anteprima la cui finestra è già completa.
-const PREVIEW_BUDGET: Duration = Duration::from_secs(1);
+/// Scadenza dell'anteprima di `finestra.*`, che dopo cinque righe non risponde più: senza
+/// l'arresto anticipato l'anteprima durerebbe tutta la scadenza.
+const PREVIEW_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Tempo massimo di un'anteprima la cui finestra è già completa, con il processo già avviato:
+/// metà della scadenza, così il test distingue l'arresto anticipato dall'attesa della
+/// scadenza senza dipendere dal carico della macchina.
+const PREVIEW_BUDGET: Duration = Duration::from_secs(5);
+
+/// Scadenza stretta per `molti.*` (400 documenti di una riga, pochi millisecondi di lavoro
+/// con il processo già avviato): più breve della pausa dell'interfaccia.
+const SHORT_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Quanto l'interfaccia simulata non legge gli eventi: il doppio di [`SHORT_TIMEOUT`]. È lo
+/// stimolo del test (un'interfaccia lenta), non un'attesa di una condizione.
+const INTERFACE_PAUSE: Duration = Duration::from_secs(2);
+
+/// Avvia il processo estrattore di `source` e aspetta che abbia servito una richiesta
+/// (`note.docx` di `dir`): da qui i tempi misurati non comprendono l'avvio di un eseguibile
+/// appena compilato, che su Windows l'antivirus può esaminare per secondi, ma solo il lavoro
+/// sul file. Il processo torna libero e serve la richiesta seguente (un solo posto nel pool).
+fn warm_up(source: &lynkeus_engine::DocumentSource, dir: &Path) {
+    let never = || false;
+    let mut events = Vec::new();
+    let end = source.pool().extract(
+        &dir.join("note.docx"),
+        &ExtractOptions::default(),
+        EXTRACT_TIMEOUT,
+        &never,
+        &mut events,
+    );
+    assert_eq!(end, ExtractEnd::Completed, "riscaldamento: {events:?}");
+    assert_eq!(source.pool().launches(), 1);
+}
 
 /// Una cartella con i file `names` (contenuto da PDF) e una copia di `note.docx`.
 fn dir_with(names: &[&str]) -> tempfile::TempDir {
@@ -108,6 +140,18 @@ fn unit_over_1_mib_is_a_protocol_violation() {
     }
 }
 
+/// Un frame che dichiara più del massimo del protocollo (qui 16 MiB) è una violazione appena
+/// se ne legge la lunghezza: il thread che legge non lo alloca e non aspetta i suoi byte
+/// (che non arrivano: se li aspettasse, l'esito sarebbe la scadenza).
+#[test]
+fn frame_over_the_maximum_is_a_protocol_violation() {
+    let name = "frame-enorme.pdf";
+    let dir = dir_with(&[name]);
+    let pool = pool(1);
+    let (end, _) = extract(&pool, &dir.path().join(name), EXTRACT_TIMEOUT);
+    assert_eq!(end, ExtractEnd::Failed(WorkerFailure::ProtocolViolation));
+}
+
 /// Un processo che manda unità valide senza fine finisce per scadenza, entro la scadenza.
 #[test]
 fn flooding_worker_times_out_within_budget() {
@@ -183,8 +227,9 @@ fn a_worker_that_never_reads_its_request_is_timed_out_or_stopped() {
         )
         .expect("assoluto"),
     );
-    // 4 MiB di nomi di voci: più del buffer di qualsiasi canale anonimo.
-    let inner: Vec<String> = (0..64)
+    // 1 MiB di nomi di voci: più del buffer dei canali anonimi (64 KiB su Linux, pochi KiB
+    // su Windows), dentro il massimo di un frame.
+    let inner: Vec<String> = (0..16)
         .map(|n| format!("{n}{}", "x".repeat(64 * 1024)))
         .collect();
     let timeout = Duration::from_secs(2);
@@ -234,15 +279,18 @@ fn a_worker_that_never_reads_its_request_is_timed_out_or_stopped() {
 fn waiting_for_the_interface_does_not_count_toward_the_timeout() {
     let dir = dir_with(&["molti.pdf"]);
     let mut req = request(vec![dir.path().join("molti.pdf")], &["carta"], Combine::Any);
-    req.limits.extract_timeout = Duration::from_secs(1);
-    let (mut handle, wake) = start_with(req, Some(documents_with(launcher(), 1, None)));
+    req.limits.extract_timeout = SHORT_TIMEOUT;
+    let source = documents_with(launcher(), 1, None);
+    // L'avvio del processo resterebbe dentro la scadenza stretta: prima lo si avvia.
+    warm_up(&source, dir.path());
+    let (mut handle, wake) = start_with(req, Some(source));
     // Abbastanza eventi perché la coda verso l'interfaccia si avvicini al pieno; poi
     // l'interfaccia resta occupata più a lungo della scadenza.
     for _ in 0..200 {
         wake.recv_timeout(EXTRACT_TIMEOUT)
             .expect("eventi della ricerca");
     }
-    std::thread::sleep(Duration::from_secs(2));
+    std::thread::sleep(INTERFACE_PAUSE);
     let found = drain(&mut handle, &wake);
     assert_eq!(found.summary.outcome, Outcome::Completed);
     assert!(found.warnings.is_empty(), "{:?}", found.warnings);
@@ -255,6 +303,8 @@ fn waiting_for_the_interface_does_not_count_toward_the_timeout() {
 fn preview_without_cache_stops_at_a_full_window() {
     let dir = dir_with(&["finestra.pdf"]);
     let source = documents_with(launcher(), 1, None);
+    // Il tempo misurato è quello dell'anteprima, non dell'avvio del processo.
+    warm_up(&source, dir.path());
     let doc = DocPath::file(dir.path().join("finestra.pdf"));
     let never = || false;
     let started = Instant::now();
@@ -264,7 +314,7 @@ fn preview_without_cache_stops_at_a_full_window() {
             &Location::PageLine { page: 1, line: 2 },
             1,
             &ExtractOptions::default(),
-            Duration::from_secs(10),
+            PREVIEW_TIMEOUT,
             &never,
         )
         .expect("documento leggibile")

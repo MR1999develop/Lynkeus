@@ -232,6 +232,29 @@ fn xls_cells() {
     assert_eq!(locations_of(&events, "città"), [spesa(2, 3)]);
 }
 
+/// Un xls vero con un flusso BIFF ben oltre 4 KB (501 righe per 3 colonne, tutte piene):
+/// ogni cella si legge, senza avvisi. Il file composto rifatto per `calamine` deve essere
+/// uno che `calamine` legge per intero.
+#[test]
+fn long_xls_reads_every_cell() {
+    let events = extract("formati/registro-lungo.xls");
+    assert_eq!(starts(&events), [(Vec::new(), Format::Xls)]);
+    assert!(warnings(&events).is_empty(), "{:?}", warnings(&events));
+    let units = events
+        .iter()
+        .filter(|e| matches!(e, ExtractEvent::Unit(_)))
+        .count();
+    assert_eq!(units, 501 * 3);
+    let registro = |row, col| Location::Cell {
+        sheet: "Registro".to_owned(),
+        row,
+        col,
+    };
+    assert_eq!(locations_of(&events, "aragosta"), [registro(501, 3)]);
+    assert_eq!(locations_of(&events, "città"), [registro(250, 3)]);
+    assert_eq!(locations_of(&events, "Voce 500"), [registro(500, 1)]);
+}
+
 #[test]
 fn ppt_slides() {
     let events = extract("formati/vecchia-presentazione.ppt");
@@ -417,6 +440,22 @@ fn sparse_xlsx_cells_are_read_in_flow() {
     };
     assert_eq!(locations_of(&events, "aragosta"), [cell(1, 1)]);
     assert_eq!(locations_of(&events, "città"), [cell(1_048_576, 16_384)]);
+}
+
+/// Un ods di meno di 1 KB con un testo di 300 caratteri ripetuto su 255 righe per 16.384
+/// colonne: le celle sono poche per un tetto in celle, ma il testo clonato per ognuna supera
+/// 1 GB. Avviso "memoria" sul file, nessuna cella letta.
+#[test]
+fn ods_with_repeated_text_is_a_memory_limit() {
+    let events = extract("malevoli/testo-ripetuto.ods");
+    assert_eq!(
+        warnings(&events),
+        [(Vec::new(), WarningKind::LimitExceeded(LimitKind::Memory))]
+    );
+    assert!(
+        !events.iter().any(|e| matches!(e, ExtractEvent::Unit(_))),
+        "nessuna cella"
+    );
 }
 
 /// Un 7z che dichiara un dizionario LZMA2 di 2 GiB per 31 byte di testo: la libreria non

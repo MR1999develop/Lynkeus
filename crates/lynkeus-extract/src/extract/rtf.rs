@@ -405,10 +405,24 @@ fn code_page(number: i64) -> Option<&'static Encoding> {
     Encoding::for_label(label.as_bytes())
 }
 
-/// Punto d'ingresso per il fuzzing: non deve mai andare in panic.
+/// Punto d'ingresso per il fuzzing: non deve mai andare in panic. Oracoli: due letture danno
+/// gli stessi paragrafi; ogni paragrafo ha testo e nessun carattere di controllo (salvo
+/// tabulazione e a capo); in tutto al più un carattere per byte dell'input (ogni carattere
+/// viene da almeno un byte: testo, `\'hh`, `\uN`, parola di controllo).
 #[cfg(any(test, feature = "fuzzing"))]
 pub(crate) fn fuzz(data: &[u8]) {
-    let _ignored = paragraphs(data, &mut |_| Ok(()));
+    let read = || {
+        let mut out = Vec::new();
+        let ended = paragraphs(data, &mut |p| {
+            out.push(p.to_owned());
+            Ok(())
+        });
+        (out, ended.is_ok())
+    };
+    let first = read();
+    assert_eq!(first, read(), "due letture diverse");
+    let violation = super::paragraph_violation(&first.0, data.len());
+    assert_eq!(violation, None, "{:?}", first.0);
 }
 
 #[cfg(test)]
@@ -566,6 +580,8 @@ testo\\par}";
                 Ok(())
             });
             prop_assert!(total <= rtf.len() * 3);
+            // Gli oracoli del fuzzing su input plausibili, che raggiungono più codice.
+            fuzz(rtf.as_bytes());
         }
     }
 }

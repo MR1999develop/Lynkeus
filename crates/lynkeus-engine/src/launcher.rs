@@ -31,11 +31,17 @@ use crate::platform;
 /// Opzione nascosta che avvia l'eseguibile come processo estrattore.
 pub const EXTRACT_WORKER_FLAG: &str = "--extract-worker";
 
-/// Gli argomenti del processo estrattore: [`EXTRACT_WORKER_FLAG`] e il limite di memoria
-/// (`--memory-limit-bytes`), che il figlio impone a sé stesso dove il padre non può (Linux).
+/// Gli argomenti del processo estrattore: [`EXTRACT_WORKER_FLAG`], il limite di memoria
+/// (`--memory-limit-bytes`), che il figlio impone a sé stesso dove il padre non può (Linux),
+/// e il pid di questo processo (`--parent-pid`), con cui il figlio riconosce la morte del
+/// padre anche se avviene prima che inizi a sorvegliarlo.
 pub fn worker_args(memory_limit: Option<ByteSize>) -> Vec<OsString> {
     let mut args = vec![OsString::from(EXTRACT_WORKER_FLAG)];
-    args.extend(WorkerConfig { memory_limit }.to_args());
+    let config = WorkerConfig {
+        memory_limit,
+        parent_pid: Some(std::process::id()),
+    };
+    args.extend(config.to_args());
     args
 }
 
@@ -234,8 +240,16 @@ mod tests {
     }
 
     #[test]
-    fn worker_args_carry_the_memory_limit() {
-        assert_eq!(worker_args(None), [OsString::from(EXTRACT_WORKER_FLAG)]);
+    fn worker_args_carry_the_memory_limit_and_this_process() {
+        let pid = OsString::from(std::process::id().to_string());
+        assert_eq!(
+            worker_args(None),
+            [
+                OsString::from(EXTRACT_WORKER_FLAG),
+                OsString::from("--parent-pid"),
+                pid.clone(),
+            ]
+        );
         let args = worker_args(Some(ByteSize::from_mib(256)));
         assert_eq!(
             args,
@@ -243,6 +257,8 @@ mod tests {
                 OsString::from(EXTRACT_WORKER_FLAG),
                 OsString::from("--memory-limit-bytes"),
                 OsString::from("268435456"),
+                OsString::from("--parent-pid"),
+                pid,
             ]
         );
     }

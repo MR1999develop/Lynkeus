@@ -587,10 +587,13 @@ mod tests {
             std::thread::Builder::new()
                 .name("estrattore-di-prova".to_owned())
                 .spawn(move || {
+                    // Nessun padre da sorvegliare: il "processo" è un thread di questo.
                     let config = lynkeus_extract::worker::WorkerConfig {
                         memory_limit: Some(THREAD_WORKER_MEMORY),
+                        parent_pid: None,
                     };
-                    let ended = lynkeus_extract::worker::run(child_stdin, child_stdout, &config);
+                    let ended =
+                        lynkeus_extract::worker::run(child_stdin, child_stdout, &config, || {});
                     let _sent = done_tx.send(ended.is_ok());
                 })?;
             Ok(lynkeus_engine::LaunchedWorker {

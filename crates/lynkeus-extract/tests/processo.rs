@@ -67,12 +67,19 @@ fn run(name: &str, test: fn()) {
     eprintln!("test {name} ... ok");
 }
 
-/// Il processo estrattore, con il limite di memoria di produzione.
+/// Codice d'uscita del processo estrattore quando il padre termina (come nell'app, il
+/// processo esce subito, anche a metà di un file).
+const PARENT_GONE_EXIT: i32 = 3;
+
+/// Il processo estrattore, con il limite di memoria di produzione e il pid del padre dagli
+/// argomenti (come lo avvia il motore).
 fn worker_role() -> ExitCode {
-    let config = WorkerConfig {
-        memory_limit: Some(DEFAULT_MEMORY_LIMIT),
+    let Ok(mut config) = WorkerConfig::from_args(std::env::args_os().skip(1)) else {
+        return ExitCode::from(2);
     };
-    match worker::run(io::stdin().lock(), io::stdout().lock(), &config) {
+    config.memory_limit = Some(DEFAULT_MEMORY_LIMIT);
+    let exit = || std::process::exit(PARENT_GONE_EXIT);
+    match worker::run(io::stdin().lock(), io::stdout().lock(), &config, exit) {
         Ok(()) => ExitCode::SUCCESS,
         Err(_) => ExitCode::FAILURE,
     }
@@ -83,6 +90,18 @@ fn this_exe(role: &str) -> Command {
     let exe = std::env::current_exe().expect("eseguibile del test");
     let mut command = Command::new(exe);
     command.env(ROLE_VAR, role);
+    command
+}
+
+/// Il processo estrattore figlio di questo processo, con il pid di questo processo come
+/// padre atteso.
+fn worker_child() -> Command {
+    let mut command = this_exe(WORKER_ROLE);
+    let parent = WorkerConfig {
+        memory_limit: None,
+        parent_pid: Some(std::process::id()),
+    };
+    command.args(parent.to_args());
     command
 }
 
@@ -98,7 +117,7 @@ type Received = (Vec<String>, Location, String);
 /// Fa estrarre `relative` (sotto `fixtures/`) a un processo estrattore vero e ne raccoglie
 /// le unità; il processo deve rispondere fino in fondo e uscire bene.
 fn extract_in_worker(relative: &str) -> Vec<Received> {
-    let mut child = this_exe(WORKER_ROLE)
+    let mut child = worker_child()
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -221,7 +240,7 @@ mod linux {
         let Some(busy_file) = std::env::var_os(BUSY_FILE_VAR) else {
             return ExitCode::FAILURE;
         };
-        let spawned = this_exe(WORKER_ROLE)
+        let spawned = worker_child()
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
