@@ -10,7 +10,9 @@
 //! - `release`: come `dist`, con `cargo auditable` (elenco delle dipendenze
 //!   nell'eseguibile) e SBOM CycloneDX: il rilascio in CI da un tag;
 //! - `deny-review`: le eccezioni di `deny.toml` hanno una data di revisione non passata;
-//! - `mitigations <exe>`: mitigazioni di un eseguibile Windows e prova con DLL finte.
+//! - `mitigations <exe>`: mitigazioni di un eseguibile Windows e prova con DLL finte;
+//! - `test-plan`: la parte automatizzabile del piano di test (`docs/piano-di-test.md`) e il
+//!   rapporto in `target/test-plan/`.
 //!
 //! I programmi esterni si avviano sempre con argomenti separati, mai tramite shell.
 
@@ -19,9 +21,11 @@ mod deny_review;
 mod dist;
 mod nospawn;
 mod pe;
+mod plan_map;
 mod process;
 mod remap;
 mod scan;
+mod test_plan;
 
 use std::process::ExitCode;
 
@@ -37,7 +41,13 @@ Comandi:
                    servono cargo-auditable e cargo-cyclonedx)
   deny-review      le eccezioni di deny.toml hanno una data di revisione non passata
   mitigations EXE  mitigazioni, DLL importate e prova con DLL finte di un eseguibile
-                   Windows";
+                   Windows
+  test-plan [--quick] [--level 1,2,3,4,5] [--clipboard] [--registry]
+                   piano di test: check, suite in release, voci T-xx, misure P-xx,
+                   parte automatica dei casi M-xx; rapporto in target/test-plan/.
+                   --quick salta check, check-linux, misure lunghe e pacchetto;
+                   senza --level tutti i livelli; --clipboard (P-08) e --registry
+                   (M-22) permettono le voci che modificano appunti e registro";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -49,6 +59,13 @@ fn main() -> ExitCode {
         ["release"] => dist::run(dist::Mode::Release),
         ["deny-review"] => deny_review::run(),
         ["mitigations", exe] => dist::print_mitigations(std::path::Path::new(exe)),
+        ["test-plan", rest @ ..] => match test_plan::Options::parse(rest) {
+            Ok(options) => test_plan::run(&options),
+            Err(message) => {
+                eprintln!("xtask: test-plan: {message}\n{USAGE}");
+                return ExitCode::from(2);
+            }
+        },
         ["help" | "--help" | "-h"] => {
             println!("{USAGE}");
             return ExitCode::SUCCESS;

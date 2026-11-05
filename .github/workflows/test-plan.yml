@@ -1,0 +1,66 @@
+# Piano di test automatico (docs/piano-di-test.md, "Esecuzione automatica"): livelli 1, 2
+# e 3 una volta alla settimana su Windows e Ubuntu, con il rapporto come artifact.
+# Le soglie delle misure sono avvisi: su un runner condiviso i tempi sono indicativi.
+name: Piano di test
+
+on:
+  schedule:
+    - cron: "29 2 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-plan-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  test-plan:
+    name: test-plan (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Librerie di sistema per eframe/egui con winit (X11 e Wayland) e per rfd (GTK 3).
+      - name: Pacchetti di sistema (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libwayland-dev libgtk-3-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+
+      # La toolchain la installa rustup da rust-toolchain.toml.
+      - name: Toolchain
+        run: rustup show active-toolchain
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      # `cargo xtask check` (livello 1) esegue anche cargo deny.
+      - uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
+        with:
+          tool: cargo-deny@0.20.2
+
+      - name: cargo xtask test-plan --level 1,2,3
+        run: cargo xtask test-plan --level 1,2,3
+
+      - name: Rapporto
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rapporto-piano-di-test-${{ matrix.os }}
+          path: target/test-plan/rapporto-*.md
+          if-no-files-found: warn
+          retention-days: 90

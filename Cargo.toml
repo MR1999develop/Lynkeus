@@ -131,7 +131,9 @@ tracing-subscriber = { version = "0.3.23", default-features = false, features = 
 toml = { version = "1.1.8", default-features = false, features = ["parse", "display", "serde"] }
 # NFC/NFD dei termini e tabella delle varianti accentate (lynkeus-core).
 unicode-normalization = "0.1.26"
-# API Win32 senza involucri, solo in `lynkeus-app/src/platform/windows_ffi.rs`: processo
+# API Win32 senza involucri, solo in `lynkeus-app/src/platform/windows_ffi.rs` (e, come
+# dev-dependency con `Win32_System_ProcessStatus`, nel modulo delle misure del piano di test
+# `lynkeus-engine/tests/misura`: picco della memoria privata): processo
 # estrattore con CreateProcessW nel Job Object (limite di memoria per processo, che `win32job`
 # non offre: experiments/jobobject/ESITI.md), SetDefaultDllDirectories, AssocIsDangerous,
 # SystemParametersInfoW e GetSysColor.

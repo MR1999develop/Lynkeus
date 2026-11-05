@@ -49,6 +49,11 @@ proptest.workspace = true
 tempfile.workspace = true
 zip.workspace = true
 
+# Picco della memoria privata nelle misure del piano di test (`tests/prestazioni_interfaccia.rs`
+# include `lynkeus-engine/tests/misura`).
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { workspace = true, features = ["Win32_System_ProcessStatus"] }
+
 [target.'cfg(windows)'.dependencies]
 opener.workspace = true
 windows-sys.workspace = true
