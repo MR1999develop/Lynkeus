@@ -3,6 +3,7 @@
 | Cosa | Valore |
 |---|---|
 | Risultati massimi | 200.000 (modificabile); al limite la ricerca si ferma e un banner lo segnala |
+| Risultati trattenuti con AND | i risultati non ancora sicuri (prima che un documento abbia tutti i termini) di tutti i documenti in lettura, in tutti i thread: al più 32 MiB stimati (`MAX_HELD_BYTES`, `batch.rs`: struttura più testi ed evidenziazioni; il picco reale è circa una volta e mezza), indipendenti dal limite dei risultati. Un documento che non trova posto guarda solo quali termini compaiono e, se li ha tutti, si rilegge alla fine. P-03: 145 MB di picco con 16 file da 300.000 parole |
 | Parola nei risultati | oltre 200 caratteri: troncata con "…" |
 | Contesto | circa 120 caratteri intorno alla parola |
 | Anteprima | unità di testo con ±20 unità vicine |

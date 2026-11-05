@@ -179,7 +179,7 @@ Totale livello 2: 14 (A) + 10 (B) + 13 (C) + 13 (D) = 50 test, di cui 9 derivati
 |---|---|---|---|---|
 | P-01 | Scansione di 100.000 file di testo ("ar", cartella generata) | Esecuzione scartata, 15 a caldo, 1 a freddo; tempo fino a "Finito" | caldo p95 ≤ 1,5 s; il freddo si riporta senza soglia | regola 31 |
 | P-02 | Annulla sotto carico | 4 processi "lento" più CPU satura, 30 ripetizioni; tempo da Annulla a `Finished` | massimo < 1 s | B-01 |
-| P-03 | `and_retained_hits_are_bounded_across_threads` | 16 file con 300.000 "il", AND con "zzz"; 5 ripetizioni; picco di memoria privata | nessun risultato; massimo sotto il budget (proposta 256 MiB) | B-02 |
+| P-03 | `p03_and_retained_hits_memory` | 16 file con 300.000 "il", AND con "zzz"; 5 ripetizioni; picco di memoria privata | nessun risultato; massimo sotto il budget di 256 MiB | B-02 |
 | P-04 | Filtro di 32 estensioni su 100.000 nomi | `criterion` con `black_box`, prima e dopo il filtro compilato | nessuna allocazione nel ciclo; miglioramento oltre il rumore | B-11 |
 | P-05 | Cache contro estrazione sui documenti demo | p50 e p95 della seconda ricerca contro la prima | la seconda più veloce, p95 riportato | B-12 |
 | P-06 | `sort_200k_timing` | `cargo test --release -p lynkeus-app --lib sort_200k_timing -- --ignored --nocapture` | < 50 ms per colonna (obiettivo del codice) | regola 31 |

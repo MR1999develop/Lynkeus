@@ -134,7 +134,8 @@ mod tests {
         }
     }
 
-    /// Cerca `text` con al più `held` risultati trattenuti; l'esito e i lotti consegnati.
+    /// Cerca `text` con posto per al più `held` risultati trattenuti (ognuno ne occupa
+    /// almeno `size_of::<Hit>()` byte); l'esito e i lotti consegnati.
     fn search(
         text: &str,
         query: &CompiledQuery,
@@ -153,7 +154,7 @@ mod tests {
         let mut reader =
             TextReader::with_block_bytes(text.as_bytes(), ByteSize::from_mib(64), block)
                 .expect("testo");
-        let held = HeldHits::new(held);
+        let held = HeldHits::new(held.saturating_mul(size_of::<Hit>()));
         search_text(&mut reader, &label, HitBatcher::new(query, &held), sink)
     }
 

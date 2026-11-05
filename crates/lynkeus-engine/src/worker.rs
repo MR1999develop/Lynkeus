@@ -14,9 +14,9 @@
 //! del pool, che li mandano al [`DocumentSource`] (cache o processo estrattore) e cercano
 //! negli eventi ([`DocSearch`]). Senza una fonte dei documenti si contano tra i saltati.
 //!
-//! I risultati non ancora sicuri (AND) trattenuti da tutti i thread insieme non superano il
-//! limite dei risultati ([`HeldHits`]); un file o un documento che non trova posto si
-//! rilegge alla fine con i risultati già sicuri (vedi [`crate::batch`]).
+//! I risultati non ancora sicuri (AND) trattenuti da tutti i thread insieme non superano
+//! [`MAX_HELD_BYTES`] ([`HeldHits`]); un file o un documento che non trova posto si rilegge
+//! alla fine con i risultati già sicuri (vedi [`crate::batch`]).
 //!
 //! Il tempo in cui un lettore di documenti aspetta la coda verso il chiamante (interfaccia
 //! lenta o occupata) non conta nella scadenza del processo estrattore.
@@ -36,10 +36,9 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, SendTimeoutError, Sender};
 use ignore::{DirEntry, WalkBuilder, WalkState};
-use lynkeus_core::Query;
 use lynkeus_extract::{ExtractError, ExtractOptions, Format, open_text};
 
-use crate::batch::{HeldHits, HitBatcher, HitLabel, HitSink};
+use crate::batch::{HeldHits, HitBatcher, HitLabel, HitSink, MAX_HELD_BYTES};
 use crate::doc::DocPath;
 use crate::docsearch::{DocSearch, Pass};
 use crate::documents::DocumentSource;
@@ -82,9 +81,7 @@ pub(crate) fn run(request: &SearchRequest, context: &WorkerContext) {
         filter: FileFilter::new(&request.filters),
         halt: Halt::default(),
         budget: Budget::new(request.limits.max_results),
-        // Oltre il limite un documento tiene solo i risultati con un termine nuovo: al più
-        // uno per termine in più.
-        held: HeldHits::new(request.limits.max_results.saturating_add(Query::MAX_TERMS)),
+        held: HeldHits::new(MAX_HELD_BYTES),
     };
     search.all_roots();
     let outcome = match search.halt.get() {
@@ -576,7 +573,7 @@ mod tests {
     use std::io::{BufReader, Read, Write};
     use std::num::NonZeroUsize;
 
-    use lynkeus_core::{Combine, Location, MatchOptions, Term, TextUnit, WildcardMode};
+    use lynkeus_core::{Combine, Location, MatchOptions, Query, Term, TextUnit, WildcardMode};
     use lynkeus_extract::ExtractEvent;
     use lynkeus_extract::protocol::{FrameReader, FrameWriter, Request, RequestId, Response};
 
@@ -676,7 +673,7 @@ mod tests {
         responses
     }
 
-    /// Cerca "ar" e "zeta" (AND) in un documento finto, con 10 posti per i risultati
+    /// Cerca "ar" e "zeta" (AND) in un documento finto, con posto per 10 risultati
     /// trattenuti: `a.txt` non trova posto e va riletta. Gli eventi della ricerca.
     fn search_scripted(script: Script) -> Vec<SearchEvent> {
         let terms = ["ar", "zeta"]
@@ -714,7 +711,8 @@ mod tests {
             filter: FileFilter::new(&request.filters),
             halt: Halt::default(),
             budget: Budget::new(1000),
-            held: HeldHits::new(10),
+            // Posto per al più 10 risultati: `a.txt` ne ha 20 prima di "zeta".
+            held: HeldHits::new(10 * size_of::<Hit>()),
         };
         let queued = QueuedDocument {
             root: 0,

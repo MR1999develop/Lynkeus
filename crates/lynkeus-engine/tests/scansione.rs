@@ -268,6 +268,59 @@ fn the_result_limit_is_exact_across_threads() {
     assert_eq!(found.summary.counts.hits, 7);
 }
 
+/// AND con molti risultati in molti file letti insieme. Dodici file con 20.000 righe
+/// "carta" e nessuna "zeta" e tre file con 15.000 righe "carta" e poi "zeta" vorrebbero
+/// trattenere insieme più risultati del tetto comune in byte: alcuni non trovano posto e
+/// sondano i termini, e i tre che li hanno tutti vanno riletti se serve. In ogni caso i tre
+/// danno tutte le loro righe, ognuna una volta, fino al limite dei risultati.
+#[test]
+fn and_files_with_many_hits_give_every_result_up_to_the_limit() {
+    const BOTH_LINES: u32 = 15_000;
+    let decoy = "carta\n".repeat(20_000).into_bytes();
+    let mut both = "carta\n".repeat(usize::try_from(BOTH_LINES).expect("righe"));
+    both.push_str("zeta\n");
+    let names: Vec<(String, &[u8])> = (0..12)
+        .map(|n| (format!("solo-{n:02}.txt"), decoy.as_slice()))
+        .chain((0..3).map(|n| (format!("entrambi-{n}.txt"), both.as_bytes())))
+        .collect();
+    let refs: Vec<(&str, &[u8])> = names.iter().map(|(n, c)| (n.as_str(), *c)).collect();
+    let dir = tree(&refs);
+    let search = |max_results| {
+        let mut req = request(vec![dir.path().into()], &["ar", "zeta"], Combine::All);
+        req.limits.max_results = max_results;
+        run(req)
+    };
+    let distinct = |found: &common::Outcome| {
+        let rows = found.rows();
+        let mut unique = rows.clone();
+        unique.dedup();
+        assert_eq!(unique.len(), rows.len(), "righe ripetute");
+        let only_both = rows
+            .iter()
+            .all(|(file, _, _)| file.starts_with("entrambi-"));
+        assert!(only_both, "risultati da un file senza \"zeta\"");
+        rows
+    };
+
+    let all = search(Limits::default().max_results);
+    assert_eq!(all.summary.outcome, Outcome::Completed);
+    let rows = distinct(&all);
+    let expected: Vec<Location> = (1..=BOTH_LINES + 1).map(Location::Line).collect();
+    for n in 0..3 {
+        let name = format!("entrambi-{n}.txt");
+        let lines: Vec<Location> = rows
+            .iter()
+            .filter(|(file, _, _)| *file == name)
+            .map(|(_, _, location)| location.clone())
+            .collect();
+        assert_eq!(lines, expected, "{name}");
+    }
+
+    let limited = search(20_000);
+    assert_eq!(limited.summary.outcome, Outcome::LimitReached);
+    assert_eq!(distinct(&limited).len(), 20_000);
+}
+
 #[test]
 fn cancel_during_the_search() {
     // Più file della coda degli eventi: senza leggere, la ricerca non può finire da sola.

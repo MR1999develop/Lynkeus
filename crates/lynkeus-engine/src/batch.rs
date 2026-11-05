@@ -11,11 +11,13 @@
 //! - prima (AND) si trattengono; oltre i posti che il limite lascia ancora si tengono solo
 //!   quelli che portano un termine nuovo (servono a sapere se il documento li ha tutti);
 //! - i risultati trattenuti da tutti i documenti in lettura, in tutti i thread, non superano
-//!   il limite dei risultati ([`HeldHits`]). Un documento che non trova posto smette di
-//!   trattenere e guarda solo quali termini compaiono ("sondaggio"): se alla fine li ha
-//!   visti tutti, chi lo legge lo rilegge con un batcher già sicuro
-//!   ([`Verdict::Reread`]). Così nessun risultato si perde e la memoria resta limitata.
+//!   [`MAX_HELD_BYTES`] ([`HeldHits`], byte stimati con [`held_bytes`]). Un documento che non
+//!   trova posto smette di trattenere e guarda solo quali termini compaiono ("sondaggio"):
+//!   se alla fine li ha visti tutti, chi lo legge lo rilegge con un batcher già sicuro
+//!   ([`Verdict::Reread`]). Così nessun risultato si perde e la memoria resta limitata,
+//!   qualunque sia il limite dei risultati.
 
+use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -31,6 +33,13 @@ use crate::request::Limits;
 /// Risultati già sicuri trattenuti al massimo prima di consegnarne un lotto.
 pub(crate) const BATCH_HITS: usize = 1024;
 
+/// Byte stimati ([`held_bytes`]) dei risultati non ancora sicuri trattenuti al massimo da
+/// tutti i documenti in lettura insieme: con parole e righe brevi (200-300 byte stimati
+/// l'uno) da 100.000 a 150.000 risultati.
+/// Il picco reale, con l'allocatore e la crescita dei vettori, è circa una volta e mezza la
+/// stima (P-03 del piano di test).
+pub(crate) const MAX_HELD_BYTES: usize = 32 * 1024 * 1024;
+
 /// Dove vanno i risultati e gli avvisi di un documento.
 pub(crate) trait HitSink {
     /// Errore se la ricerca deve fermarsi (annullata, limite raggiunto, chiamante sparito).
@@ -44,37 +53,57 @@ pub(crate) trait HitSink {
 }
 
 /// I risultati trattenuti (non ancora sicuri) da tutti i documenti in lettura, con un tetto
-/// comune.
+/// comune in byte stimati.
 #[derive(Debug)]
 pub(crate) struct HeldHits {
     held: AtomicUsize,
-    max: usize,
+    max_bytes: usize,
 }
 
 impl HeldHits {
-    /// Al più `max` risultati trattenuti in tutto.
-    pub(crate) fn new(max: usize) -> HeldHits {
+    /// Al più `max_bytes` byte stimati ([`held_bytes`]) trattenuti in tutto.
+    pub(crate) fn new(max_bytes: usize) -> HeldHits {
         HeldHits {
             held: AtomicUsize::new(0),
-            max,
+            max_bytes,
         }
     }
 
-    /// Prenota un posto; falso se il tetto è pieno.
-    fn reserve_one(&self) -> bool {
+    /// Prenota il posto di `bytes` byte; falso se non c'è.
+    fn reserve(&self, bytes: usize) -> bool {
         self.held
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
-                (held < self.max).then_some(held + 1)
+                held.checked_add(bytes)
+                    .filter(|&total| total <= self.max_bytes)
             })
             .is_ok()
     }
 
-    /// Libera `count` posti prenotati.
-    fn release(&self, count: usize) {
-        if count > 0 {
-            self.held.fetch_sub(count, Ordering::Relaxed);
+    /// Libera `bytes` byte prenotati.
+    fn release(&self, bytes: usize) {
+        if bytes > 0 {
+            self.held.fetch_sub(bytes, Ordering::Relaxed);
         }
     }
+}
+
+/// I byte che un risultato trattenuto occupa, stimati: la struttura più la capacità dei suoi
+/// testi e delle evidenziazioni (il documento è condiviso tra le righe e non conta).
+pub(crate) fn held_bytes(hit: &Hit) -> usize {
+    let sheet = match &hit.location {
+        Location::Cell { sheet, .. } => sheet.capacity(),
+        _ => 0,
+    };
+    let highlights = hit
+        .snippet
+        .highlights
+        .capacity()
+        .saturating_mul(size_of::<Range<usize>>());
+    size_of::<Hit>()
+        .saturating_add(hit.word.capacity())
+        .saturating_add(hit.snippet.text.capacity())
+        .saturating_add(highlights)
+        .saturating_add(sheet)
 }
 
 /// Cosa cercare e come etichettare i risultati di un documento.
@@ -114,7 +143,7 @@ pub(crate) enum Verdict {
 
 /// Lo stato dei risultati di un documento.
 enum State {
-    /// Si raccolgono i risultati; `reserved` posti presi da [`HeldHits`].
+    /// Si raccolgono i risultati; `reserved` byte presi da [`HeldHits`].
     Collecting {
         accumulator: FileAccumulator<Hit>,
         reserved: usize,
@@ -178,15 +207,17 @@ impl<'h> HitBatcher<'h> {
         if accumulator.len() >= room && accumulator.seen().contains_all(terms) {
             return None;
         }
+        let hit = make();
         if !accumulator.is_satisfied() {
-            if !self.held.reserve_one() {
+            let bytes = held_bytes(&hit);
+            if !self.held.reserve(bytes) {
                 let seen = accumulator.seen().union(terms);
                 self.start_probing(seen);
                 return None;
             }
-            *reserved += 1;
+            *reserved = reserved.saturating_add(bytes);
         }
-        accumulator.push(terms, make());
+        accumulator.push(terms, hit);
         let len = accumulator.len();
         (accumulator.is_satisfied() && (len >= BATCH_HITS || len >= room))
             .then(|| self.take_ready())
@@ -289,8 +320,42 @@ mod tests {
         label.hit("carta", &found, Location::Line(1))
     }
 
+    /// Byte trattenuti ora.
     fn current(held: &HeldHits) -> usize {
         held.held.load(Ordering::Relaxed)
+    }
+
+    /// I byte che trattiene un risultato di [`hit`] (tutti uguali: il documento è condiviso
+    /// e non conta).
+    fn one() -> usize {
+        held_bytes(&hit(0))
+    }
+
+    /// Posto per `count` risultati di [`hit`].
+    fn places(count: usize) -> HeldHits {
+        HeldHits::new(count * one())
+    }
+
+    /// Quanti risultati di [`hit`] sono trattenuti ora.
+    fn held_count(held: &HeldHits) -> usize {
+        current(held) / one()
+    }
+
+    /// Un risultato con parola (150 caratteri, 30 corrispondenze) e contesto lunghi.
+    fn long_hit() -> Hit {
+        let limits = Limits::default();
+        let compiled = query(&["ar"], Combine::Any);
+        let label = HitLabel {
+            query: &compiled,
+            limits: &limits,
+            root: 0,
+            doc: Arc::new(DocPath::file("lungo.txt")),
+        };
+        let text = format!("{} {}", "x".repeat(300), "carta".repeat(30));
+        let found = lynkeus_core::find_words(&compiled, &text)
+            .pop()
+            .expect("carta");
+        label.hit(&text, &found, Location::Line(1))
     }
 
     const AR: usize = 0;
@@ -302,7 +367,7 @@ mod tests {
     #[test]
     fn held_hits_are_bounded_across_documents() {
         let compiled = query(&["ar", "zeta"], Combine::All);
-        let held = HeldHits::new(100);
+        let held = places(100);
         let mut first = HitBatcher::new(&compiled, &held);
         let mut second = HitBatcher::new(&compiled, &held);
         for n in 0..80 {
@@ -313,7 +378,7 @@ mod tests {
                 second.push(TermSet::single(AR), usize::MAX, || hit(n)),
                 None
             );
-            assert!(current(&held) <= 100, "{}", current(&held));
+            assert!(held_count(&held) <= 100, "{}", current(&held));
         }
         assert!(!second.is_settled());
         assert_eq!(
@@ -333,12 +398,88 @@ mod tests {
         assert_eq!(current(&held), 0, "posti non liberati");
     }
 
+    /// Il tetto vale tra i thread: otto documenti AND letti insieme, con 40 risultati non
+    /// sicuri ciascuno, non trattengono mai più di 100 risultati in tutto. Dopo l'ultimo
+    /// termine ognuno consegna tutti i suoi 41 risultati o chiede la seconda lettura; al più
+    /// due hanno trovato posto per tutti; alla fine i posti sono liberi.
+    #[test]
+    fn held_hits_are_bounded_across_threads() {
+        const THREADS: usize = 8;
+        const PLACES: usize = 100;
+        let compiled = query(&["ar", "zeta"], Combine::All);
+        let held = places(PLACES);
+        // Tutti trattengono prima che qualcuno finisca: la concorrenza non dipende dal caso.
+        let all_held = std::sync::Barrier::new(THREADS);
+        let verdicts: Vec<Verdict> = std::thread::scope(|scope| {
+            let readers: Vec<_> = (0..THREADS)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let mut batcher = HitBatcher::new(&compiled, &held);
+                        for n in 0..40 {
+                            let batch = batcher.push(TermSet::single(AR), usize::MAX, || hit(n));
+                            assert_eq!(batch, None);
+                            assert!(held_count(&held) <= PLACES, "{}", current(&held));
+                        }
+                        all_held.wait();
+                        let batch = batcher.push(TermSet::single(ZETA), usize::MAX, || hit(0));
+                        assert_eq!(batch, None, "lotto sotto BATCH_HITS: alla fine");
+                        batcher.finish()
+                    })
+                })
+                .collect();
+            readers
+                .into_iter()
+                .map(|reader| reader.join().expect("thread del lettore"))
+                .collect()
+        });
+        let delivered: Vec<usize> = verdicts
+            .iter()
+            .filter(|v| **v != Verdict::Reread)
+            .map(Verdict::hits_len)
+            .collect();
+        assert!(delivered.len() <= 2, "{delivered:?}");
+        assert!(delivered.iter().all(|&len| len == 41), "{delivered:?}");
+        assert_eq!(current(&held), 0, "posti non liberati");
+    }
+
+    /// Il tetto è in byte: un risultato con parola e contesto lunghi occupa più posto di uno
+    /// breve. Nel posto di due lunghi il terzo non sta (il documento smette di trattenere e
+    /// poi chiede la seconda lettura), ma stanno sei brevi.
+    #[test]
+    fn held_places_are_counted_in_bytes() {
+        let long_bytes = held_bytes(&long_hit());
+        assert!(long_bytes > 3 * one(), "{long_bytes} contro {}", one());
+        let compiled = query(&["ar", "zeta"], Combine::All);
+        let held = HeldHits::new(2 * long_bytes);
+        let mut batcher = HitBatcher::new(&compiled, &held);
+        for _ in 0..2 {
+            let batch = batcher.push(TermSet::single(AR), usize::MAX, long_hit);
+            assert_eq!(batch, None);
+        }
+        assert_eq!(current(&held), 2 * long_bytes);
+        let batch = batcher.push(TermSet::single(AR), usize::MAX, long_hit);
+        assert_eq!(batch, None);
+        assert_eq!(
+            current(&held),
+            0,
+            "il documento che non trova posto libera i suoi"
+        );
+        let batch = batcher.push(TermSet::single(ZETA), usize::MAX, || hit(0));
+        assert_eq!(batch, None);
+        assert_eq!(batcher.finish(), Verdict::Reread);
+        let mut short = HitBatcher::new(&compiled, &held);
+        for n in 0..6 {
+            assert_eq!(short.push(TermSet::single(AR), usize::MAX, || hit(n)), None);
+        }
+        assert_eq!(held_count(&held), 6);
+    }
+
     /// Un documento senza tutti i termini non consegna nulla e libera i posti, anche se
     /// interrotto.
     #[test]
     fn unsatisfied_documents_release_their_places() {
         let compiled = query(&["ar", "zeta"], Combine::All);
-        let held = HeldHits::new(10);
+        let held = places(10);
         let mut probing = HitBatcher::new(&compiled, &held);
         for n in 0..20 {
             assert_eq!(
@@ -354,7 +495,7 @@ mod tests {
                 None
             );
         }
-        assert_eq!(current(&held), 5);
+        assert_eq!(held_count(&held), 5);
         drop(interrupted);
         assert_eq!(current(&held), 0);
     }
@@ -388,12 +529,12 @@ mod tests {
     #[test]
     fn beyond_the_limit_only_new_terms_are_kept() {
         let compiled = query(&["ar", "zeta"], Combine::All);
-        let held = HeldHits::new(1000);
+        let held = places(1000);
         let mut batcher = HitBatcher::new(&compiled, &held);
         for n in 0..10 {
             assert_eq!(batcher.push(TermSet::single(AR), 3, || hit(n)), None);
         }
-        assert_eq!(current(&held), 3);
+        assert_eq!(held_count(&held), 3);
         let batch = batcher.push(TermSet::single(ZETA), 3, || hit(99));
         assert_eq!(batch.map(|b| b.len()), Some(4));
         assert_eq!(current(&held), 0);

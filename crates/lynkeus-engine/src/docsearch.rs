@@ -374,7 +374,8 @@ mod tests {
     fn documents_without_places_are_reread() {
         let request = request(&["ar", "zeta"]);
         let progress = Progress::default();
-        let held = HeldHits::new(10);
+        // Posto per al più 10 risultati: `a.txt` ne ha 20 prima di "zeta".
+        let held = HeldHits::new(10 * size_of::<Hit>());
         let path = Path::new("archivio.zip");
         let mut first = Collect::default();
         let rereads = {
