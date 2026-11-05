@@ -17,6 +17,8 @@ Solo ciò che è specifico di questo progetto. Le decisioni stanno in `PLAN.md`.
 
 - `PLAN.md`: piano e checklist delle fasi; si spunta una voce solo se completata e verificata.
 - `docs/`: `specifica.md`, `threat-model.md`, `dipendenze.md`, `adr/` (decisioni difficili da cambiare).
+- `docs/analisi-conformita.md`: analisi di conformità del 2026-11-05 (problemi per area con ID, priorità di correzione).
+- `docs/piano-di-test.md`: piano di test a cinque livelli, matrice problema → test, registro delle esecuzioni.
 
 ## Struttura del workspace
 
