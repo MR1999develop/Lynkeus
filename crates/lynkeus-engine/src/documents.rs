@@ -12,6 +12,13 @@
 //! I percorsi si rendono assoluti prima della chiave della cache e della richiesta al
 //! processo estrattore: lo stesso file ha una sola chiave, e l'estrattore (con un'altra
 //! cartella corrente) legge proprio quel file.
+//!
+//! Una scrittura della cache che fallisce non ferma la lettura: la cache la conta
+//! ([`TextCache::write_failures`]) e l'app la registra.
+//!
+//! L'anteprima ([`DocumentSource::units_around`]) ferma l'estrazione appena ha l'unità e
+//! le sue vicine, se il documento non va comunque salvato nella cache (cache spenta, voce
+//! troppo grande): il processo non resta occupato fino alla scadenza.
 
 use std::collections::VecDeque;
 use std::path::Path;
@@ -21,10 +28,10 @@ use std::time::Duration;
 use lynkeus_core::{Location, TextUnit};
 use lynkeus_extract::{EntrySink, EventSink, ExtractEvent, ExtractOptions, Stopped, line_location};
 
-use crate::cache::{CacheKey, MAX_ENTRY_BYTES, TextCache};
+use crate::cache::{CacheKey, CacheRead, MAX_ENTRY_BYTES, TextCache};
 use crate::doc::DocPath;
 use crate::event::WarningKind;
-use crate::pool::{EntryEnd, ExtractEnd, ExtractorPool, absolute_path};
+use crate::pool::{EntryEnd, ExtractBudget, ExtractEnd, ExtractorPool, absolute_path};
 
 /// Da dove vengono gli eventi di un file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,32 +101,70 @@ impl DocumentSource {
         stop: &dyn Fn() -> bool,
         sink: &mut dyn EventSink,
     ) -> (ExtractEnd, Origin) {
+        let budget = ExtractBudget::new(timeout);
+        self.extract_with(path, options, &budget, stop, sink, SinkStop::Stops)
+    }
+
+    /// Come [`DocumentSource::extract`], con il tempo di `budget`.
+    pub(crate) fn extract_within(
+        &self,
+        path: &Path,
+        options: &ExtractOptions,
+        budget: &ExtractBudget<'_>,
+        stop: &dyn Fn() -> bool,
+        sink: &mut dyn EventSink,
+    ) -> (ExtractEnd, Origin) {
+        self.extract_with(path, options, budget, stop, sink, SinkStop::Stops)
+    }
+
+    /// L'estrazione con la cache; `when_sink_stops` dice se un destinatario che si ferma
+    /// ferma anche il salvataggio nella cache.
+    fn extract_with(
+        &self,
+        path: &Path,
+        options: &ExtractOptions,
+        budget: &ExtractBudget<'_>,
+        stop: &dyn Fn() -> bool,
+        sink: &mut dyn EventSink,
+        when_sink_stops: SinkStop,
+    ) -> (ExtractEnd, Origin) {
         let path = absolute_path(path);
         let path = path.as_path();
         let cache = self.active_cache();
         let key = cache.and_then(|_| CacheKey::for_file(path, options));
-        if let (Some(cache), Some(key)) = (cache, &key)
-            && let Some(events) = cache.get(key)
-        {
-            self.cache_hits.fetch_add(1, Ordering::Relaxed);
-            for event in events {
-                if stop() || sink.emit(event).is_err() {
+        if let (Some(cache), Some(key)) = (cache, &key) {
+            let mut checked = StopChecked {
+                stop,
+                sink: &mut *sink,
+            };
+            match cache.read(key, &mut checked) {
+                CacheRead::Delivered => {
+                    self.cache_hits.fetch_add(1, Ordering::Relaxed);
+                    return (ExtractEnd::Completed, Origin::Cache);
+                }
+                CacheRead::Stopped => {
+                    self.cache_hits.fetch_add(1, Ordering::Relaxed);
                     return (ExtractEnd::Stopped, Origin::Cache);
                 }
+                CacheRead::Missing => {}
             }
-            return (ExtractEnd::Completed, Origin::Cache);
         }
         let mut tee = Tee {
             sink,
             saved: key.as_ref().map(|_| Vec::new()),
             saved_bytes: 0,
+            when_sink_stops,
+            sink_done: false,
         };
-        let end = self.pool.extract(path, options, timeout, stop, &mut tee);
+        let end = self
+            .pool
+            .extract_within(path, options, budget, stop, &mut tee);
         if end == ExtractEnd::Completed
             && let (Some(cache), Some(key), Some(events)) = (cache, &key, tee.saved)
         {
-            // La cache è un derivato: se non si scrive, si rileggerà il file.
-            let _saved = cache.put(key, &events);
+            // La cache è un derivato: se non si scrive, si rileggerà il file. L'errore lo
+            // conta la cache (`write_failures`) e lo registra l'app.
+            let _counted = cache.put(key, &events);
         }
         (end, Origin::Extractor)
     }
@@ -158,12 +203,24 @@ impl DocumentSource {
         stop: &dyn Fn() -> bool,
     ) -> Result<Option<Vec<TextUnit>>, WarningKind> {
         let mut window = UnitWindow::new(&doc.inner, location, radius);
-        let (end, _) = self.extract(&doc.path, options, timeout, stop, &mut window);
+        let budget = ExtractBudget::new(timeout);
+        let (end, _) = self.extract_with(
+            &doc.path,
+            options,
+            &budget,
+            stop,
+            &mut window,
+            SinkStop::FinishesForTheCache,
+        );
+        if stop() {
+            return Ok(None);
+        }
         match end {
             ExtractEnd::Completed => {}
+            // Finestra completa: si è fermata da sola, o le unità che servono sono arrivate
+            // prima del guasto.
+            ExtractEnd::Stopped | ExtractEnd::Failed(_) if window.is_complete() => {}
             ExtractEnd::Stopped => return Ok(None),
-            // Se l'unità e le sue vicine sono già arrivate, bastano.
-            ExtractEnd::Failed(_) if window.is_complete() => {}
             ExtractEnd::Failed(failure) => return Err(failure.warning_kind()),
         }
         if let Some(kind) = window.warning
@@ -184,12 +241,25 @@ fn is_transient(kind: lynkeus_extract::WarningKind) -> bool {
     )
 }
 
+/// Che cosa vuol dire un destinatario che si ferma.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SinkStop {
+    /// Si ferma anche l'estrazione (ricerca annullata o al limite).
+    Stops,
+    /// Il destinatario ha finito; l'estrazione continua solo se il documento va ancora
+    /// salvato nella cache (anteprima).
+    FinishesForTheCache,
+}
+
 /// Passa gli eventi a chi chiama e ne tiene una copia per la cache, finché è piccola.
 struct Tee<'a> {
     sink: &'a mut dyn EventSink,
     /// `None` = non si salva (cache spenta, voce troppo grande, avviso passeggero).
     saved: Option<Vec<ExtractEvent>>,
     saved_bytes: usize,
+    when_sink_stops: SinkStop,
+    /// Il destinatario ha finito: gli eventi vanno solo alla copia.
+    sink_done: bool,
 }
 
 impl EventSink for Tee<'_> {
@@ -206,6 +276,38 @@ impl EventSink for Tee<'_> {
             } else {
                 saved.push(event.clone());
             }
+        }
+        if self.sink_done {
+            // Senza più nulla da salvare, inutile continuare.
+            return if self.saved.is_some() {
+                Ok(())
+            } else {
+                Err(Stopped)
+            };
+        }
+        match self.sink.emit(event) {
+            Err(Stopped)
+                if self.when_sink_stops == SinkStop::FinishesForTheCache
+                    && self.saved.is_some() =>
+            {
+                self.sink_done = true;
+                Ok(())
+            }
+            other => other,
+        }
+    }
+}
+
+/// Passa gli eventi a `sink` finché `stop` resta falso (lettura dalla cache).
+struct StopChecked<'a> {
+    stop: &'a dyn Fn() -> bool,
+    sink: &'a mut dyn EventSink,
+}
+
+impl EventSink for StopChecked<'_> {
+    fn emit(&mut self, event: ExtractEvent) -> Result<(), Stopped> {
+        if (self.stop)() {
+            return Err(Stopped);
         }
         self.sink.emit(event)
     }
@@ -234,6 +336,8 @@ enum WindowState {
     After { left: usize },
     /// Completa: il resto si ignora.
     Done,
+    /// Il documento è finito senza l'unità cercata.
+    Missing,
 }
 
 /// Raccoglie le unità intorno a una posizione di un documento, senza tenere tutto il
@@ -262,11 +366,12 @@ impl<'a> UnitWindow<'a> {
     }
 
     fn found(&self) -> bool {
-        self.state != WindowState::Before
+        matches!(self.state, WindowState::After { .. } | WindowState::Done)
     }
 
+    /// Vero se non arriva più nulla che serva: unità e vicine raccolte, o documento finito.
     fn is_complete(&self) -> bool {
-        self.state == WindowState::Done
+        matches!(self.state, WindowState::Done | WindowState::Missing)
     }
 
     fn finish(self) -> Option<Vec<TextUnit>> {
@@ -296,18 +401,34 @@ impl<'a> UnitWindow<'a> {
                     WindowState::After { left: left - 1 }
                 };
             }
-            WindowState::Done => {}
+            WindowState::Done | WindowState::Missing => {}
         }
+    }
+
+    /// Fine del documento cercato: dopo non arrivano altre sue unità (le voci sono uniche nel
+    /// loro archivio).
+    fn end_of_target(&mut self) {
+        self.state = match self.state {
+            WindowState::Before | WindowState::Missing => WindowState::Missing,
+            WindowState::After { .. } | WindowState::Done => WindowState::Done,
+        };
     }
 }
 
 impl EventSink for UnitWindow<'_> {
+    /// Raccoglie le unità; quando la finestra è completa chiede di fermarsi (chi la usa
+    /// decide se l'estrazione continua per la cache).
     fn emit(&mut self, event: ExtractEvent) -> Result<(), Stopped> {
         match event {
             ExtractEvent::DocumentStart { inner, .. } => {
                 self.in_target = inner == self.inner;
             }
-            ExtractEvent::DocumentEnd => self.in_target = false,
+            ExtractEvent::DocumentEnd => {
+                if self.in_target {
+                    self.end_of_target();
+                }
+                self.in_target = false;
+            }
             ExtractEvent::Unit(unit) if self.in_target && !self.is_complete() => {
                 for piece in split_lines(unit) {
                     self.push(piece);
@@ -319,8 +440,11 @@ impl EventSink for UnitWindow<'_> {
             ExtractEvent::Unit(_) | ExtractEvent::Warning { .. } | ExtractEvent::Skipped { .. } => {
             }
         }
-        // Si lascia finire l'estrazione: il documento completo finisce nella cache.
-        Ok(())
+        if self.is_complete() {
+            Err(Stopped)
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -370,7 +494,10 @@ mod tests {
         let inner: Vec<String> = inner.iter().map(|s| (*s).to_owned()).collect();
         let mut window = UnitWindow::new(&inner, at, radius);
         for event in events {
-            assert!(window.emit(event).is_ok());
+            if window.emit(event).is_err() {
+                assert!(window.is_complete(), "fermata prima di essere completa");
+                break;
+            }
         }
         window
             .finish()
@@ -423,6 +550,45 @@ mod tests {
             window(events, &[], &Location::Paragraph(2), 3),
             Some(vec!["prima riga\nseconda".into(), "carta".into()])
         );
+    }
+
+    /// Con la cache che salva, la finestra completa non ferma l'estrazione finché il
+    /// documento è da salvare; senza salvataggio, o oltre il massimo di una voce, si ferma.
+    #[test]
+    fn a_complete_window_stops_the_extraction_unless_the_cache_needs_it() {
+        let location = Location::Line(1);
+        let inner: Vec<String> = Vec::new();
+        let big = "x".repeat(1024 * 1024);
+        let events = || {
+            let mut events = vec![start(&[]), unit(Location::Line(1), "carta")];
+            events.extend((2..=70).map(|n| unit(Location::Line(n), &big)));
+            events.push(ExtractEvent::DocumentEnd);
+            events
+        };
+        let feed = |saving: bool| -> (usize, bool) {
+            let mut window = UnitWindow::new(&inner, &location, 0);
+            let mut tee = Tee {
+                sink: &mut window,
+                saved: saving.then(Vec::new),
+                saved_bytes: 0,
+                when_sink_stops: SinkStop::FinishesForTheCache,
+                sink_done: false,
+            };
+            let mut accepted = 0;
+            for event in events() {
+                if tee.emit(event).is_err() {
+                    break;
+                }
+                accepted += 1;
+            }
+            (accepted, tee.saved.is_some())
+        };
+        // Senza cache si ferma alla seconda unità (quella cercata).
+        assert_eq!(feed(false), (1, false));
+        // Con la cache continua finché la voce non supera il massimo, poi si ferma.
+        let (accepted, still_saving) = feed(true);
+        assert!(!still_saving);
+        assert!((60..70).contains(&accepted), "{accepted}");
     }
 
     #[test]

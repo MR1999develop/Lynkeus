@@ -10,6 +10,8 @@ use lynkeus_core::{ByteSize, CompiledQuery};
 use lynkeus_extract::ArchiveLimits;
 use serde::{Deserialize, Serialize};
 
+use crate::platform;
+
 /// Una ricerca da avviare con [`start_search`](crate::start_search).
 #[derive(Debug, Clone)]
 pub struct SearchRequest {
@@ -176,8 +178,7 @@ impl Extension {
 
     /// Vero se l'ultima estensione di `path` è questa, senza distinguere le maiuscole.
     pub fn matches(&self, path: &Path) -> bool {
-        path.extension()
-            .is_some_and(|ext| ext.to_string_lossy().to_lowercase() == self.0)
+        platform::extension_is(path, &self.0)
     }
 }
 

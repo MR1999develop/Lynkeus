@@ -13,10 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use common::{
-    documents, documents_with, drain, file_name, fixtures, launcher, request, run, run_with,
-    start_with,
-};
+use common::{documents, documents_with, file_name, fixtures, launcher, request, run, run_with};
 use lynkeus_core::{Combine, Location};
 use lynkeus_engine::{
     DocPath, EntryEnd, ExtractEnd, LaunchedWorker, LimitKind, Limits, Origin, Outcome, WarningKind,
@@ -287,28 +284,52 @@ fn misbehaving_workers_are_replaced_and_reported() {
         "{}",
         source.pool().launches()
     );
+    // I processi che non leggono stdin si chiudono prima della fine del test.
+    source.pool().shutdown();
 }
 
+/// Misura P-05 (piano di test): documenti demo letti dal processo estrattore e dalla cache;
+/// stampa p50 e p95 di 15 letture dopo una scartata. `cargo test --release -p lynkeus-engine
+/// --test documenti cache_against_extraction -- --ignored --nocapture`.
 #[test]
-fn cancel_stops_a_busy_worker_within_one_second() {
-    let dir = misbehaving_dir(&["lento.pdf"]);
-    let source = documents_with(launcher(), 1, None);
-    let req = request(vec![dir.path().join("lento.pdf")], &["carta"], Combine::Any);
-    let (mut handle, wake) = start_with(req, Some(Arc::clone(&source)));
-    // Si aspetta che il processo stia leggendo il file lento.
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while source.pool().launches() == 0 {
-        assert!(Instant::now() < deadline, "processo mai avviato");
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    std::thread::sleep(Duration::from_millis(200));
-    let cancelled = Instant::now();
-    handle.cancel();
-    let found = drain(&mut handle, &wake);
-    let took = cancelled.elapsed();
-    assert_eq!(found.summary.outcome, Outcome::Cancelled);
-    assert!(took < Duration::from_secs(1), "annulla in {took:?}");
-    assert!(found.warnings.is_empty(), "{:?}", found.warnings);
+#[ignore = "misura di prestazioni (P-05), da lanciare a mano in release"]
+fn cache_against_extraction_timing() {
+    let cache = tempfile::tempdir().expect("cartella della cache");
+    let files = [
+        fixtures("demo/ufficio/note.docx"),
+        fixtures("demo/musica/archivio.zip"),
+    ];
+    let measure = |source: &lynkeus_engine::DocumentSource, expected: Origin| {
+        let never = || false;
+        let mut times: Vec<Duration> = (0..16)
+            .map(|_| {
+                let started = Instant::now();
+                for file in &files {
+                    let mut events: Vec<ExtractEvent> = Vec::new();
+                    let (end, origin) = source.extract(
+                        file,
+                        &ExtractOptions::default(),
+                        Duration::from_secs(30),
+                        &never,
+                        &mut events,
+                    );
+                    assert_eq!(end, ExtractEnd::Completed);
+                    assert_eq!(origin, expected);
+                }
+                started.elapsed()
+            })
+            .skip(1)
+            .collect();
+        times.sort_unstable();
+        (times[times.len() / 2], times[(times.len() - 1) * 95 / 100])
+    };
+    let extractor = documents_with(launcher(), 1, None);
+    let cached = documents_with(launcher(), 1, Some(&cache.path().join("cache")));
+    let (p50, p95) = measure(&extractor, Origin::Extractor);
+    println!("P-05 processo estrattore: p50 {p50:?}, p95 {p95:?}");
+    let _fill = measure(&cached, Origin::Extractor);
+    let (p50, p95) = measure(&cached, Origin::Cache);
+    println!("P-05 cache: p50 {p50:?}, p95 {p95:?}");
 }
 
 #[test]

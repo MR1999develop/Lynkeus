@@ -7,20 +7,37 @@
 //! `lynkeus_extract::worker::run` e per i file normali fa la stessa cosa (`extract_path`). Per
 //! i file con un nome riservato si comporta male di proposito, per provare il pool:
 //!
-//! - `lento.*`: non risponde più (dorme a lungo, ignorando stdin);
+//! - `lento.*`: inizia un documento (così chi chiama sa che la richiesta è arrivata) e non
+//!   risponde più (dorme a lungo, ignorando stdin);
 //! - `muore.*`: inizia un documento ed esce con codice 3;
 //! - `sporco.*`: scrive su stdout byte estranei al protocollo;
 //! - `fuori-sequenza.*`: manda un'unità senza inizio documento, poi la fine;
-//! - `altro-id.*`: risponde con un id diverso da quello della richiesta;
+//! - `altro-id.*`: risponde con un id diverso (successivo) da quello della richiesta;
 //! - `descrittori.*`: risponde con un'unità che elenca i descrittori aperti del processo
 //!   (`/proc/self/fd`, solo Linux; altrove un testo che lo dice);
 //! - `lucchetto.*`: apre il file, ne prende il lock esclusivo e lo tiene fino all'uscita del
 //!   processo (il test sa così se il processo è ancora vivo), poi risponde come un documento
-//!   vuoto.
+//!   vuoto;
+//! - `lucchetto-occupato.*`: come `lucchetto`, ma dopo l'inizio del documento gira a vuoto
+//!   sulla CPU per sempre, senza leggere stdin;
+//! - `unita-grande.*`: un documento con un'unità da 2 MiB (oltre il massimo del protocollo);
+//! - `troppo-profondo.*`: un avviso con più voci annidate della profondità massima;
+//! - `inonda.*`: un documento con unità valide senza fine;
+//! - `chiacchierone.*`: un documento vuoto, poi un secondo `Done` non richiesto;
+//! - `dati-fuori-sequenza.*`: risponde a un'estrazione con i byte di una voce;
+//! - `finestra.*`: un documento con cinque righe, poi non risponde più;
+//! - `molti.*`: [`MANY_DOCUMENTS`] voci, ciascuna con una riga "carta".
+//!
+//! Con [`DEAF_FLAG`] (dopo `--extract-worker`) non legge mai stdin e dorme: prova le
+//! scritture verso un processo che non legge.
 //!
 //! Con [`ORPHAN_PARENT_FLAG`] fa invece da padre intermedio: avvia un processo estrattore con
 //! il lanciatore portabile, gli fa prendere il lock del file indicato, scrive `pronto` su
-//! stdout e dorme; il test lo uccide e controlla che il figlio rimasto senza padre esca.
+//! stdout e dorme; il test lo uccide e controlla che il figlio rimasto senza padre esca. Con
+//! [`BUSY_ORPHAN_PARENT_FLAG`] il figlio, dopo il lock, resta occupato (`lucchetto-occupato`).
+//!
+//! Su Linux il processo estrattore chiede al kernel di essere ucciso quando muore il padre
+//! (`PR_SET_PDEATHSIG`), come il processo estrattore vero.
 //!
 //! Non fa parte del pacchetto distribuito.
 
@@ -41,24 +58,50 @@ use lynkeus_extract::protocol::{
 };
 use lynkeus_extract::worker::WorkerConfig;
 use lynkeus_extract::{
-    EntrySink, EventSink, ExtractEvent, ExtractOptions, Format, Stopped, extract_entry,
-    extract_path,
+    EntrySink, EventSink, ExtractEvent, ExtractOptions, Format, Stopped, WarningKind,
+    extract_entry, extract_path,
 };
 
 /// Opzione che avvia il padre intermedio del test sugli orfani, seguita dal file da bloccare.
 const ORPHAN_PARENT_FLAG: &str = "--orphan-parent";
 
+/// Come [`ORPHAN_PARENT_FLAG`], con il figlio occupato dopo il lock.
+const BUSY_ORPHAN_PARENT_FLAG: &str = "--orphan-parent-busy";
+
+/// Opzione (subito dopo `--extract-worker`) di un processo che non legge mai stdin.
+const DEAF_FLAG: &str = "--deaf";
+
+/// Voci del file `molti.*`.
+const MANY_DOCUMENTS: usize = 400;
+
+/// Byte dell'unità di `unita-grande.*`: oltre il massimo di un'unità (1 MiB).
+const OVERSIZED_UNIT_BYTES: usize = 2 * 1024 * 1024;
+
+/// Byte di ogni unità di `inonda.*`.
+const FLOOD_UNIT_BYTES: usize = 64 * 1024;
+
+/// Un'attesa che il test non vede mai finire.
+const FOREVER: Duration = Duration::from_secs(3600);
+
 fn main() -> ExitCode {
-    let mut args = std::env::args_os().skip(1);
+    let mut args = std::env::args_os().skip(1).peekable();
     let first = args.next();
-    if first == Some(OsString::from(ORPHAN_PARENT_FLAG)) {
+    if first == Some(OsString::from(ORPHAN_PARENT_FLAG))
+        || first == Some(OsString::from(BUSY_ORPHAN_PARENT_FLAG))
+    {
+        let busy = first == Some(OsString::from(BUSY_ORPHAN_PARENT_FLAG));
         return match args.next() {
-            Some(lock) => orphan_parent(Path::new(&lock)),
+            Some(lock) => orphan_parent(Path::new(&lock), busy),
             None => ExitCode::from(2),
         };
     }
     if first != Some(OsString::from("--extract-worker")) {
         return ExitCode::from(2);
+    }
+    die_with_parent();
+    if args.peek() == Some(&OsString::from(DEAF_FLAG)) {
+        std::thread::sleep(FOREVER);
+        return ExitCode::FAILURE;
     }
     if WorkerConfig::from_args(args).is_err() {
         return ExitCode::from(2);
@@ -70,6 +113,23 @@ fn main() -> ExitCode {
         Err(_) => ExitCode::FAILURE,
     }
 }
+
+/// Linux: il kernel uccide questo processo quando muore il thread che l'ha avviato; se il
+/// padre è già morto prima di questa chiamata, esce subito.
+#[cfg(target_os = "linux")]
+fn die_with_parent() {
+    use rustix::process::{Pid, Signal, getppid, set_parent_process_death_signal};
+    if set_parent_process_death_signal(Some(Signal::KILL)).is_err() {
+        std::process::exit(4);
+    }
+    if getppid().is_none_or(Pid::is_init) {
+        std::process::exit(4);
+    }
+}
+
+/// Altrove la vita del figlio la lega il padre (Job Object su Windows).
+#[cfg(not(target_os = "linux"))]
+fn die_with_parent() {}
 
 fn serve(input: impl io::Read, output: impl Write) -> Result<(), ProtocolError> {
     let mut reader = FrameReader::new(BufReader::new(input));
@@ -89,10 +149,15 @@ fn serve(input: impl io::Read, output: impl Write) -> Result<(), ProtocolError> 
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
+        let id = request.id;
         match stem.as_str() {
-            "lento" => std::thread::sleep(Duration::from_secs(3600)),
+            "lento" => {
+                writer.write(&event(id, start()))?;
+                writer.flush()?;
+                std::thread::sleep(FOREVER);
+            }
             "muore" => {
-                writer.write(&event(request.id, start()))?;
+                writer.write(&event(id, start()))?;
                 writer.flush()?;
                 std::process::exit(3);
             }
@@ -102,26 +167,24 @@ fn serve(input: impl io::Read, output: impl Write) -> Result<(), ProtocolError> 
                 out.write_all(b"ciao, sono un messaggio di log\n")
                     .and_then(|()| out.flush())
                     .map_err(ProtocolError::Io)?;
-                std::thread::sleep(Duration::from_secs(3600));
+                std::thread::sleep(FOREVER);
                 return Ok(());
             }
             "fuori-sequenza" => {
-                writer.write(&event(request.id, unit("carta")))?;
-                writer.write(&Response::Done { id: request.id })?;
+                writer.write(&event(id, unit(1, "carta")))?;
+                writer.write(&Response::Done { id })?;
                 writer.flush()?;
             }
             "altro-id" => {
-                writer.write(&event(request.id.wrapping_add(7), start()))?;
+                writer.write(&event(id.wrapping_add(7), start()))?;
                 writer.flush()?;
             }
             "descrittori" => {
-                writer.write(&event(request.id, start()))?;
-                writer.write(&event(request.id, unit(&open_descriptors())))?;
-                writer.write(&event(request.id, ExtractEvent::DocumentEnd))?;
-                writer.write(&Response::Done { id: request.id })?;
-                writer.flush()?;
+                writer.write(&event(id, start()))?;
+                writer.write(&event(id, unit(1, &open_descriptors())))?;
+                finish(&mut writer, id)?;
             }
-            "lucchetto" => {
+            "lucchetto" | "lucchetto-occupato" => {
                 let file = File::options()
                     .read(true)
                     .write(true)
@@ -129,15 +192,96 @@ fn serve(input: impl io::Read, output: impl Write) -> Result<(), ProtocolError> 
                     .map_err(ProtocolError::Io)?;
                 file.lock().map_err(ProtocolError::Io)?;
                 locked.push(file);
-                writer.write(&event(request.id, start()))?;
-                writer.write(&event(request.id, ExtractEvent::DocumentEnd))?;
-                writer.write(&Response::Done { id: request.id })?;
+                writer.write(&event(id, start()))?;
+                if stem == "lucchetto-occupato" {
+                    writer.flush()?;
+                    spin_forever();
+                }
+                finish(&mut writer, id)?;
+            }
+            "unita-grande" => {
+                writer.write(&event(id, start()))?;
+                let text = "carta ".repeat(OVERSIZED_UNIT_BYTES / 6);
+                writer.write(&event(id, unit(1, &text)))?;
+                finish(&mut writer, id)?;
+            }
+            "troppo-profondo" => {
+                let depth = ExtractOptions::default().limits.max_depth;
+                let inner = (0..=depth).map(|i| format!("livello{i}.zip")).collect();
+                writer.write(&event(
+                    id,
+                    ExtractEvent::Warning {
+                        inner,
+                        kind: WarningKind::Corrupt,
+                    },
+                ))?;
+                writer.write(&Response::Done { id })?;
+                writer.flush()?;
+            }
+            "inonda" => {
+                writer.write(&event(id, start()))?;
+                let text = "aragosta ".repeat(FLOOD_UNIT_BYTES / 9);
+                for line in 1.. {
+                    writer.write(&event(id, unit(line, &text)))?;
+                }
+            }
+            "chiacchierone" => {
+                writer.write(&event(id, start()))?;
+                writer.write(&event(id, ExtractEvent::DocumentEnd))?;
+                writer.write(&Response::Done { id })?;
+                writer.write(&Response::Done { id })?;
+                writer.flush()?;
+            }
+            "dati-fuori-sequenza" => {
+                writer.write(&Response::EntryData {
+                    id,
+                    bytes: b"carta".to_vec(),
+                })?;
+                writer.write(&Response::Done { id })?;
+                writer.flush()?;
+            }
+            "finestra" => {
+                writer.write(&event(id, start()))?;
+                for line in 1..=5 {
+                    writer.write(&event(id, unit(line, &format!("riga {line} carta"))))?;
+                }
+                writer.flush()?;
+                std::thread::sleep(FOREVER);
+            }
+            "molti" => {
+                for n in 0..MANY_DOCUMENTS {
+                    writer.write(&event(
+                        id,
+                        ExtractEvent::DocumentStart {
+                            inner: vec![format!("voce{n}.txt")],
+                            format: Format::Text,
+                        },
+                    ))?;
+                    writer.write(&event(id, unit(1, "carta")))?;
+                    writer.write(&event(id, ExtractEvent::DocumentEnd))?;
+                }
+                writer.write(&Response::Done { id })?;
                 writer.flush()?;
             }
             _ => normal(&mut writer, &request)?,
         }
     }
     Ok(())
+}
+
+/// Chiude il documento e la richiesta `id`.
+fn finish<W: Write>(writer: &mut FrameWriter<W>, id: RequestId) -> Result<(), ProtocolError> {
+    writer.write(&event(id, ExtractEvent::DocumentEnd))?;
+    writer.write(&Response::Done { id })?;
+    writer.flush()
+}
+
+/// Un ciclo che occupa la CPU e non finisce mai.
+fn spin_forever() -> ! {
+    let mut counter = 0_u64;
+    loop {
+        counter = std::hint::black_box(counter.wrapping_add(1));
+    }
 }
 
 /// I descrittori aperti, in ordine e separati da spazi, senza quello della cartella che si
@@ -166,9 +310,21 @@ fn open_descriptors() -> String {
     "descrittori non elencabili su questo sistema".to_owned()
 }
 
-/// Il padre intermedio: avvia un processo estrattore che blocca `lock`, dice `pronto` e
-/// aspetta di essere ucciso.
-fn orphan_parent(lock: &Path) -> ExitCode {
+/// Dice `pronto` su stdout al primo evento.
+struct ReadySignal;
+
+impl EventSink for ReadySignal {
+    fn emit(&mut self, _event: ExtractEvent) -> Result<(), Stopped> {
+        let mut out = io::stdout().lock();
+        // Senza `pronto` il test fallisce per scadenza: un errore qui non ha altro rimedio.
+        let _said = out.write_all(b"pronto\n").and_then(|()| out.flush());
+        Ok(())
+    }
+}
+
+/// Il padre intermedio: avvia un processo estrattore che blocca `lock` (e con `busy` resta
+/// occupato), dice `pronto` e aspetta di essere ucciso.
+fn orphan_parent(lock: &Path, busy: bool) -> ExitCode {
     let Ok(exe) = std::env::current_exe() else {
         return ExitCode::FAILURE;
     };
@@ -177,6 +333,17 @@ fn orphan_parent(lock: &Path) -> ExitCode {
     };
     let pool = ExtractorPool::new(Arc::new(launcher), NonZeroUsize::MIN);
     let never = || false;
+    if busy {
+        // L'estrazione non finisce mai: `pronto` parte dall'inizio del documento.
+        let _never_ends = pool.extract(
+            lock,
+            &ExtractOptions::default(),
+            FOREVER,
+            &never,
+            &mut ReadySignal,
+        );
+        return ExitCode::FAILURE;
+    }
     let mut events: Vec<ExtractEvent> = Vec::new();
     let end = pool.extract(
         lock,
@@ -190,17 +357,14 @@ fn orphan_parent(lock: &Path) -> ExitCode {
     }
     let mut out = io::stdout().lock();
     if out
-        .write_all(
-            b"pronto
-",
-        )
+        .write_all(b"pronto\n")
         .and_then(|()| out.flush())
         .is_err()
     {
         return ExitCode::FAILURE;
     }
     // Il test uccide questo processo; il pool (e il figlio) non si chiudono da qui.
-    std::thread::sleep(Duration::from_secs(3600));
+    std::thread::sleep(FOREVER);
     ExitCode::FAILURE
 }
 
@@ -299,9 +463,9 @@ fn start() -> ExtractEvent {
     }
 }
 
-fn unit(text: &str) -> ExtractEvent {
+fn unit(line: u32, text: &str) -> ExtractEvent {
     ExtractEvent::Unit(TextUnit {
-        location: Location::PageLine { page: 1, line: 1 },
+        location: Location::PageLine { page: 1, line },
         text: text.to_owned(),
     })
 }

@@ -5,53 +5,79 @@
 //! voce d'archivio) è un [`DocPath`] con le sue righe di risultato, e OR/AND valgono per
 //! documento, come per un file sul disco.
 //!
-//! [`DocSearch`] riceve gli eventi man mano (dal pool o dalla cache) e consegna i risultati
-//! a lotti come la ricerca nei file di testo: con OR appena ci sono, con AND da quando ogni
-//! termine è comparso nel documento. Gli avvisi diventano [`SearchEvent::Warning`] con il
-//! documento a cui si riferiscono; i documenti saltati si contano.
+//! [`DocSearch`] riceve gli eventi man mano (dal pool o dalla cache) e passa i risultati a un
+//! [`HitBatcher`] per documento, come la ricerca nei file di testo. Gli avvisi diventano
+//! avvisi della ricerca con il documento a cui si riferiscono; i documenti saltati si
+//! contano. I documenti che il batcher vuole rileggere ([`Verdict::Reread`]) si raccolgono:
+//! chi chiama rilegge il file con [`Pass::Reread`], che guarda solo quei documenti.
 
 use std::path::Path;
 use std::sync::Arc;
 
-use lynkeus_core::{FileAccumulator, TextUnit, find_words, snippet, word_text};
+use lynkeus_core::{TextUnit, find_words};
 use lynkeus_extract::{EventSink, ExtractEvent, SkipReason, Stopped, line_location};
 
+use crate::batch::{HeldHits, HitBatcher, HitLabel, HitSink, Verdict};
 use crate::doc::DocPath;
-use crate::event::{Hit, WarningKind};
-use crate::progress::Counter;
-use crate::textfile::{BATCH_HITS, FileSearch, HitSink};
-use crate::worker::{Search, Stop};
+use crate::event::WarningKind;
+use crate::halt::Stop;
+use crate::progress::{Counter, Progress};
+use crate::request::SearchRequest;
+
+/// Quale lettura del file.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Pass<'p> {
+    /// La prima: ogni documento, con avvisi e saltati.
+    First,
+    /// La seconda: solo i documenti con queste voci, che hanno già tutti i termini; avvisi e
+    /// saltati sono già stati contati.
+    Reread(&'p [Vec<String>]),
+}
 
 /// Il documento aperto tra un inizio e una fine.
-struct OpenDocument {
+struct OpenDocument<'h> {
     doc: Arc<DocPath>,
-    accumulator: FileAccumulator<Hit>,
+    batcher: HitBatcher<'h>,
 }
 
 /// Destinatario degli eventi di un file che li trasforma in risultati e avvisi.
-pub(crate) struct DocSearch<'s, 'r, S: HitSink> {
-    search: &'s Search<'r>,
+pub(crate) struct DocSearch<'a, S: HitSink> {
+    request: &'a SearchRequest,
+    progress: &'a Progress,
+    held: &'a HeldHits,
     sink: S,
-    path: &'s Path,
+    path: &'a Path,
     root: usize,
-    open: Option<OpenDocument>,
+    pass: Pass<'a>,
+    open: Option<OpenDocument<'a>>,
+    /// Voci dei documenti da rileggere.
+    rereads: Vec<Vec<String>>,
     /// Perché la ricerca si è fermata durante la consegna, se è successo.
     stopped: Option<Stop>,
 }
 
-impl<'s, 'r, S: HitSink> DocSearch<'s, 'r, S> {
+impl<'a, S: HitSink> DocSearch<'a, S> {
+    /// La ricerca negli eventi del file `path` (dalla radice `root`) per `request`;
+    /// risultati e avvisi vanno a `sink`.
     pub(crate) fn new(
-        search: &'s Search<'r>,
+        request: &'a SearchRequest,
+        progress: &'a Progress,
+        held: &'a HeldHits,
         sink: S,
-        path: &'s Path,
+        path: &'a Path,
         root: usize,
-    ) -> DocSearch<'s, 'r, S> {
+        pass: Pass<'a>,
+    ) -> DocSearch<'a, S> {
         DocSearch {
-            search,
+            request,
+            progress,
+            held,
             sink,
             path,
             root,
+            pass,
             open: None,
+            rereads: Vec::new(),
             stopped: None,
         }
     }
@@ -59,6 +85,21 @@ impl<'s, 'r, S: HitSink> DocSearch<'s, 'r, S> {
     /// Il motivo d'arresto registrato durante la consegna.
     pub(crate) fn stopped(&self) -> Option<Stop> {
         self.stopped
+    }
+
+    /// Le voci dei documenti da rileggere (vuoto se nessuno).
+    pub(crate) fn take_rereads(&mut self) -> Vec<Vec<String>> {
+        std::mem::take(&mut self.rereads)
+    }
+
+    /// Avvisa che l'estrazione si è interrotta: l'avviso va al documento aperto (i suoi
+    /// risultati si scartano), altrimenti al file.
+    pub(crate) fn warn_interrupted(&mut self, kind: WarningKind) -> Result<(), Stop> {
+        let doc = match self.open.take() {
+            Some(open) => open.doc,
+            None => self.doc(Vec::new()),
+        };
+        self.sink.warn(doc, kind)
     }
 
     /// Il documento di un evento: il file più le voci `inner`.
@@ -69,51 +110,61 @@ impl<'s, 'r, S: HitSink> DocSearch<'s, 'r, S> {
         })
     }
 
-    /// Il documento a cui dare l'avviso di un'estrazione interrotta: quello aperto (i suoi
-    /// risultati si scartano), altrimenti il file.
-    pub(crate) fn interrupted_doc(&mut self) -> Arc<DocPath> {
-        match self.open.take() {
-            Some(open) => open.doc,
-            None => self.doc(Vec::new()),
-        }
-    }
-
     fn handle(&mut self, event: ExtractEvent) -> Result<(), Stop> {
-        let progress = &self.search.context().progress;
+        let first = matches!(self.pass, Pass::First);
         match event {
             ExtractEvent::DocumentStart { inner, .. } => {
-                let doc = self.doc(inner);
-                progress.set_current(Some(Arc::clone(&doc)));
-                let query = &self.search.request().query;
-                self.open = Some(OpenDocument {
-                    doc,
-                    accumulator: FileAccumulator::new(query.term_count(), query.combine()),
-                });
+                self.open_document(inner);
                 Ok(())
             }
             ExtractEvent::Unit(unit) => self.unit(&unit),
-            ExtractEvent::DocumentEnd => match self.open.take() {
-                Some(open) => {
-                    let hits = open.accumulator.finish();
-                    if hits.is_empty() {
-                        Ok(())
-                    } else {
-                        self.sink.deliver(hits)
-                    }
-                }
-                None => Ok(()),
-            },
-            ExtractEvent::Warning { inner, kind } => {
+            ExtractEvent::DocumentEnd => self.close_document(),
+            ExtractEvent::Warning { inner, kind } if first => {
                 let doc = self.doc(inner);
-                self.search
-                    .warn_shared(doc, WarningKind::from_extract(kind))
+                self.sink.warn(doc, WarningKind::from_extract(kind))
             }
-            ExtractEvent::Skipped { reason, .. } => {
+            ExtractEvent::Skipped { reason, .. } if first => {
                 let counter = match reason {
                     SkipReason::Binary => Counter::BinarySkipped,
                     SkipReason::TooLarge | SkipReason::SpecialEntry => Counter::FilesSkipped,
                 };
-                progress.add(counter, 1);
+                self.progress.add(counter, 1);
+                Ok(())
+            }
+            ExtractEvent::Warning { .. } | ExtractEvent::Skipped { .. } => Ok(()),
+        }
+    }
+
+    /// Apre il documento `inner`, se questa lettura lo riguarda.
+    fn open_document(&mut self, inner: Vec<String>) {
+        let query = &self.request.query;
+        let batcher = match self.pass {
+            Pass::First => HitBatcher::new(query, self.held),
+            Pass::Reread(wanted) if wanted.contains(&inner) => {
+                HitBatcher::satisfied(query, self.held)
+            }
+            Pass::Reread(_) => {
+                self.open = None;
+                return;
+            }
+        };
+        let doc = self.doc(inner);
+        if matches!(self.pass, Pass::First) {
+            self.progress.set_current(Some(Arc::clone(&doc)));
+        }
+        self.open = Some(OpenDocument { doc, batcher });
+    }
+
+    /// Chiude il documento aperto: consegna ciò che resta, o lo segna da rileggere.
+    fn close_document(&mut self) -> Result<(), Stop> {
+        let Some(open) = self.open.take() else {
+            return Ok(());
+        };
+        match open.batcher.finish() {
+            Verdict::Hits(hits) if hits.is_empty() => Ok(()),
+            Verdict::Hits(hits) => self.sink.deliver(hits),
+            Verdict::Reread => {
+                self.rereads.push(open.doc.inner.clone());
                 Ok(())
             }
         }
@@ -125,44 +176,30 @@ impl<'s, 'r, S: HitSink> DocSearch<'s, 'r, S> {
         let Some(open) = self.open.as_mut() else {
             return Ok(());
         };
-        let request = self.search.request();
-        let file = FileSearch {
-            query: &request.query,
-            limits: &request.limits,
+        let label = HitLabel {
+            query: &self.request.query,
+            limits: &self.request.limits,
             root: self.root,
             doc: Arc::clone(&open.doc),
         };
         let room = self.sink.remaining();
-        for found in find_words(file.query, &unit.text) {
-            // Come nei file di testo: oltre il limite solo i termini nuovi (per AND).
-            if open.accumulator.len() >= room && open.accumulator.seen().contains_all(found.terms) {
-                continue;
-            }
-            let word = word_text(&unit.text, &found, file.limits.word_max_chars);
-            let hit = Hit {
-                doc: Arc::clone(&file.doc),
-                root: file.root,
-                location: line_location(&unit.location, found.line),
-                word: word.text,
-                word_truncated_start: word.truncated_start,
-                word_truncated_end: word.truncated_end,
-                snippet: snippet(&unit.text, &found, file.limits.context_chars),
-                terms: found.terms,
+        for found in find_words(label.query, &unit.text) {
+            let make = || {
+                label.hit(
+                    &unit.text,
+                    &found,
+                    line_location(&unit.location, found.line),
+                )
             };
-            open.accumulator.push(found.terms, hit);
-        }
-        let held = open.accumulator.len();
-        if open.accumulator.is_satisfied() && (held >= room || held >= BATCH_HITS) {
-            let hits = open.accumulator.take_ready();
-            if !hits.is_empty() {
-                self.sink.deliver(hits)?;
+            if let Some(batch) = open.batcher.push(found.terms, room, make) {
+                self.sink.deliver(batch)?;
             }
         }
         Ok(())
     }
 }
 
-impl<S: HitSink> EventSink for DocSearch<'_, '_, S> {
+impl<S: HitSink> EventSink for DocSearch<'_, S> {
     fn emit(&mut self, event: ExtractEvent) -> Result<(), Stopped> {
         if self.stopped.is_some() {
             return Err(Stopped);
@@ -171,5 +208,123 @@ impl<S: HitSink> EventSink for DocSearch<'_, '_, S> {
             self.stopped = Some(stop);
             Stopped
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use lynkeus_core::{Combine, Location, MatchOptions, Query, Term, WildcardMode};
+    use lynkeus_extract::Format;
+
+    use super::*;
+    use crate::event::Hit;
+    use crate::request::{Filters, Limits};
+
+    /// Raccoglie risultati e avvisi, senza limite.
+    #[derive(Default)]
+    struct Collect {
+        hits: Vec<Hit>,
+        warnings: Vec<WarningKind>,
+    }
+
+    impl HitSink for &mut Collect {
+        fn check(&self) -> Result<(), Stop> {
+            Ok(())
+        }
+        fn remaining(&self) -> usize {
+            usize::MAX
+        }
+        fn deliver(&mut self, hits: Vec<Hit>) -> Result<(), Stop> {
+            self.hits.extend(hits);
+            Ok(())
+        }
+        fn warn(&mut self, _doc: Arc<DocPath>, kind: WarningKind) -> Result<(), Stop> {
+            self.warnings.push(kind);
+            Ok(())
+        }
+    }
+
+    fn request(terms: &[&str]) -> SearchRequest {
+        let terms = terms
+            .iter()
+            .map(|t| Term::parse(t, WildcardMode::Enabled).expect("termine valido"))
+            .collect();
+        SearchRequest {
+            roots: Vec::new(),
+            query: Query::new(terms, MatchOptions::default(), Combine::All)
+                .and_then(|q| q.compile())
+                .expect("query valida"),
+            filters: Filters::default(),
+            limits: Limits::default(),
+        }
+    }
+
+    /// Un archivio con due voci: `a.txt` ha 20 righe "carta" e poi "zeta", `b.txt` solo
+    /// "carta"; più un avviso.
+    fn archive() -> Vec<ExtractEvent> {
+        let line = |n: u32, text: &str| {
+            ExtractEvent::Unit(TextUnit {
+                location: Location::Line(n),
+                text: text.to_owned(),
+            })
+        };
+        let start = |name: &str| ExtractEvent::DocumentStart {
+            inner: vec![name.to_owned()],
+            format: Format::Text,
+        };
+        let mut events = vec![start("a.txt")];
+        events.extend((1..=20).map(|n| line(n, "carta")));
+        events.push(line(21, "zeta"));
+        events.push(ExtractEvent::DocumentEnd);
+        events.push(start("b.txt"));
+        events.push(line(1, "carta"));
+        events.push(ExtractEvent::DocumentEnd);
+        events.push(ExtractEvent::Warning {
+            inner: vec!["c.pdf".to_owned()],
+            kind: lynkeus_extract::WarningKind::Corrupt,
+        });
+        events
+    }
+
+    /// Senza posti per trattenere (altri documenti li occupano) la voce con tutti i termini
+    /// si segna da rileggere e non consegna nulla; la seconda lettura consegna solo lei, per
+    /// intero, senza ripetere gli avvisi.
+    #[test]
+    fn documents_without_places_are_reread() {
+        let request = request(&["ar", "zeta"]);
+        let progress = Progress::default();
+        let held = HeldHits::new(10);
+        let path = Path::new("archivio.zip");
+        let mut first = Collect::default();
+        let rereads = {
+            let mut search =
+                DocSearch::new(&request, &progress, &held, &mut first, path, 0, Pass::First);
+            for event in archive() {
+                assert!(search.emit(event).is_ok());
+            }
+            search.take_rereads()
+        };
+        assert_eq!(rereads, [vec!["a.txt".to_owned()]]);
+        assert!(first.hits.is_empty());
+        assert_eq!(first.warnings, [WarningKind::Corrupt]);
+
+        let mut second = Collect::default();
+        let mut search = DocSearch::new(
+            &request,
+            &progress,
+            &held,
+            &mut second,
+            path,
+            0,
+            Pass::Reread(&rereads),
+        );
+        for event in archive() {
+            assert!(search.emit(event).is_ok());
+        }
+        assert!(search.take_rereads().is_empty());
+        drop(search);
+        assert_eq!(second.hits.len(), 21);
+        assert!(second.hits.iter().all(|h| h.doc.inner == ["a.txt"]));
+        assert!(second.warnings.is_empty());
     }
 }

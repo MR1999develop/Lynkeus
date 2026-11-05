@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Copyright (C) 2026 MR
 
-//! Eventi che il worker manda al chiamante: risultati, avvisi, fine.
+//! Eventi che il worker manda al chiamante (risultati, avvisi, fine) e l'avviso che ne
+//! segue ([`Notify`]).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,6 +12,11 @@ use lynkeus_extract::{ExtractError, LimitKind};
 
 use crate::doc::DocPath;
 use crate::progress::ProgressSnapshot;
+
+/// Funzione chiamata dal worker dopo ogni evento inviato (es. `ctx.request_repaint()`).
+///
+/// Deve essere veloce e non bloccarsi: gira sul thread del worker.
+pub type Notify = Arc<dyn Fn() + Send + Sync>;
 
 /// Una riga dei risultati: una parola che contiene almeno un termine.
 #[derive(Debug, Clone, PartialEq, Eq)]
