@@ -17,7 +17,7 @@ Esempio: cercando `ar` si ottiene "aragosta" nel file X, "carta" nel file Y, "ch
 
 ## Uso dei risultati
 
-- **Apri**: doppio clic su una riga o Invio apre il file con il programma predefinito del sistema. I programmi e gli script (per esempio `.exe`, `.bat`, `.ps1`, `.sh`) non vengono mai aperti da qui: si può solo mostrarli nella cartella. **Mostra nella cartella**: Ctrl+Maiusc+R o clic destro.
+- **Apri**: doppio clic su una riga o Invio apre il file con il programma predefinito del sistema. Funziona anche per le voci dentro un archivio, di qualsiasi formato (per esempio un PDF dentro uno zip): il programma le estrae in una cartella temporanea privata, svuotata all'avvio e all'uscita, e le apre da lì. Per un capitolo di un EPUB si apre il libro. Se più voci di un archivio hanno lo stesso nome, compaiono come "nome (2).ext", "nome (3).ext". I programmi e gli script (per esempio `.exe`, `.bat`, `.cmd`, `.ps1`, `.vbs`, `.js`, `.lnk`, `.msi`, `.jar`, `.sh`, `.py`; l'elenco completo è largo di proposito) non vengono mai aperti da qui: si può solo mostrarli nella cartella. **Mostra nella cartella**: Ctrl+Maiusc+R o clic destro.
 - **Anteprima**: sotto la tabella, mostra le righe intorno al risultato con le corrispondenze evidenziate; per i documenti e gli archivi mostra le unità di testo vicine (paragrafi, celle, righe di pagina) fino a 20 prima e 20 dopo il risultato. Ctrl+3 la mostra o la nasconde; l'altezza si può cambiare e viene ricordata.
 - **Esporta**: Ctrl+E salva le righe mostrate o solo quelle selezionate in CSV (UTF-8; separatore `;` in italiano, `,` in inglese) o in TXT tabulato. Le celle che inizierebbero come una formula (`=`, `+`, `-`, `@`) ricevono un apostrofo davanti, così il foglio di calcolo non le esegue.
 - **Copia**: Ctrl+C copia le righe selezionate come testo con colonne separate da tabulazioni, pronto da incollare in un foglio di calcolo.
@@ -52,7 +52,7 @@ Sono letti anche i file `.tgz`/`.tar.gz`. Le e-mail (EML) sono lette con i loro 
 - Dei file .doc si estrae il testo principale: note, intestazioni e piè di pagina, commenti e caselle di testo non si leggono; Word 6 e 95 non sono supportati (avviso "danneggiato").
 - Dei file .ppt si estrae il testo delle diapositive: note del relatore, schemi, commenti e oggetti incorporati (grafici, tabelle) non si leggono.
 - I file .rar non sono supportati.
-- Una voce di archivio che è un documento (per esempio un PDF dentro uno zip) si trova e si vede nell'anteprima, ma per ora non si può aprire dal programma; le voci di testo sì.
+- Una voce di archivio molto grande (oltre il limite per voce, 512 MiB predefiniti) non si legge né si apre.
 - I file protetti da password o danneggiati, e quelli che superano i limiti di tempo o di dimensione (anche degli archivi), non vengono letti: compaiono nella scheda Avvisi con il loro motivo.
 - Il numero di risultati è limitato (200.000 per impostazione predefinita); al limite la ricerca si ferma e un avviso invita a restringerla.
 - I file presenti solo online (per esempio in OneDrive) sono saltati per non scaricarli, salvo diversa scelta.
