@@ -7,6 +7,14 @@
 //! Le righe restano nel `Vec<Hit>` nell'ordine d'arrivo; [`ResultsView`] tiene solo la
 //! permutazione mostrata e la selezione per indice di risultato, così un riordino non
 //! perde la selezione.
+//!
+//! Senza un ordinamento scelto le righe arrivano in coda e a fine ricerca si ordinano per
+//! File → Posizione; con un ordinamento scelto ogni riga entra subito al suo posto (a
+//! parità resta l'ordine d'arrivo, come nell'ordinamento completo).
+//!
+//! Gli indici per documento e per gruppo di righe consecutive dello stesso documento si
+//! aggiornano a ogni cambio dell'ordine: posizione del cursore e passi tra i risultati
+//! ([`ResultsView::step_target`]) costano O(1), anche con 200 000 righe.
 
 use std::cmp::{Ordering, Reverse};
 use std::collections::HashMap;
@@ -51,7 +59,7 @@ pub struct SortSpec {
 
 impl SortSpec {
     /// Ordinamento crescente su `column`.
-    pub fn ascending(column: SortColumn) -> SortSpec {
+    pub const fn ascending(column: SortColumn) -> SortSpec {
         SortSpec {
             column,
             order: SortOrder::Ascending,
@@ -98,19 +106,19 @@ pub enum Step {
     PreviousFile,
 }
 
-/// Vero se le due righe sono dello stesso documento (le righe di un file condividono lo
-/// stesso `Arc`: il confronto per puntatore basta quasi sempre).
-fn same_doc(a: &Arc<DocPath>, b: &Arc<DocPath>) -> bool {
-    Arc::ptr_eq(a, b) || a == b
-}
-
 /// Ordine mostrato e selezione delle righe.
 #[derive(Debug, Clone, Default)]
 pub struct ResultsView {
     /// Posizione mostrata → indice del risultato.
     order: Vec<usize>,
+    /// Indice del risultato → posizione mostrata (l'inversa di `order`).
+    position_of: Vec<usize>,
     /// Ordinamento scelto dall'utente; `None` = ordine predefinito.
     sort: Option<SortSpec>,
+    /// I documenti dei risultati.
+    docs: DocIndex,
+    /// I gruppi di righe dello stesso documento nell'ordine mostrato.
+    groups: GroupIndex,
     /// Selezione per indice del risultato.
     selected: Vec<bool>,
     selected_count: usize,
@@ -120,6 +128,9 @@ pub struct ResultsView {
     cursor: Option<usize>,
     /// Vero se il cursore è appena cambiato: la tabella lo porta in vista una volta.
     scroll_pending: bool,
+    /// Vero se la riga del cursore deve prendere il focus della tastiera (dopo un clic o
+    /// una freccia), finché la tabella non la disegna.
+    focus_pending: bool,
 }
 
 impl ResultsView {
@@ -136,29 +147,51 @@ impl ResultsView {
         *self = ResultsView::new(self.sort);
     }
 
-    /// Aggiunge in fondo i risultati arrivati, fino a `hit_count` in tutto.
-    pub fn extend_to(&mut self, hit_count: usize) {
-        let start = self.order.len();
-        if hit_count > start {
-            self.order.extend(start..hit_count);
-            self.selected.resize(hit_count, false);
+    /// Mostra i risultati arrivati dopo quelli già mostrati (`hits` sono tutti i risultati
+    /// della ricerca, nell'ordine d'arrivo): in coda senza un ordinamento scelto, al loro
+    /// posto con un ordinamento scelto.
+    pub fn extend_to(&mut self, hits: &[Hit], roots: &[PathBuf]) {
+        let known = self.position_of.len();
+        if hits.len() <= known {
+            return;
+        }
+        self.docs.extend(hits, roots);
+        self.selected.resize(hits.len(), false);
+        self.position_of.resize(hits.len(), 0);
+        match self.sort {
+            None => {
+                let first_new = self.order.len();
+                for hit in known..hits.len() {
+                    self.position_of[hit] = self.order.len();
+                    self.order.push(hit);
+                }
+                self.groups.append(&self.order, first_new, &self.docs);
+            }
+            Some(spec) => {
+                insert_sorted(&mut self.order, known..hits.len(), spec, hits, &self.docs);
+                self.reindex();
+            }
         }
     }
 
-    /// A fine ricerca: ordine dell'utente se scelto, altrimenti File → Posizione.
+    /// A fine ricerca: ordine dell'utente se scelto (già applicato), altrimenti File →
+    /// Posizione; se le righe si spostano, la riga del cursore torna in vista.
     pub fn finish(&mut self, hits: &[Hit], roots: &[PathBuf]) {
-        self.extend_to(hits.len());
-        let spec = self
-            .sort
-            .unwrap_or_else(|| SortSpec::ascending(SortColumn::File));
-        sort_order(&mut self.order, spec, hits, roots);
+        self.extend_to(hits, roots);
+        if self.sort.is_none() {
+            let spec = SortSpec::ascending(SortColumn::File);
+            sort_order(&mut self.order, spec, hits, &self.docs);
+            self.reindex();
+            self.scroll_pending = self.cursor.is_some();
+        }
     }
 
     /// Ordina per scelta dell'utente (clic su un'intestazione).
     pub fn set_sort(&mut self, spec: SortSpec, hits: &[Hit], roots: &[PathBuf]) {
+        self.extend_to(hits, roots);
         self.sort = Some(spec);
-        self.extend_to(hits.len());
-        sort_order(&mut self.order, spec, hits, roots);
+        sort_order(&mut self.order, spec, hits, &self.docs);
+        self.reindex();
         self.scroll_pending = self.cursor.is_some();
     }
 
@@ -200,34 +233,21 @@ impl ResultsView {
             .filter(|&hit| self.is_selected(hit))
     }
 
-    /// Clic sulla riga in posizione `position`.
+    /// Clic sulla riga in posizione `position`: cambia la selezione, porta lì il cursore e
+    /// chiede il focus della tastiera per quella riga.
     pub fn click(&mut self, position: usize, kind: ClickKind) {
-        let Some(hit) = self.hit_at(position) else {
-            return;
-        };
-        match kind {
-            ClickKind::Replace => {
-                self.clear_selection();
-                self.set_selected(hit, true);
-                self.anchor = Some(hit);
-            }
-            ClickKind::Toggle => {
-                let now = !self.is_selected(hit);
-                self.set_selected(hit, now);
-                self.anchor = Some(hit);
-            }
-            ClickKind::Range => self.select_range_to(position),
+        if self.place_cursor(position, kind) {
+            self.focus_pending = true;
         }
-        self.cursor = Some(hit);
     }
 
     /// Sposta il cursore di `delta` righe (frecce); con `extend` allarga la selezione
-    /// dall'ancora come Maiusc+clic. Senza righe non fa nulla.
+    /// dall'ancora come Maiusc+clic. La riga raggiunta va in vista e prende il focus. Senza
+    /// righe non fa nulla.
     pub fn move_cursor(&mut self, delta: isize, extend: bool) {
-        if self.order.is_empty() {
+        let Some(last) = self.order.len().checked_sub(1) else {
             return;
-        }
-        let last = self.order.len() - 1;
+        };
         let target = match self.cursor_position() {
             Some(current) => current.saturating_add_signed(delta).min(last),
             None if delta < 0 => last,
@@ -249,10 +269,10 @@ impl ResultsView {
     }
 
     /// Porta cursore e selezione sulla riga in posizione `position` e la tabella in vista
-    /// (precedente/successiva dell'anteprima). Fuori dai limiti non fa nulla.
+    /// (precedente/successiva dell'anteprima), senza togliere il focus a chi ce l'ha. Fuori
+    /// dai limiti non fa nulla.
     pub fn jump_to(&mut self, position: usize) {
-        if position < self.order.len() {
-            self.click(position, ClickKind::Replace);
+        if self.place_cursor(position, ClickKind::Replace) {
             self.scroll_pending = true;
         }
     }
@@ -266,35 +286,27 @@ impl ResultsView {
     /// - [`Step::PreviousFile`]: l'inizio del gruppo di righe consecutive del documento che
     ///   precede quello del cursore.
     ///
-    /// Tempo lineare nel numero di righe.
-    pub fn step_target(&self, hits: &[Hit], step: Step) -> Option<usize> {
+    /// Tempo costante.
+    pub fn step_target(&self, step: Step) -> Option<usize> {
         let current = self.cursor_position()?;
-        let doc_at = |position: usize| -> Option<&Arc<DocPath>> {
-            hits.get(self.hit_at(position)?).map(|hit| &hit.doc)
-        };
-        let here = doc_at(current)?;
-        let same = |position: usize| doc_at(position).is_some_and(|doc| same_doc(doc, here));
-        let mut after = current.saturating_add(1)..self.order.len();
         match step {
-            Step::NextInFile => after.find(|&p| same(p)),
-            Step::PreviousInFile => (0..current).rev().find(|&p| same(p)),
-            Step::NextFile => after.find(|&p| !same(p)),
+            Step::NextInFile => self.groups.next_same.get(current).copied().flatten(),
+            Step::PreviousInFile => self.groups.previous_same.get(current).copied().flatten(),
+            Step::NextFile => {
+                let end = self.groups.group_end(current, self.order.len())?;
+                (end < self.order.len()).then_some(end)
+            }
             Step::PreviousFile => {
-                let end = (0..current).rev().find(|&p| !same(p))?;
-                let target = doc_at(end)?;
-                let mut start = end;
-                while start > 0 && doc_at(start - 1).is_some_and(|doc| same_doc(doc, target)) {
-                    start -= 1;
-                }
-                Some(start)
+                let group = *self.groups.group_of.get(current)?;
+                let previous = group.checked_sub(1)?;
+                self.groups.group_start.get(previous).copied()
             }
         }
     }
 
     /// Posizione mostrata del cursore.
     pub fn cursor_position(&self) -> Option<usize> {
-        let cursor = self.cursor?;
-        self.order.iter().position(|&hit| hit == cursor)
+        self.position(self.cursor?)
     }
 
     /// La posizione da portare in vista, una sola volta dopo un movimento del cursore.
@@ -304,6 +316,17 @@ impl ResultsView {
         } else {
             None
         }
+    }
+
+    /// Il risultato la cui riga deve prendere il focus della tastiera, se c'è una richiesta
+    /// in sospeso (resta finché la tabella non disegna la riga: [`ResultsView::focus_done`]).
+    pub fn focus_request(&self) -> Option<usize> {
+        self.cursor.filter(|_| self.focus_pending)
+    }
+
+    /// La riga ha preso il focus: la richiesta è soddisfatta.
+    pub fn focus_done(&mut self) {
+        self.focus_pending = false;
     }
 
     /// Seleziona tutte le righe.
@@ -318,10 +341,50 @@ impl ResultsView {
         self.selected_count = 0;
     }
 
+    /// Cambia selezione e cursore come un clic su `position`; falso fuori dai limiti.
+    fn place_cursor(&mut self, position: usize, kind: ClickKind) -> bool {
+        let Some(hit) = self.hit_at(position) else {
+            return false;
+        };
+        match kind {
+            ClickKind::Replace => {
+                self.clear_selection();
+                self.set_selected(hit, true);
+                self.anchor = Some(hit);
+            }
+            ClickKind::Toggle => {
+                let now = !self.is_selected(hit);
+                self.set_selected(hit, now);
+                self.anchor = Some(hit);
+            }
+            ClickKind::Range => self.select_range_to(position),
+        }
+        self.cursor = Some(hit);
+        true
+    }
+
+    /// La posizione mostrata del risultato `hit`.
+    fn position(&self, hit: usize) -> Option<usize> {
+        self.position_of
+            .get(hit)
+            .copied()
+            .filter(|&position| self.order.get(position) == Some(&hit))
+    }
+
+    /// Ricalcola posizioni e gruppi dopo un cambio dell'ordine (tempo lineare).
+    fn reindex(&mut self) {
+        for (position, &hit) in self.order.iter().enumerate() {
+            if let Some(slot) = self.position_of.get_mut(hit) {
+                *slot = position;
+            }
+        }
+        self.groups.rebuild(&self.order, &self.docs);
+    }
+
     fn select_range_to(&mut self, position: usize) {
         let anchor_position = self
             .anchor
-            .and_then(|anchor| self.order.iter().position(|&hit| hit == anchor))
+            .and_then(|anchor| self.position(anchor))
             .unwrap_or(position);
         let (from, to) = if anchor_position <= position {
             (anchor_position, position)
@@ -352,20 +415,218 @@ impl ResultsView {
     }
 }
 
-/// Ordina la permutazione `order` (stabile: a parità resta l'ordine precedente).
+/// I documenti distinti dei risultati, nell'ordine in cui compaiono.
 ///
-/// Per File e Posizione la chiave del file (percorso relativo in minuscolo) si calcola una
-/// volta per documento, non per riga: con 200 000 righe l'ordinamento resta sotto i 50 ms
-/// (misura in `sort_200k_timing`).
-fn sort_order(order: &mut [usize], spec: SortSpec, hits: &[Hit], roots: &[PathBuf]) {
-    let descending = spec.order == SortOrder::Descending;
-    let directed = |ordering: Ordering| {
-        if descending {
-            ordering.reverse()
-        } else {
-            ordering
+/// Due risultati sono dello stesso documento se i loro [`DocPath`] sono uguali (di solito
+/// condividono anche lo stesso `Arc`). Ogni file si legge da una sola radice: la chiave di
+/// ordinamento del documento usa la radice del suo primo risultato.
+#[derive(Debug, Clone, Default)]
+struct DocIndex {
+    /// Indice del risultato → indice del documento.
+    doc_of_hit: Vec<usize>,
+    /// Documento (per valore) → indice.
+    index_of: HashMap<Arc<DocPath>, usize>,
+    /// Indirizzo dell'`Arc` → indice: evita l'hash del percorso per le righe che
+    /// condividono l'`Arc` del loro file. L'`Arc` conservato tiene valido l'indirizzo.
+    by_pointer: HashMap<usize, (Arc<DocPath>, usize)>,
+    /// Per documento: radice, poi percorso relativo in minuscolo (chiave di File e
+    /// Posizione), calcolata una volta per documento.
+    keys: Vec<(usize, String)>,
+}
+
+impl DocIndex {
+    /// Registra i documenti dei risultati non ancora visti.
+    fn extend(&mut self, hits: &[Hit], roots: &[PathBuf]) {
+        let first = self.doc_of_hit.len();
+        for (index, hit) in hits.iter().enumerate().skip(first) {
+            // Le righe di un file arrivano di solito insieme e con lo stesso `Arc`: il
+            // confronto per puntatore evita di calcolare l'hash del percorso.
+            let same_as_previous = index
+                .checked_sub(1)
+                .and_then(|previous| Some((hits.get(previous)?, self.of(previous)?)))
+                .filter(|(previous, _)| Arc::ptr_eq(&previous.doc, &hit.doc))
+                .map(|(_, doc)| doc);
+            let address = Arc::as_ptr(&hit.doc).addr();
+            let known = same_as_previous
+                .or_else(|| self.by_pointer.get(&address).map(|(_, doc)| *doc))
+                .or_else(|| self.index_of.get(&hit.doc).copied());
+            let doc = match known {
+                Some(doc) => doc,
+                None => {
+                    let doc = self.keys.len();
+                    self.index_of.insert(Arc::clone(&hit.doc), doc);
+                    self.keys.push(file_key(hit, roots));
+                    doc
+                }
+            };
+            self.by_pointer
+                .entry(address)
+                .or_insert_with(|| (Arc::clone(&hit.doc), doc));
+            self.doc_of_hit.push(doc);
         }
+    }
+
+    /// Il documento del risultato `hit`.
+    fn of(&self, hit: usize) -> Option<usize> {
+        self.doc_of_hit.get(hit).copied()
+    }
+
+    /// La chiave di ordinamento del file del risultato `hit`.
+    fn key(&self, hit: usize) -> Option<&(usize, String)> {
+        self.keys.get(self.of(hit)?)
+    }
+
+    /// Per ogni documento, il suo posto nell'ordine dei file (uguale per chiavi uguali).
+    fn ranks(&self) -> Vec<usize> {
+        let mut sorted: Vec<usize> = (0..self.keys.len()).collect();
+        sorted.sort_by(|&a, &b| self.keys[a].cmp(&self.keys[b]));
+        let mut rank_of = vec![0; self.keys.len()];
+        let mut rank = 0;
+        for (index, &doc) in sorted.iter().enumerate() {
+            if index > 0 && self.keys[sorted[index - 1]] != self.keys[doc] {
+                rank += 1;
+            }
+            rank_of[doc] = rank;
+        }
+        rank_of
+    }
+}
+
+/// Per ogni posizione mostrata: il gruppo di righe consecutive dello stesso documento e le
+/// righe precedente e successiva dello stesso documento (anche non consecutive).
+#[derive(Debug, Clone, Default)]
+struct GroupIndex {
+    /// Posizione → gruppo.
+    group_of: Vec<usize>,
+    /// Gruppo → prima posizione.
+    group_start: Vec<usize>,
+    /// Posizione → posizione precedente dello stesso documento.
+    previous_same: Vec<Option<usize>>,
+    /// Posizione → posizione successiva dello stesso documento.
+    next_same: Vec<Option<usize>>,
+    /// Documento → ultima posizione indicizzata.
+    last_of_doc: Vec<Option<usize>>,
+}
+
+impl GroupIndex {
+    /// Indicizza da capo l'ordine `order`.
+    fn rebuild(&mut self, order: &[usize], docs: &DocIndex) {
+        self.group_of.clear();
+        self.group_start.clear();
+        self.previous_same.clear();
+        self.next_same.clear();
+        self.last_of_doc.clear();
+        self.append(order, 0, docs);
+    }
+
+    /// Indicizza le posizioni da `first` in poi, aggiunte in coda a `order`.
+    fn append(&mut self, order: &[usize], first: usize, docs: &DocIndex) {
+        self.last_of_doc.resize(docs.keys.len(), None);
+        for (position, &hit) in order.iter().enumerate().skip(first) {
+            let doc = docs.of(hit);
+            let previous_doc = position
+                .checked_sub(1)
+                .and_then(|p| order.get(p))
+                .and_then(|&h| docs.of(h));
+            let group = match self.group_of.last() {
+                Some(&group) if previous_doc == doc => group,
+                _ => {
+                    self.group_start.push(position);
+                    self.group_start.len() - 1
+                }
+            };
+            self.group_of.push(group);
+            let previous_same = doc.and_then(|d| self.last_of_doc.get(d).copied().flatten());
+            if let Some(slot) = previous_same.and_then(|p| self.next_same.get_mut(p)) {
+                *slot = Some(position);
+            }
+            self.previous_same.push(previous_same);
+            self.next_same.push(None);
+            if let Some(slot) = doc.and_then(|d| self.last_of_doc.get_mut(d)) {
+                *slot = Some(position);
+            }
+        }
+    }
+
+    /// La posizione dopo l'ultima riga del gruppo di `position`.
+    fn group_end(&self, position: usize, len: usize) -> Option<usize> {
+        let group = *self.group_of.get(position)?;
+        Some(self.group_start.get(group + 1).copied().unwrap_or(len))
+    }
+}
+
+/// Il testo in minuscolo, carattere per carattere: la stessa trasformazione nelle chiavi
+/// dell'ordinamento completo e nei confronti dell'inserimento ordinato.
+fn folded(text: &str) -> impl Iterator<Item = char> + '_ {
+    text.chars().flat_map(char::to_lowercase)
+}
+
+/// Il primo termine che corrisponde (per la colonna Termine).
+fn first_term(hit: &Hit) -> usize {
+    hit.terms.iter().next().unwrap_or(usize::MAX)
+}
+
+/// Confronta i risultati `a` e `b` secondo `spec`: la stessa relazione di
+/// [`sort_order`], senza allocare.
+fn compare(spec: SortSpec, hits: &[Hit], docs: &DocIndex, a: usize, b: usize) -> Ordering {
+    let (Some(first), Some(second)) = (hits.get(a), hits.get(b)) else {
+        return hits.get(a).is_some().cmp(&hits.get(b).is_some());
     };
+    let by_file = || docs.key(a).cmp(&docs.key(b));
+    let ordering = match spec.column {
+        SortColumn::Word => folded(&first.word).cmp(folded(&second.word)),
+        SortColumn::Term => first_term(first).cmp(&first_term(second)),
+        SortColumn::Context => folded(&first.snippet.text).cmp(folded(&second.snippet.text)),
+        SortColumn::File => by_file().then_with(|| first.location.cmp(&second.location)),
+        SortColumn::Position => first.location.cmp(&second.location).then_with(by_file),
+    };
+    match spec.order {
+        SortOrder::Ascending => ordering,
+        SortOrder::Descending => ordering.reverse(),
+    }
+}
+
+/// Inserisce i risultati `incoming` in `order`, già ordinato secondo `spec`: ognuno dopo
+/// le righe uguali già presenti, così a parità resta l'ordine d'arrivo.
+///
+/// Costo: ordinamento dei nuovi (con le chiavi in cache se sono le prime righe, quindi
+/// tante), una ricerca binaria per ognuno, una copia di `order`.
+fn insert_sorted(
+    order: &mut Vec<usize>,
+    incoming: std::ops::Range<usize>,
+    spec: SortSpec,
+    hits: &[Hit],
+    docs: &DocIndex,
+) {
+    let mut incoming: Vec<usize> = incoming.collect();
+    if order.is_empty() {
+        sort_order(&mut incoming, spec, hits, docs);
+        *order = incoming;
+        return;
+    }
+    let compare = |a: usize, b: usize| compare(spec, hits, docs, a, b);
+    incoming.sort_by(|&a, &b| compare(a, b));
+    let mut merged = Vec::with_capacity(order.len() + incoming.len());
+    let mut rest: &[usize] = order;
+    for hit in incoming {
+        let at = rest.partition_point(|&existing| compare(existing, hit) != Ordering::Greater);
+        let (before, after) = rest.split_at(at);
+        merged.extend_from_slice(before);
+        merged.push(hit);
+        rest = after;
+    }
+    merged.extend_from_slice(rest);
+    *order = merged;
+}
+
+/// Ordina la permutazione `order` (stabile: a parità resta l'ordine precedente). È la
+/// stessa relazione di [`compare`], con le chiavi calcolate una volta per riga.
+///
+/// Per File e Posizione la chiave del file si calcola una volta per documento, non per
+/// riga: con 200 000 righe l'ordinamento resta sotto i 50 ms (misura in
+/// `sort_200k_timing`).
+fn sort_order(order: &mut [usize], spec: SortSpec, hits: &[Hit], docs: &DocIndex) {
+    let descending = spec.order == SortOrder::Descending;
     macro_rules! by_key {
         ($key:expr) => {{
             let key = $key;
@@ -377,57 +638,30 @@ fn sort_order(order: &mut [usize], spec: SortSpec, hits: &[Hit], roots: &[PathBu
         }};
     }
     match spec.column {
-        SortColumn::Word => by_key!(|hit: &Hit| hit.word.to_lowercase()),
-        SortColumn::Term => by_key!(|hit: &Hit| hit.terms.iter().next().unwrap_or(usize::MAX)),
-        SortColumn::Context => by_key!(|hit: &Hit| hit.snippet.text.to_lowercase()),
+        SortColumn::Word => by_key!(|hit: &Hit| folded(&hit.word).collect::<String>()),
+        SortColumn::Term => by_key!(first_term),
+        SortColumn::Context => by_key!(|hit: &Hit| folded(&hit.snippet.text).collect::<String>()),
         SortColumn::File | SortColumn::Position => {
-            let ranks = file_ranks(hits, roots);
-            let file = |i: usize| ranks.get(i).copied();
+            let ranks = docs.ranks();
+            let file = |i: usize| docs.of(i).and_then(|doc| ranks.get(doc).copied());
             let location = |i: usize| hits.get(i).map(|hit| &hit.location);
             let file_first = spec.column == SortColumn::File;
             order.sort_by(|&a, &b| {
                 let by_file = file(a).cmp(&file(b));
                 let by_location = location(a).cmp(&location(b));
-                directed(if file_first {
+                let ordering = if file_first {
                     by_file.then(by_location)
                 } else {
                     by_location.then(by_file)
-                })
+                };
+                if descending {
+                    ordering.reverse()
+                } else {
+                    ordering
+                }
             });
         }
     }
-}
-
-/// Per ogni riga, il posto del suo file nell'ordine dei file: radice, poi percorso
-/// relativo in minuscolo. Righe dello stesso file hanno lo stesso posto.
-///
-/// La chiave testuale si calcola una volta per documento (le righe di un file condividono
-/// lo stesso `Arc<DocPath>`), poi si ordinano solo i documenti distinti.
-fn file_ranks(hits: &[Hit], roots: &[PathBuf]) -> Vec<usize> {
-    let mut slot_of: HashMap<(*const DocPath, usize), usize> = HashMap::new();
-    let mut keys: Vec<(usize, String)> = Vec::new();
-    let slots: Vec<usize> = hits
-        .iter()
-        .map(|hit| {
-            *slot_of
-                .entry((Arc::as_ptr(&hit.doc), hit.root))
-                .or_insert_with(|| {
-                    keys.push(file_key(hit, roots));
-                    keys.len() - 1
-                })
-        })
-        .collect();
-    let mut sorted: Vec<usize> = (0..keys.len()).collect();
-    sorted.sort_by(|&a, &b| keys[a].cmp(&keys[b]));
-    let mut rank_of_slot = vec![0; keys.len()];
-    let mut rank = 0;
-    for (position, &slot) in sorted.iter().enumerate() {
-        if position > 0 && keys[sorted[position - 1]] != keys[slot] {
-            rank += 1;
-        }
-        rank_of_slot[slot] = rank;
-    }
-    slots.into_iter().map(|slot| rank_of_slot[slot]).collect()
 }
 
 /// Chiave del file di una riga: la radice, poi il percorso relativo in minuscolo.
@@ -487,7 +721,7 @@ mod tests {
     fn arrival_order_until_finished_then_file_and_position() {
         let hits = sample();
         let mut view = ResultsView::new(None);
-        view.extend_to(hits.len());
+        view.extend_to(&hits, &roots());
         assert_eq!(
             shown(&view, &hits),
             ["carta", "Aragosta", "chitarra", "mare"]
@@ -609,26 +843,22 @@ mod tests {
         let mut view = ResultsView::new(None);
         view.finish(&hits, &roots());
         // Ordine mostrato: a.txt, a.txt, b.txt, b.txt (ogni riga con un suo `Arc`).
-        assert_eq!(
-            view.step_target(&hits, Step::NextInFile),
-            None,
-            "senza cursore"
-        );
+        assert_eq!(view.step_target(Step::NextInFile), None, "senza cursore");
 
         view.jump_to(0);
         assert_eq!(view.cursor_hit(), view.hit_at(0));
         assert_eq!(view.selected_count(), 1);
         assert_eq!(view.take_scroll_target(), Some(0));
-        assert_eq!(view.step_target(&hits, Step::NextInFile), Some(1));
-        assert_eq!(view.step_target(&hits, Step::PreviousInFile), None);
-        assert_eq!(view.step_target(&hits, Step::NextFile), Some(2));
-        assert_eq!(view.step_target(&hits, Step::PreviousFile), None);
+        assert_eq!(view.step_target(Step::NextInFile), Some(1));
+        assert_eq!(view.step_target(Step::PreviousInFile), None);
+        assert_eq!(view.step_target(Step::NextFile), Some(2));
+        assert_eq!(view.step_target(Step::PreviousFile), None);
 
         view.jump_to(3);
-        assert_eq!(view.step_target(&hits, Step::PreviousInFile), Some(2));
-        assert_eq!(view.step_target(&hits, Step::NextInFile), None);
-        assert_eq!(view.step_target(&hits, Step::NextFile), None);
-        assert_eq!(view.step_target(&hits, Step::PreviousFile), Some(0));
+        assert_eq!(view.step_target(Step::PreviousInFile), Some(2));
+        assert_eq!(view.step_target(Step::NextInFile), None);
+        assert_eq!(view.step_target(Step::NextFile), None);
+        assert_eq!(view.step_target(Step::PreviousFile), Some(0));
 
         // Fuori dai limiti: nulla cambia.
         view.jump_to(9);
@@ -642,10 +872,10 @@ mod tests {
         // Per parola: Aragosta (a), carta (b), chitarra (b), mare (a).
         view.set_sort(SortSpec::ascending(SortColumn::Word), &hits, &roots());
         view.jump_to(0);
-        assert_eq!(view.step_target(&hits, Step::NextInFile), Some(3));
-        assert_eq!(view.step_target(&hits, Step::NextFile), Some(1));
+        assert_eq!(view.step_target(Step::NextInFile), Some(3));
+        assert_eq!(view.step_target(Step::NextFile), Some(1));
         view.jump_to(3);
-        assert_eq!(view.step_target(&hits, Step::PreviousFile), Some(1));
+        assert_eq!(view.step_target(Step::PreviousFile), Some(1));
     }
 
     /// 200 000 righe da 2 000 file (100 righe per file, file condivisi come nel motore),
@@ -670,6 +900,211 @@ mod tests {
             .collect()
     }
 
+    /// Il clic e le frecce portano il focus sulla riga del cursore; i passi
+    /// dell'anteprima no (il focus resta al bottone premuto).
+    #[test]
+    fn focus_follows_clicks_and_arrows_not_steps() {
+        let hits = sample();
+        let mut view = ResultsView::new(None);
+        view.finish(&hits, &roots());
+        view.jump_to(1);
+        assert_eq!(view.focus_request(), None);
+        view.click(2, ClickKind::Replace);
+        assert_eq!(view.focus_request(), view.hit_at(2));
+        view.focus_done();
+        assert_eq!(view.focus_request(), None);
+        view.move_cursor(1, false);
+        assert_eq!(view.focus_request(), view.hit_at(3));
+    }
+
+    /// Il passo calcolato scorrendo le righe, come faceva la prima versione: l'oracolo per
+    /// gli indici.
+    fn naive_step(view: &ResultsView, hits: &[Hit], step: Step) -> Option<usize> {
+        let current = view.cursor_position()?;
+        let doc_at =
+            |position: usize| -> Option<&DocPath> { Some(&hits.get(view.hit_at(position)?)?.doc) };
+        let here = doc_at(current)?;
+        let same = |position: usize| doc_at(position) == Some(here);
+        let mut after = current + 1..view.len();
+        match step {
+            Step::NextInFile => after.find(|&p| same(p)),
+            Step::PreviousInFile => (0..current).rev().find(|&p| same(p)),
+            Step::NextFile => after.find(|&p| !same(p)),
+            Step::PreviousFile => {
+                let end = (0..current).rev().find(|&p| !same(p))?;
+                let target = doc_at(end)?;
+                let mut start = end;
+                while start > 0 && doc_at(start - 1) == Some(target) {
+                    start -= 1;
+                }
+                Some(start)
+            }
+        }
+    }
+
+    /// Righe generate: poche parole e pochi file, così ci sono molte parità. Ogni riga ha
+    /// il suo `Arc`, come quando lo stesso file arriva da due lotti diversi.
+    fn generated(rows: &[(u8, u8, u8)]) -> Vec<Hit> {
+        rows.iter()
+            .map(|&(file, line, word)| {
+                let words = ["ar", "Ar", "carta", "Città", "città", "mare"];
+                let word = words[usize::from(word) % words.len()];
+                hit(&format!("f{}.txt", file % 5), u32::from(line % 7), word)
+            })
+            .collect()
+    }
+
+    const ALL_SPECS: [SortSpec; 10] = {
+        let columns = [
+            SortColumn::Word,
+            SortColumn::Term,
+            SortColumn::File,
+            SortColumn::Position,
+            SortColumn::Context,
+        ];
+        let mut specs = [SortSpec::ascending(SortColumn::Word); 10];
+        let mut i = 0;
+        while i < 5 {
+            specs[2 * i] = SortSpec {
+                column: columns[i],
+                order: SortOrder::Ascending,
+            };
+            specs[2 * i + 1] = SortSpec {
+                column: columns[i],
+                order: SortOrder::Descending,
+            };
+            i += 1;
+        }
+        specs
+    };
+
+    proptest::proptest! {
+        /// Inserire le righe al loro posto man mano che arrivano dà lo stesso ordine
+        /// dell'ordinamento completo a fine ricerca, parità comprese.
+        #[test]
+        fn incremental_insertion_equals_a_full_sort(
+            rows in proptest::collection::vec((0u8..8, 0u8..10, 0u8..6), 0..40),
+            cuts in proptest::collection::vec(0usize..40, 0..6),
+            spec_index in 0usize..10,
+        ) {
+            let hits = generated(&rows);
+            let spec = ALL_SPECS[spec_index];
+            let mut incremental = ResultsView::new(Some(spec));
+            let mut cuts: Vec<usize> = cuts.into_iter().map(|c| c.min(hits.len())).collect();
+            cuts.sort_unstable();
+            for cut in cuts {
+                incremental.extend_to(&hits[..cut], &roots());
+            }
+            incremental.finish(&hits, &roots());
+            let mut full = ResultsView::new(None);
+            full.extend_to(&hits, &roots());
+            full.set_sort(spec, &hits, &roots());
+            proptest::prop_assert_eq!(&incremental.order, &full.order);
+        }
+
+        /// I passi con gli indici coincidono con quelli calcolati scorrendo le righe, in
+        /// ogni ordinamento e da ogni riga.
+        #[test]
+        fn indexed_steps_equal_the_naive_ones(
+            rows in proptest::collection::vec((0u8..8, 0u8..10, 0u8..6), 1..30),
+            spec_index in 0usize..11,
+            arrival_only in proptest::bool::ANY,
+        ) {
+            let hits = generated(&rows);
+            let mut view = ResultsView::new(None);
+            if arrival_only {
+                view.extend_to(&hits, &roots());
+            } else if let Some(spec) = ALL_SPECS.get(spec_index) {
+                view.set_sort(*spec, &hits, &roots());
+            } else {
+                view.finish(&hits, &roots());
+            }
+            for position in 0..view.len() {
+                view.jump_to(position);
+                for step in [Step::NextInFile, Step::PreviousInFile, Step::NextFile, Step::PreviousFile] {
+                    proptest::prop_assert_eq!(
+                        view.step_target(step),
+                        naive_step(&view, &hits, step),
+                        "{:?} da {}", step, position
+                    );
+                }
+            }
+        }
+    }
+
+    /// C-17: con un ordinamento scelto, le righe che arrivano durante la ricerca entrano al
+    /// loro posto, non in coda.
+    #[test]
+    fn rows_arriving_during_a_search_take_their_sorted_place() {
+        let hits = vec![
+            hit("b.txt", 3, "carta"),
+            hit("a.txt", 2, "mare"),
+            hit("a.txt", 9, "Aragosta"),
+            hit("b.txt", 1, "chitarra"),
+        ];
+        let mut view = ResultsView::new(None);
+        view.extend_to(&hits[..2], &roots());
+        view.set_sort(SortSpec::ascending(SortColumn::Word), &hits[..2], &roots());
+        assert_eq!(shown(&view, &hits), ["carta", "mare"]);
+        view.extend_to(&hits, &roots());
+        assert_eq!(
+            shown(&view, &hits),
+            ["Aragosta", "carta", "chitarra", "mare"]
+        );
+    }
+
+    /// C-17: il riordino di fine ricerca riporta in vista la riga del cursore.
+    #[test]
+    fn finish_brings_the_cursor_row_back_into_view() {
+        let hits = sample();
+        let mut view = ResultsView::new(None);
+        view.extend_to(&hits, &roots());
+        view.click(0, ClickKind::Replace);
+        view.take_scroll_target();
+        view.finish(&hits, &roots());
+        assert_eq!(
+            view.take_scroll_target(),
+            Some(3),
+            "\"carta\" è ora l'ultima"
+        );
+    }
+
+    /// C-08, misura P-07: `cargo test --release -p lynkeus-app --lib step_target_200k --
+    /// --ignored --nocapture`. Obiettivo: meno di 1 ms per chiamata.
+    #[test]
+    #[ignore = "misura di prestazioni, da eseguire in release"]
+    fn step_target_200k() {
+        let hits = many_hits();
+        let steps = [
+            Step::NextInFile,
+            Step::PreviousInFile,
+            Step::NextFile,
+            Step::PreviousFile,
+        ];
+        // Righe per file (ordine predefinito) e sparse (per parola), con il cursore
+        // all'inizio, a metà e in fondo: i casi peggiori di una ricerca per scorrimento.
+        for sort in [None, Some(SortSpec::ascending(SortColumn::Word))] {
+            let mut view = ResultsView::new(sort);
+            view.finish(&hits, &roots());
+            for position in [0, hits.len() / 2, hits.len() - 1] {
+                view.jump_to(position);
+                const CALLS: u32 = 50;
+                let started = std::time::Instant::now();
+                for _ in 0..CALLS {
+                    for step in steps {
+                        std::hint::black_box(view.step_target(std::hint::black_box(step)));
+                    }
+                }
+                let per_call = started.elapsed() / (CALLS * 4);
+                println!("step_target {sort:?} da {position}: {per_call:?} per chiamata");
+                assert!(
+                    per_call < std::time::Duration::from_millis(1),
+                    "{per_call:?}"
+                );
+            }
+        }
+    }
+
     /// Misura dell'ordinamento finale: `cargo test --release -p lynkeus-app --lib
     /// sort_200k -- --ignored --nocapture`. Obiettivo: meno di ~50 ms per colonna.
     #[test]
@@ -687,6 +1122,21 @@ mod tests {
             let started = std::time::Instant::now();
             view.finish(&hits, &roots());
             println!("{column:?}: {:?}", started.elapsed());
+
+            // Durante la ricerca, con l'ordinamento scelto: righe inserite al loro posto a
+            // lotti come quelli di un frame (`MAX_HITS_PER_FRAME`).
+            let mut streaming = ResultsView::new(Some(SortSpec::ascending(column)));
+            let mut slowest = std::time::Duration::ZERO;
+            for end in (5_000..=hits.len()).step_by(5_000) {
+                let batch = std::time::Instant::now();
+                streaming.extend_to(&hits[..end], &roots());
+                slowest = slowest.max(batch.elapsed());
+            }
+            println!("{column:?}, a lotti di 5000: al massimo {slowest:?} per lotto");
+            assert!(
+                slowest < std::time::Duration::from_millis(50),
+                "{column:?}: {slowest:?}"
+            );
         }
     }
 }

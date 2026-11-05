@@ -10,11 +10,16 @@
 //! Il worker si svuota in [`eframe::App::logic`], che gira anche a finestra nascosta, con
 //! un limite di righe per frame; si ridisegna solo su richiesta (eventi del worker, timer
 //! dello stato durante la ricerca, input).
+//!
+//! Nulla di lento sul thread dell'interfaccia: i dialoghi di sistema si aprono in un thread
+//! (la finestra continua a ridisegnarsi e la ricerca a ricevere righe), la copia e il
+//! salvataggio delle impostazioni li prepara l'app in un thread.
 
 mod commands;
 mod export_dialog;
 mod menu;
 mod notice;
+mod panes;
 mod preview;
 mod search_panel;
 mod status;
@@ -22,15 +27,17 @@ mod table;
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::mpsc;
+use std::thread;
 use std::time::Duration;
 
 use egui::{Align2, Id, RichText, Ui};
 use lynkeus_engine::{DocPath, Notify};
 
-use crate::app::{Application, MAX_HITS_PER_FRAME, Notice, Pump, Tab};
+use crate::app::{Application, FileChoice, MAX_HITS_PER_FRAME, Notice, Pump, Tab};
 use crate::diagnostics::LogLevel;
 use crate::export::ExportFormat;
-use crate::form::RootKind;
+use crate::form::{FormField, RootKind};
 use crate::i18n::Language;
 use crate::results::{ClickKind, SortColumn};
 use crate::settings::LayoutSettings;
@@ -62,6 +69,7 @@ pub(crate) enum Action {
     SetLogLevel(LogLevel),
     ClearCache,
     ResetFilters,
+    UndoFiltersReset,
     DismissNotice,
     Reveal(Arc<DocPath>),
     /// Chiude il dialogo delle impostazioni di esportazione; con `true` le applica ed
@@ -75,19 +83,22 @@ fn repaint(ctx: &egui::Context) -> Notify {
     Arc::new(move || ctx.request_repaint())
 }
 
-/// Prepara il contesto: font, token del tema, preferenza Sistema/Chiaro/Scuro. Da chiamare
-/// una volta alla creazione della finestra (anche nei test dell'interfaccia).
+/// Prepara il contesto: font, token del tema (o quelli del contrasto elevato del sistema,
+/// se [`Application::set_system_contrast`] li ha dati), preferenza Sistema/Chiaro/Scuro. Da
+/// chiamare una volta alla creazione della finestra (anche nei test dell'interfaccia).
 pub fn setup_context(ctx: &egui::Context, app: &Application) {
     crate::platform::install_fonts(ctx);
-    theme::apply(ctx, app.theme());
+    theme::apply(ctx, app.theme(), app.system_contrast());
 }
 
 impl eframe::App for Application {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if !self.has_root_check_waker() {
             self.set_root_check_waker(repaint(ctx));
-            // Anche l'istanza unica, una volta sola, con lo stesso contesto.
+            // Anche l'istanza unica e i lavori senza vista, una volta sola, con lo stesso
+            // contesto.
             self.set_instance_waker(repaint(ctx));
+            self.set_waker(repaint(ctx));
         }
         self.pump_root_checks();
         if self.pump_instance() {
@@ -99,7 +110,7 @@ impl eframe::App for Application {
         if self.pump_events(MAX_HITS_PER_FRAME) == Pump::MorePending {
             ctx.request_repaint();
         }
-        if self.is_searching() {
+        if self.is_searching() || self.is_copying() {
             ctx.request_repaint_after(STATUS_REFRESH);
         }
         self.pump_actions();
@@ -107,6 +118,11 @@ impl eframe::App for Application {
     }
 
     fn ui(&mut self, ui: &mut Ui, frame: &mut eframe::Frame) {
+        if let Some(text) = self.take_clipboard_text() {
+            ui.ctx().copy_text(text);
+        }
+        // Le zone per F6 si registrano di nuovo mentre si disegnano.
+        panes::forget(ui.ctx());
         let mut actions = Vec::new();
         read_shortcuts(self, ui.ctx(), &mut actions);
         read_dropped_files(ui.ctx(), &mut actions);
@@ -139,11 +155,10 @@ impl eframe::App for Application {
     }
 
     fn save(&mut self, _storage: &mut dyn eframe::Storage) {
-        // eframe ricorda la finestra; le impostazioni vanno in settings.toml. Un errore
-        // non ferma l'app: riproverà al prossimo salvataggio.
-        if let Err(error) = self.save_settings() {
-            tracing::warn!(%error, "impostazioni non salvate");
-        }
+        // eframe ricorda la finestra; le impostazioni vanno in settings.toml, scritte in un
+        // thread. Un errore non ferma l'app: si dice una volta e si riprova al prossimo
+        // salvataggio.
+        self.save_settings_in_background();
     }
 
     fn on_exit(&mut self) {
@@ -162,15 +177,20 @@ impl eframe::App for Application {
 
 /// Le scorciatoie, lette una volta per frame nell'ordine di [`Command::SHORTCUT_ORDER`].
 ///
-/// Con un dialogo aperto nessuna: Invio ed Esc sono del dialogo. Invio apre il risultato
-/// solo se nessun controllo ha il focus (altrimenti attiva quel controllo). Ctrl+C arriva
-/// da eframe come evento "copia", non come tasto.
+/// Con un dialogo aperto nessuna: Invio ed Esc sono del dialogo. Con un menu o un popup
+/// aperto Esc e Invio restano a lui (Esc lo chiude, la ricerca continua). Invio apre il
+/// risultato dalla riga con il focus o se nessun controllo ha il focus (altrimenti attiva
+/// quel controllo). Ctrl+C arriva da eframe come evento "copia", non come tasto. Le frecce
+/// muovono il cursore della tabella dalla riga con il focus, o se nessun controllo ce l'ha.
 fn read_shortcuts(app: &Application, ctx: &egui::Context, actions: &mut Vec<Action>) {
     if app.view_state.export_dialog.is_some() || app.view_state.about_open {
         return;
     }
-    let typing = ctx.egui_wants_keyboard_input();
-    let focused = ctx.memory(|m| m.focused().is_some());
+    let typing = ctx.text_edit_focused();
+    let popup_open = egui::Popup::is_any_open(ctx);
+    let focused = ctx.memory(egui::Memory::focused);
+    let row_focused = focused.is_some() && focused == table::cursor_row_id(app);
+    let other_focused = focused.is_some() && !row_focused;
     for command in Command::SHORTCUT_ORDER {
         let Some(shortcut) = command.shortcut() else {
             continue;
@@ -178,7 +198,10 @@ fn read_shortcuts(app: &Application, ctx: &egui::Context, actions: &mut Vec<Acti
         if typing && command.yields_to_text_fields() {
             continue;
         }
-        if focused && command == Command::Open {
+        if popup_open && command.yields_to_popups() {
+            continue;
+        }
+        if other_focused && command == Command::Open {
             continue;
         }
         if command.availability(app).is_err() {
@@ -192,8 +215,8 @@ fn read_shortcuts(app: &Application, ctx: &egui::Context, actions: &mut Vec<Acti
             actions.push(Action::Command(command));
         }
     }
-    // Frecce nella tabella, quando nessun campo ha il focus.
-    if !typing && app.view_state.tab == Tab::Results && !app.view().is_empty() {
+    let table_keys = !typing && !popup_open && !other_focused;
+    if table_keys && app.view_state.tab == Tab::Results && !app.view().is_empty() {
         let (down, up, shift) = ctx.input(|i| {
             (
                 i.key_pressed(egui::Key::ArrowDown),
@@ -370,7 +393,8 @@ fn apply(app: &mut Application, ctx: &egui::Context, frame: &eframe::Frame, acti
         Action::ClearCache => app.clear_cache(&repaint(ctx)),
         Action::SetContextMenu(enabled) => app.set_context_menu(enabled, &repaint(ctx)),
         Action::SetLogLevel(level) => app.set_log_level(level),
-        Action::ResetFilters => app.form.filters.reset(),
+        Action::ResetFilters => app.reset_filters(),
+        Action::UndoFiltersReset => app.undo_filters_reset(),
         Action::DismissNotice => app.dismiss_notice(),
         Action::Reveal(doc) => {
             app.dismiss_notice();
@@ -389,7 +413,7 @@ fn apply(app: &mut Application, ctx: &egui::Context, frame: &eframe::Frame, acti
 }
 
 /// Chiede dove salvare (dialogo di sistema, che conferma la sovrascrittura di un file
-/// esistente) ed esporta con le ultime scelte.
+/// esistente) ed esporta con le ultime scelte, quando l'utente ha scelto.
 fn export(app: &mut Application, ctx: &egui::Context, frame: &eframe::Frame) {
     let i18n = app.i18n();
     let settings = app.export_settings();
@@ -405,8 +429,36 @@ fn export(app: &mut Application, ctx: &egui::Context, frame: &eframe::Frame) {
     if let Some(dir) = &settings.last_dir {
         dialog = dialog.set_directory(dir);
     }
-    if let Some(path) = dialog.set_parent(frame).save_file() {
-        app.export_to(path, &repaint(ctx));
+    let dialog = dialog.set_parent(frame);
+    open_dialog(app, ctx, move || {
+        dialog.save_file().map(FileChoice::ExportTo)
+    });
+}
+
+/// Apre un dialogo di sistema in un thread: intanto la finestra si ridisegna e la ricerca
+/// continua; la scelta arriva all'app, che la applica ([`Application::wait_for_dialog`]).
+/// Un dialogo alla volta: con uno già aperto non fa nulla.
+fn open_dialog(
+    app: &mut Application,
+    ctx: &egui::Context,
+    choose: impl FnOnce() -> Option<FileChoice> + Send + 'static,
+) {
+    if app.is_dialog_open() {
+        return;
+    }
+    let (tx, rx) = mpsc::channel();
+    let ctx = ctx.clone();
+    let spawned = thread::Builder::new()
+        .name("dialogo".to_owned())
+        .spawn(move || {
+            let choice = choose();
+            if tx.send(choice).is_ok() {
+                ctx.request_repaint();
+            }
+        });
+    match spawned {
+        Ok(_) => app.wait_for_dialog(rx),
+        Err(_) => app.set_notice(Notice::NoThread),
     }
 }
 
@@ -418,16 +470,16 @@ fn run_command(
 ) {
     match command {
         Command::AddFolder => {
-            let picked = dialog(app, frame, "dialog-add-folder").pick_folders();
-            for path in picked.unwrap_or_default() {
-                app.add_root(path);
-            }
+            let dialog = dialog(app, frame, "dialog-add-folder");
+            open_dialog(app, ctx, move || {
+                dialog.pick_folders().map(FileChoice::AddRoots)
+            });
         }
         Command::AddFile => {
-            let picked = dialog(app, frame, "dialog-add-file").pick_files();
-            for path in picked.unwrap_or_default() {
-                app.add_root(path);
-            }
+            let dialog = dialog(app, frame, "dialog-add-file");
+            open_dialog(app, ctx, move || {
+                dialog.pick_files().map(FileChoice::AddRoots)
+            });
         }
         Command::Open => app.open_current(&repaint(ctx)),
         Command::Reveal => app.reveal_current(&repaint(ctx)),
@@ -435,12 +487,7 @@ fn run_command(
         Command::ExportSettings => {
             app.view_state.export_dialog = Some(app.export_settings().clone());
         }
-        Command::Copy => {
-            if let Some((tsv, rows)) = app.selection_tsv() {
-                ctx.copy_text(tsv);
-                app.set_notice(Notice::Copied { rows });
-            }
-        }
+        Command::Copy => app.copy_selection(&repaint(ctx)),
         Command::Step(step) => {
             app.step(step);
         }
@@ -452,14 +499,15 @@ fn run_command(
         Command::SelectNone => app.view_mut().clear_selection(),
         Command::FindTerms => {
             app.layout.search_panel_visible = true;
-            app.view_state.focus_first_term = true;
+            app.view_state.focus_field = Some(FormField::Term(0));
         }
         Command::AddTerm => {
             app.form.add_term();
         }
         Command::Search => {
             let ctx = ctx.clone();
-            // L'errore resta nell'app e il modulo lo mostra sotto ogni campo.
+            // L'errore resta nell'app e il modulo lo mostra sotto ogni campo; l'app riapre
+            // pannello e Filtri e chiede il focus per il primo campo da correggere.
             if app
                 .start_search(Arc::new(move || ctx.request_repaint()))
                 .is_ok()
@@ -477,6 +525,8 @@ fn run_command(
             app.layout.search_panel_visible = true;
             app.view_state.open_filters = true;
         }
+        Command::NextPane => panes::cycle_focus(ctx, false),
+        Command::PreviousPane => panes::cycle_focus(ctx, true),
         Command::About => app.view_state.about_open = true,
     }
 }

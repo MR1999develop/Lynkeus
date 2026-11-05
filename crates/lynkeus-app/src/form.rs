@@ -216,6 +216,11 @@ impl FilterForm {
     }
 }
 
+/// Vero se il testo di una riga dei termini è vuoto o fatto solo di spazi.
+fn is_blank(text: &str) -> bool {
+    text.trim().is_empty()
+}
+
 /// Le parti di un elenco di estensioni separato da virgole, punti e virgola o spazi.
 fn split_extensions(text: &str) -> impl Iterator<Item = &str> {
     text.split(|c: char| c == ',' || c == ';' || c.is_whitespace())
@@ -303,6 +308,32 @@ impl FormErrors {
             && self.query.is_none()
             && self.extensions.is_none()
     }
+
+    /// Il primo campo da correggere, nell'ordine in cui il modulo si legge (luoghi,
+    /// termini, filtri): lì va il focus quando la ricerca non parte.
+    pub fn first_field(&self) -> Option<FormField> {
+        if self.no_roots {
+            return Some(FormField::Roots);
+        }
+        if let Some(row) = self.terms.iter().position(Option::is_some) {
+            return Some(FormField::Term(row));
+        }
+        if self.query.is_some() {
+            return Some(FormField::Term(0));
+        }
+        self.extensions.as_ref().map(|_| FormField::Extensions)
+    }
+}
+
+/// Un campo del modulo, per portarci il focus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FormField {
+    /// L'elenco dei luoghi (il bottone "Aggiungi cartella…").
+    Roots,
+    /// La riga dei termini con questo indice.
+    Term(usize),
+    /// Il campo delle estensioni, nei Filtri.
+    Extensions,
 }
 
 /// Una ricerca pronta da avviare.
@@ -505,10 +536,19 @@ impl SearchForm {
         }
     }
 
-    /// L'errore attuale della riga `index`, a prescindere da quando mostrarlo.
+    /// L'errore attuale della riga `index`, a prescindere da quando mostrarlo. Una riga
+    /// vuota non è un errore se un'altra riga ha del testo: la ricerca la ignora.
     pub fn term_error(&self, index: usize) -> Option<TermError> {
         let row = self.terms.get(index)?;
+        if self.is_ignored(row) {
+            return None;
+        }
         Term::parse(&row.text, self.wildcard_mode()).err()
+    }
+
+    /// Vero se la riga è vuota e un'altra ha del testo: la ricerca la salta.
+    fn is_ignored(&self, row: &TermRow) -> bool {
+        is_blank(&row.text) && self.terms.iter().any(|other| !is_blank(&other.text))
     }
 
     /// Vero se la scelta qualsiasi/tutti i termini ha senso: almeno due righe.
@@ -550,7 +590,8 @@ impl SearchForm {
         self.filters.show_extension_error = true;
     }
 
-    /// Valida tutto il modulo: la ricerca pronta, o un errore per campo.
+    /// Valida tutto il modulo: la ricerca pronta, o un errore per campo. Le righe dei
+    /// termini vuote si ignorano se almeno una riga ha del testo.
     pub fn validate(&self) -> Result<ValidSearch, FormErrors> {
         let mut errors = FormErrors {
             no_roots: self.roots.is_empty(),
@@ -558,9 +599,17 @@ impl SearchForm {
             ..FormErrors::default()
         };
         let mut terms = Vec::with_capacity(self.terms.len());
-        for (slot, row) in errors.terms.iter_mut().zip(&self.terms) {
+        // Per ogni termine della query, la riga da cui viene (per gli errori di riga).
+        let mut row_of_term = Vec::with_capacity(self.terms.len());
+        for (index, (slot, row)) in errors.terms.iter_mut().zip(&self.terms).enumerate() {
+            if self.is_ignored(row) {
+                continue;
+            }
             match Term::parse(&row.text, self.wildcard_mode()) {
-                Ok(term) => terms.push(term),
+                Ok(term) => {
+                    terms.push(term);
+                    row_of_term.push(index);
+                }
                 Err(error) => *slot = Some(TermRowError::Invalid(error)),
             }
         }
@@ -571,7 +620,8 @@ impl SearchForm {
         if !errors.is_empty() {
             return Err(errors);
         }
-        let combine = if self.combine_enabled() {
+        // Con un solo termine "tutti" e "almeno uno" coincidono.
+        let combine = if terms.len() >= 2 {
             self.combine
         } else {
             Combine::Any
@@ -582,7 +632,8 @@ impl SearchForm {
         let query = match compiled {
             Ok(query) => query,
             Err(QueryError::TooComplex { term_index }) => {
-                if let Some(slot) = errors.terms.get_mut(term_index) {
+                let row = row_of_term.get(term_index).copied();
+                if let Some(slot) = row.and_then(|row| errors.terms.get_mut(row)) {
                     *slot = Some(TermRowError::TooComplex);
                 }
                 return Err(errors);
@@ -643,11 +694,12 @@ mod tests {
         form.filters.extensions = "txt, tar.gz".to_owned();
         let errors = form.validate().expect_err("non valido");
         assert!(errors.no_roots);
+        // La riga vuota si ignora: c'è un termine valido.
         assert_eq!(
             errors.terms,
             [
                 None,
-                Some(TermRowError::Invalid(TermError::Empty)),
+                None,
                 Some(TermRowError::Invalid(TermError::OnlyWildcards)),
             ]
         );
@@ -658,6 +710,63 @@ mod tests {
                 error: ExtensionError::InvalidChar,
             })
         );
+    }
+
+    /// T-C12 (C-16): una riga vuota accanto a una valida si ignora; se sono tutte vuote,
+    /// ognuna dice di scrivere il testo.
+    #[test]
+    fn empty_term_row_is_ignored_when_another_is_valid() {
+        let mut form = form_with(&["dati"], &["ar", "  ", "carta", ""]);
+        form.reveal_all_errors();
+        let search = form.validate().expect("le righe vuote si ignorano");
+        assert_eq!(search.terms, ["ar", "carta"]);
+        assert_eq!(
+            form.term_error(1),
+            None,
+            "nessun errore sotto la riga vuota"
+        );
+
+        // Una sola riga piena: OR/AND non conta, la ricerca usa quella.
+        let mut single = form_with(&["dati"], &["", "ar"]);
+        single.combine = Combine::All;
+        let search = single.validate().expect("valido");
+        assert_eq!(search.terms, ["ar"]);
+        assert_eq!(search.query.combine(), Combine::Any);
+
+        let all_empty = form_with(&["dati"], &["", " "]);
+        let errors = all_empty.validate().expect_err("nessun termine");
+        assert_eq!(
+            errors.terms,
+            [
+                Some(TermRowError::Invalid(TermError::Empty)),
+                Some(TermRowError::Invalid(TermError::Empty)),
+            ]
+        );
+        assert_eq!(all_empty.term_error(0), Some(TermError::Empty));
+    }
+
+    /// C-04: il primo campo da correggere, nell'ordine in cui il modulo si legge.
+    #[test]
+    fn first_field_to_fix_follows_the_reading_order() {
+        let mut form = form_with(&[], &["ar", "**"]);
+        form.filters.extension_mode = ExtensionMode::Include;
+        let errors = form.validate().expect_err("non valido");
+        assert_eq!(errors.first_field(), Some(FormField::Roots));
+
+        form.add_root(PathBuf::from("dati"), RootKind::Folder);
+        let errors = form.validate().expect_err("non valido");
+        assert_eq!(errors.first_field(), Some(FormField::Term(1)));
+
+        form.set_terms(&["ar"]);
+        let errors = form.validate().expect_err("non valido");
+        assert_eq!(errors.first_field(), Some(FormField::Extensions));
+
+        let too_many = FormErrors {
+            query: Some(QueryError::TooManyTerms { max: 1 }),
+            ..FormErrors::default()
+        };
+        assert_eq!(too_many.first_field(), Some(FormField::Term(0)));
+        assert_eq!(FormErrors::default().first_field(), None);
     }
 
     #[test]
