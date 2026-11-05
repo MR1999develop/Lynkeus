@@ -268,9 +268,19 @@ fn target_dir(root: &Path) -> PathBuf {
     std::env::var_os("CARGO_TARGET_DIR").map_or_else(|| root.join("target"), PathBuf::from)
 }
 
+/// I testi locali di questa macchina che non devono stare nei file distribuiti: il nome
+/// utente dentro un percorso, il nome del computer, la cartella utente, la cartella del
+/// progetto, `CARGO_HOME` e `RUSTUP_HOME`. Letti al momento e mai scritti: i messaggi
+/// mostrano solo le etichette. Unica fonte per i controlli di `cargo xtask dist` (eseguibile
+/// e SBOM) e per M-34 di `cargo xtask test-plan` (file dello zip).
+pub fn local_needles(root: &Path) -> Result<Vec<Needle>> {
+    Ok(Locations::detect(root)?.needles())
+}
+
 /// Percorsi e nomi locali di questa macchina, letti al momento e mai salvati.
 struct Locations {
     user_name: Option<String>,
+    computer_name: Option<String>,
     home: Option<PathBuf>,
     cargo_home: PathBuf,
     rustup_home: PathBuf,
@@ -293,6 +303,7 @@ impl Locations {
             .filter(|name| !name.is_empty());
         Ok(Self {
             user_name,
+            computer_name: computer_name(),
             home,
             cargo_home,
             rustup_home,
@@ -324,6 +335,9 @@ impl Locations {
             add("nome utente in un percorso", format!(r"\{name}\"));
             add("nome utente in un percorso", format!("/{name}/"));
         }
+        if let Some(name) = &self.computer_name {
+            add("nome del computer", name.clone());
+        }
         if let Some(home) = &self.home {
             add("cartella utente", home.display().to_string());
         }
@@ -332,6 +346,17 @@ impl Locations {
         add("RUSTUP_HOME", self.rustup_home.display().to_string());
         list
     }
+}
+
+/// Il nome del computer (`COMPUTERNAME`, `HOSTNAME` o `/etc/hostname`), se è lungo almeno
+/// 4 caratteri: uno più corto troverebbe parole qualsiasi.
+fn computer_name() -> Option<String> {
+    let env = |name: &str| std::env::var(name).ok();
+    env("COMPUTERNAME")
+        .or_else(|| env("HOSTNAME"))
+        .or_else(|| std::fs::read_to_string("/etc/hostname").ok())
+        .map(|name| name.trim().to_owned())
+        .filter(|name| name.chars().count() >= 4)
 }
 
 fn env_path(name: &str) -> Option<PathBuf> {
@@ -554,6 +579,15 @@ mod tests {
         let neutral = neutral_paths(sbom, root);
         assert!(!neutral.contains("progetti"), "{neutral}");
         assert!(neutral.contains("lynkeus/crates/app#0.1.0"), "{neutral}");
+    }
+
+    /// Ogni testo ha un valore e c'è la cartella del progetto, com'è scritta.
+    #[test]
+    fn needles_have_values_and_the_project_path() {
+        let needles = local_needles(Path::new("/progetto")).expect("percorsi locali noti");
+        assert!(needles.iter().all(|n| !n.text.trim().is_empty()));
+        assert!(needles.iter().any(|n| n.label == "cartella del progetto"
+            && n.text == Path::new("/progetto").display().to_string()));
     }
 
     #[test]

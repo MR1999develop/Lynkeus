@@ -22,7 +22,7 @@ use super::{Entry, Level, Verdict};
 use crate::dist;
 use crate::plan_map::{Automation, MANUAL_CASES, ManualCase, SharedState, TestRef};
 use crate::process::cargo;
-use crate::scan::{self, Needle};
+use crate::scan;
 
 /// Tempo massimo di un test di sistema.
 const SYSTEM_TEST_TIMEOUT: Duration = Duration::from_secs(15 * 60);
@@ -341,7 +341,7 @@ fn extract_exe(package: &Package, work: &Path) -> Result<PathBuf> {
 
 /// M-34: nessun nome utente, nome del computer o percorso locale nei file dello zip.
 fn verify_no_local_data(package: &Package, root: &Path) -> Result<()> {
-    let needles = local_needles(root);
+    let needles = dist::local_needles(root)?;
     let mut archive = package_zip(package)?;
     let mut problems = Vec::new();
     for index in 0..archive.len() {
@@ -354,51 +354,6 @@ fn verify_no_local_data(package: &Package, root: &Path) -> Result<()> {
         bail!("dati locali nel pacchetto: {}", problems.join("; "));
     }
     Ok(())
-}
-
-/// I testi locali di questa macchina, letti al momento e mai scritti nel rapporto (le
-/// etichette sì, i valori no).
-fn local_needles(root: &Path) -> Vec<Needle> {
-    let env = |name: &str| std::env::var(name).ok().filter(|v| !v.trim().is_empty());
-    let home = env(if cfg!(windows) { "USERPROFILE" } else { "HOME" });
-    let under_home = |dir: &str| {
-        home.as_ref()
-            .map(|h| Path::new(h).join(dir).display().to_string())
-    };
-    let computer = env("COMPUTERNAME")
-        .or_else(|| env("HOSTNAME"))
-        .or_else(|| {
-            std::fs::read_to_string("/etc/hostname")
-                .ok()
-                .map(|h| h.trim().to_owned())
-        })
-        // Un nome troppo corto troverebbe parole qualsiasi.
-        .filter(|name| name.chars().count() >= 4);
-    let mut needles = Vec::new();
-    let mut add = |label: &str, text: Option<String>| {
-        if let Some(text) = text {
-            needles.push(Needle {
-                label: label.to_owned(),
-                text,
-            });
-        }
-    };
-    if let Some(user) = env("USERNAME").or_else(|| env("USER")) {
-        add("nome utente in un percorso", Some(format!(r"\{user}\")));
-        add("nome utente in un percorso", Some(format!("/{user}/")));
-    }
-    add("nome del computer", computer);
-    add("cartella utente", home.clone());
-    add("cartella del progetto", Some(root.display().to_string()));
-    add(
-        "CARGO_HOME",
-        env("CARGO_HOME").or_else(|| under_home(".cargo")),
-    );
-    add(
-        "RUSTUP_HOME",
-        env("RUSTUP_HOME").or_else(|| under_home(".rustup")),
-    );
-    needles
 }
 
 /// Giudica il descrittore letto da `Get-Acl` (righe `PROTECTED=`, `USER=`, `OWNER=`,
@@ -630,13 +585,5 @@ mod tests {
             "percorso"
         );
         assert!(parse_sums(&hash).is_err(), "senza nome");
-    }
-
-    #[test]
-    fn needles_have_values_and_the_project_path() {
-        let needles = local_needles(Path::new("/progetto"));
-        assert!(needles.iter().all(|n| !n.text.trim().is_empty()));
-        assert!(needles.iter().any(|n| n.label == "cartella del progetto"
-            && n.text == Path::new("/progetto").display().to_string()));
     }
 }
