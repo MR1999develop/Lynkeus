@@ -10,8 +10,8 @@
 //!   piè di pagina, note e commenti non si leggono.
 //! - **pptx**: le diapositive nell'ordine di `ppt/presentation.xml` (relazioni di
 //!   `ppt/_rels/presentation.xml.rels`), o in ordine di numero se l'ordine non si ricava;
-//!   un'unità per diapositiva ([`Location::Slide`]) con un paragrafo (`a:p`) per riga. Le note
-//!   del relatore non si leggono.
+//!   un'unità per diapositiva ([`Location::Slide`]) con un paragrafo (`a:p`) per riga; una
+//!   diapositiva elencata più volte si legge una volta. Le note del relatore non si leggono.
 //! - Un OOXML cifrato con password è un file composto (CFB) con un flusso `EncryptedPackage`:
 //!   avviso "protetto da password". Un file composto senza quel flusso non è un OOXML.
 //!
@@ -19,7 +19,7 @@
 //! `ppt/presentation.xml`): un pacchetto senza di esse dà "contenuto diverso
 //! dall'estensione".
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader};
 
 use lynkeus_core::Location;
@@ -108,10 +108,17 @@ pub(crate) fn extract_pptx(ctx: &mut Ctx<'_>, input: Input<'_>) -> Result<(), Fa
     if !container.has(PPTX_MAIN) {
         return Err(ExtractError::ContentMismatch.into());
     }
-    let slides = match slide_order(ctx, &mut container)? {
+    let listed = match slide_order(ctx, &mut container)? {
         Some(order) => order,
         None => slides_by_number(&container.names()),
     };
+    // Una diapositiva elencata più volte si legge una volta, al suo primo posto: altrimenti
+    // pochi byte di presentazione la farebbero decomprimere migliaia di volte.
+    let mut seen = HashSet::new();
+    let slides: Vec<String> = listed
+        .into_iter()
+        .filter(|name| seen.insert(name.clone()))
+        .collect();
     for (index, name) in slides.iter().enumerate() {
         let Some(part) = container.part(ctx, name)? else {
             continue;

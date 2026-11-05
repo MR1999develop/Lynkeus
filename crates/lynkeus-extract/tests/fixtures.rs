@@ -404,6 +404,38 @@ fn zip_bomb_hits_ratio_limit() {
     assert!(starts(&events).is_empty());
 }
 
+/// A1 e XFD1048576 in un xlsx di 2 KB: le due celle si leggono a flusso, senza riservare il
+/// rettangolo che le contiene (centinaia di GB).
+#[test]
+fn sparse_xlsx_cells_are_read_in_flow() {
+    let events = extract("malevoli/sparso.xlsx");
+    assert!(warnings(&events).is_empty(), "{events:?}");
+    let cell = |row, col| Location::Cell {
+        sheet: "Sparso".to_owned(),
+        row,
+        col,
+    };
+    assert_eq!(locations_of(&events, "aragosta"), [cell(1, 1)]);
+    assert_eq!(locations_of(&events, "città"), [cell(1_048_576, 16_384)]);
+}
+
+/// Un 7z che dichiara un dizionario LZMA2 di 2 GiB per 31 byte di testo: la libreria non
+/// alloca il dizionario in anticipo, la voce si legge. Nel processo estrattore vero, con il
+/// limite di memoria, lo prova anche `tests/processo.rs`.
+#[test]
+fn sevenz_huge_dictionary_is_not_allocated_up_front() {
+    let events = extract("malevoli/dizionario-enorme.7z");
+    assert!(warnings(&events).is_empty(), "{events:?}");
+    assert_eq!(locations_of(&events, "aragosta"), [Location::Line(1)]);
+}
+
+/// La stessa diapositiva elencata 10.000 volte nella presentazione si legge una volta sola.
+#[test]
+fn pptx_repeated_slide_ids_read_once() {
+    let events = extract("malevoli/slide-ripetute.pptx");
+    assert_eq!(locations_of(&events, "aragosta"), [Location::Slide(1)]);
+}
+
 #[test]
 fn entry_names_are_only_labels() {
     let before = listing(&fixture("malevoli"));

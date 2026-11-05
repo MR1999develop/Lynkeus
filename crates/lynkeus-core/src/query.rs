@@ -12,6 +12,7 @@ use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
 
 use crate::pattern::{GUARD_GROUP, LEAD_GROUP, TRAIL_GROUP, TermPattern, term_pattern};
+use crate::unicode::without_marks;
 
 /// Maiuscole e minuscole.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
@@ -69,10 +70,11 @@ pub enum Combine {
 /// Motivo per cui un termine non è valido; l'interfaccia lo mostra sotto il campo.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum TermError {
-    /// Vuoto o fatto solo di spazi.
+    /// Vuoto, o fatto solo di spazi e di segni combinanti (accenti senza lettera).
     #[error("termine vuoto")]
     Empty,
-    /// Fatto solo di `*`, `?` e spazi, con i jolly attivi: troverebbe ogni parola.
+    /// Fatto solo di `*`, `?`, spazi e segni combinanti, con i jolly attivi: troverebbe
+    /// ogni parola.
     #[error("termine fatto solo di caratteri jolly")]
     OnlyWildcards,
     /// Più lungo di `max_chars` caratteri.
@@ -106,7 +108,10 @@ impl Term {
     /// Prima toglie gli spazi (White_Space Unicode) iniziali e finali: con `" car"` la
     /// corrispondenza inizierebbe con uno spazio e la parola si estenderebbe oltre lo
     /// spazio. Poi controlla, nell'ordine: lunghezza (senza quegli spazi), a capo, vuoto,
-    /// solo jolly. Nessuna normalizzazione: la compilazione porta il termine in NFC.
+    /// solo jolly. Vuoto e solo jolly si giudicano senza i segni combinanti, come li
+    /// vedrebbe la ricerca con gli accenti ignorati: "\u{301}" è vuoto e "*\u{301}" è solo
+    /// jolly con qualunque opzione degli accenti, perché un termine valido lo resta anche
+    /// cambiando opzione. Il termine non si normalizza: lo fa la compilazione.
     pub fn parse(raw: &str, wildcards: WildcardMode) -> Result<Term, TermError> {
         let raw = raw.trim();
         // Un carattere UTF-8 occupa al massimo 4 byte: oltre, è troppo lungo senza contare.
@@ -119,14 +124,11 @@ impl Term {
         if raw.contains(['\n', '\r']) {
             return Err(TermError::LineBreak);
         }
-        if raw.is_empty() {
+        let mut bases = without_marks(raw).filter(|c| !c.is_whitespace()).peekable();
+        if bases.peek().is_none() {
             return Err(TermError::Empty);
         }
-        if wildcards == WildcardMode::Enabled
-            && raw
-                .chars()
-                .all(|c| c == '*' || c == '?' || c.is_whitespace())
-        {
+        if wildcards == WildcardMode::Enabled && bases.all(|c| c == '*' || c == '?') {
             return Err(TermError::OnlyWildcards);
         }
         Ok(Term {
@@ -253,7 +255,6 @@ impl Query {
                 pattern,
                 lead_star,
                 trail_star,
-                guard,
             } = term_pattern(term.as_str(), self.options);
             let regex = RegexBuilder::new(&pattern)
                 .case_insensitive(self.options.case == CaseMode::Insensitive)
@@ -267,7 +268,7 @@ impl Query {
             };
             let lead_group = group(lead_star, LEAD_GROUP);
             let trail_group = group(trail_star, TRAIL_GROUP);
-            let guard_group = group(guard, GUARD_GROUP);
+            let guard_group = group(true, GUARD_GROUP);
             matchers.push(TermMatcher {
                 regex,
                 lead_group,
@@ -297,7 +298,7 @@ pub(crate) struct TermMatcher {
     pub(crate) lead_group: Option<usize>,
     /// Gruppo del `*` finale, se il termine finisce con `*`.
     pub(crate) trail_group: Option<usize>,
-    /// Gruppo della guardia finale, con gli accenti distinti.
+    /// Gruppo della guardia finale (c'è sempre: `None` solo se l'automa non lo avesse).
     pub(crate) guard_group: Option<usize>,
 }
 
@@ -358,6 +359,26 @@ mod tests {
             "arte",
             "a capo finale tolto come spazio"
         );
+    }
+
+    /// Un termine che, tolti i segni combinanti, resta vuoto o fatto di soli jolly non è
+    /// valido: con gli accenti ignorati "*\u{301}" diventerebbe "*" e troverebbe ogni parola.
+    #[test]
+    fn terms_normalizing_to_wildcards_are_rejected() {
+        let on = WildcardMode::Enabled;
+        assert_eq!(Term::parse("*\u{301}", on), Err(TermError::OnlyWildcards));
+        assert_eq!(Term::parse("?\u{301}", on), Err(TermError::OnlyWildcards));
+        assert_eq!(Term::parse("* \u{301}?", on), Err(TermError::OnlyWildcards));
+        assert_eq!(Term::parse("\u{301}", on), Err(TermError::Empty));
+        assert_eq!(
+            Term::parse(" \u{301}\u{302} ", WildcardMode::Literal),
+            Err(TermError::Empty)
+        );
+        // Con i jolly letterali `*` è un carattere come gli altri.
+        assert!(Term::parse("*\u{301}", WildcardMode::Literal).is_ok());
+        // Una lettera con i suoi segni resta valida, anche accanto ai jolly.
+        assert!(Term::parse("e\u{301}*", on).is_ok());
+        assert!(Term::parse("\u{301}a", on).is_ok());
     }
 
     #[test]

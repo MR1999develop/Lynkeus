@@ -920,7 +920,9 @@ name = "lynkeus-fuzz"
 version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
+ "lynkeus-core",
  "lynkeus-extract",
+ "serde",
 ]
 
 [[package]]

@@ -20,14 +20,21 @@ static NONSPACING_MARK: LazyLock<Option<Regex>> = LazyLock::new(|| Regex::new(r"
 /// Un carattere della categoria `P` (punteggiatura).
 static PUNCTUATION: LazyLock<Option<Regex>> = LazyLock::new(|| Regex::new(r"\A\p{P}\z").ok());
 
-/// Lettera di base → lettere precomposte la cui decomposizione canonica completa è la lettera
-/// di base seguita solo da segni `Mn` (es. `e` → `è`, `é`, `ê`, …), in ordine di codice.
+/// Carattere di base → caratteri precomposti la cui decomposizione canonica completa è quel
+/// carattere seguito solo da segni `Mn` (es. `e` → `è`, `é`, `ê`, …; `¨` → `΅`; `=` → `≠`),
+/// in ordine di codice.
 static ACCENTED_VARIANTS: LazyLock<HashMap<char, Vec<char>>> = LazyLock::new(build_variants);
 
 /// Vero se `c` è un segno combinante non spaziato (categoria generale `Mn`).
 pub(crate) fn is_nonspacing_mark(c: char) -> bool {
     // Fast path: nessun carattere ASCII è un segno combinante.
     !c.is_ascii() && matches_char(&NONSPACING_MARK, c)
+}
+
+/// `raw` decomposto (NFD) senza i segni `Mn`: ciò che di un termine conta con gli accenti
+/// ignorati. Una sola definizione per la validazione dei termini e per la loro traduzione.
+pub(crate) fn without_marks(raw: &str) -> impl Iterator<Item = char> + '_ {
+    raw.nfd().filter(|&c| !is_nonspacing_mark(c))
 }
 
 /// Vero se `c` è un segno di punteggiatura (categoria generale `P`: `Pc`, `Pd`, `Ps`, `Pe`,
@@ -73,8 +80,9 @@ fn build_variants() -> HashMap<char, Vec<char>> {
         let Some((&base, marks)) = parts.split_first() else {
             continue;
         };
-        if !marks.is_empty() && base.is_alphabetic() && marks.iter().all(|&m| is_nonspacing_mark(m))
-        {
+        // Anche le basi che non sono lettere (`¨` di `΅`, `=` di `≠`): con gli accenti
+        // ignorati il termine perde i segni, e deve trovare ancora il carattere precomposto.
+        if !marks.is_empty() && marks.iter().all(|&m| is_nonspacing_mark(m)) {
             table.entry(base).or_default().push(c);
         }
     }
@@ -108,6 +116,21 @@ mod tests {
         assert!(accented_variants('E').contains(&'É'));
         assert!(!accented_variants('o').contains(&'ø'), "ø non si decompone");
         assert!(accented_variants('1').is_empty());
+        // Basi che non sono lettere.
+        assert!(accented_variants('\u{A8}').contains(&'\u{385}'));
+        assert!(accented_variants('=').contains(&'≠'));
+        // Le sillabe hangul si decompongono in jamo, non in segni: nessuna variante.
+        assert!(accented_variants('ᄒ').is_empty());
+    }
+
+    #[test]
+    fn without_marks_keeps_bases_and_hangul_jamo() {
+        assert_eq!(without_marks("città").collect::<String>(), "citta");
+        assert_eq!(without_marks("\u{301}*").collect::<String>(), "*");
+        assert_eq!(
+            without_marks("한").collect::<String>(),
+            "\u{1112}\u{1161}\u{11AB}"
+        );
     }
 
     #[test]

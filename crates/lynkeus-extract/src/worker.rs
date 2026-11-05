@@ -7,16 +7,20 @@
 //! L'app avvia lo stesso eseguibile con l'opzione nascosta `--extract-worker` seguita da
 //! [`WorkerConfig::to_args`], e nel figlio chiama [`run`] con stdin e stdout. Il ciclo:
 //!
-//! 1. all'avvio, prima di leggere qualunque file, imposta il limite di memoria se
-//!    configurato (`RLIMIT_AS` su Linux; su Windows lo impone il Job Object del padre). Se
-//!    non ci riesce esce con errore: un estrattore senza limite non parte;
+//! 1. all'avvio, prima di leggere qualunque file, avvia la sorveglianza del padre
+//!    ([`watch_parent`]) e imposta il limite di memoria (`RLIMIT_AS` su Linux; su Windows lo
+//!    impone il Job Object del padre). Senza limite configurato, o se una delle due cose non
+//!    riesce, esce con errore: un estrattore senza limite non parte;
 //! 2. per ogni [`Request::Extract`] chiama [`extract_path`] e manda gli eventi man mano
 //!    (il buffer si svuota a ogni fine documento e alla fine della richiesta); per ogni
 //!    [`Request::ExtractEntry`] chiama [`extract_entry`] e manda i byte della voce a pezzi,
 //!    poi l'esito;
 //! 3. esce con `Ok` quando stdin finisce tra una richiesta e l'altra (il padre lo chiude per
 //!    fermarlo), con errore su un frame non valido (dopo aver mandato
-//!    [`Response::Rejected`]) o se stdout non si scrive più.
+//!    [`Response::Rejected`]), se stdout non si scrive più o se il padre è terminato: in
+//!    quel caso l'estrazione in corso si ferma al primo evento e le richieste in coda non si
+//!    servono. Così un estrattore occupato non resta orfano (Linux; su Windows il Job Object
+//!    del padre lo termina).
 //!
 //! Il processo legge solo i file richiesti, non scrive su disco, non avvia programmi e non
 //! usa la rete. Stdout è riservato al protocollo: niente `print!` in questo crate (i log, se
@@ -24,6 +28,8 @@
 
 use std::ffi::OsString;
 use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use lynkeus_core::ByteSize;
 
@@ -50,8 +56,9 @@ pub const MIN_MEMORY_LIMIT: ByteSize = ByteSize::from_mib(64);
 /// Configurazione del processo estrattore, passata come argomenti dal padre.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct WorkerConfig {
-    /// Limite di memoria che il processo impone a sé stesso dove può (Linux); `None` =
-    /// nessun limite proprio.
+    /// Limite di memoria che il processo impone a sé stesso dove può (Linux). Obbligatorio
+    /// per [`run`]: con `None` il processo non parte. `None` resta possibile solo per chi
+    /// avvia un processo di prova che non chiama [`run`].
     pub memory_limit: Option<ByteSize>,
 }
 
@@ -82,6 +89,7 @@ impl WorkerConfig {
     }
 
     /// Legge gli argomenti che seguono `--extract-worker` (quelli di [`WorkerConfig::to_args`]).
+    /// Senza [`MEMORY_LIMIT_FLAG`] il limite resta `None`, e [`run`] non parte.
     pub fn from_args<I: IntoIterator<Item = OsString>>(args: I) -> Result<WorkerConfig, ArgsError> {
         let mut config = WorkerConfig::default();
         let mut args = args.into_iter();
@@ -104,32 +112,73 @@ impl WorkerConfig {
 /// Perché il processo estrattore si è fermato con errore.
 #[derive(Debug, thiserror::Error)]
 pub enum WorkerError {
-    /// Il limite di memoria non si è potuto impostare.
+    /// Il limite di memoria manca nella configurazione o non si è potuto impostare.
     #[error("limite di memoria non impostato")]
     MemoryLimit(#[source] io::Error),
+    /// La sorveglianza del processo principale non è partita.
+    #[error("sorveglianza del processo principale non avviata")]
+    ParentWatch(#[source] io::Error),
+    /// Il processo principale è terminato: le richieste non si servono più.
+    #[error("processo principale terminato")]
+    ParentGone,
     /// Frame non valido in ingresso o stdout non scrivibile.
     #[error("errore del protocollo")]
     Protocol(#[source] ProtocolError),
 }
 
+/// Mette `parent_gone` a vero quando il processo che ha avviato questo termina (Linux; su
+/// Windows non fa nulla, il Job Object del padre termina l'estrattore). [`run`] la chiama
+/// da sé e ferma l'estrazione al primo evento dopo il segnale; serve a parte solo a un
+/// processo di prova che non usa [`run`].
+///
+/// Errore se la sorveglianza non parte.
+pub fn watch_parent(parent_gone: Arc<AtomicBool>) -> io::Result<()> {
+    platform::watch_parent(parent_gone)
+}
+
 /// Il ciclo del processo estrattore su `input` (stdin) e `output` (stdout).
 ///
-/// Restituisce `Ok` quando `input` finisce tra una richiesta e l'altra.
+/// Prima di leggere qualunque richiesta avvia la sorveglianza del padre e impone il limite
+/// di memoria di `config`, obbligatorio: senza, [`WorkerError::MemoryLimit`] e nessuna
+/// richiesta servita. Restituisce `Ok` quando `input` finisce tra una richiesta e l'altra,
+/// [`WorkerError::ParentGone`] se il padre termina prima.
 pub fn run<R: Read, W: Write>(
     input: R,
     output: W,
     config: &WorkerConfig,
 ) -> Result<(), WorkerError> {
-    if let Some(limit) = config.memory_limit {
-        platform::limit_address_space(limit.bytes()).map_err(WorkerError::MemoryLimit)?;
-    }
+    let Some(limit) = config.memory_limit else {
+        return Err(WorkerError::MemoryLimit(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "limite di memoria mancante",
+        )));
+    };
+    let parent_gone = Arc::new(AtomicBool::new(false));
+    watch_parent(Arc::clone(&parent_gone)).map_err(WorkerError::ParentWatch)?;
+    platform::limit_address_space(limit.bytes()).map_err(WorkerError::MemoryLimit)?;
+    serve_requests(input, output, &parent_gone)
+}
+
+/// Serve le richieste di `input` finché finisce tra una richiesta e l'altra, o finché
+/// `parent_gone` diventa vero.
+fn serve_requests<R: Read, W: Write>(
+    input: R,
+    output: W,
+    parent_gone: &AtomicBool,
+) -> Result<(), WorkerError> {
     let mut reader = FrameReader::new(BufReader::new(input));
     let mut writer = FrameWriter::new(BufWriter::new(output));
     loop {
-        match reader.read::<Request>() {
+        let request = reader.read::<Request>();
+        if parent_gone.load(Ordering::Relaxed) {
+            return Err(WorkerError::ParentGone);
+        }
+        match request {
             Ok(None) => return Ok(()),
-            Ok(Some(Request::Extract(request))) => serve(&mut writer, &request)?,
-            Ok(Some(Request::ExtractEntry(request))) => serve_entry(&mut writer, &request)?,
+            Ok(Some(Request::Extract(request))) => serve(&mut writer, &request, parent_gone)?,
+            Ok(Some(Request::ExtractEntry(request))) => {
+                serve_entry(&mut writer, &request, parent_gone)?;
+            }
             Err(error) => {
                 if let Some(reason) = error.reject_reason() {
                     // Il padre vede comunque l'uscita: se nemmeno il rifiuto si scrive,
@@ -145,19 +194,67 @@ pub fn run<R: Read, W: Write>(
     }
 }
 
+/// Perché un destinatario ha fermato l'estrazione.
+#[derive(Debug)]
+enum Halt {
+    /// Stdout non si scrive più.
+    Protocol(ProtocolError),
+    /// Il processo principale è terminato.
+    ParentGone,
+}
+
+impl From<Halt> for WorkerError {
+    fn from(halt: Halt) -> WorkerError {
+        match halt {
+            Halt::Protocol(error) => WorkerError::Protocol(error),
+            Halt::ParentGone => WorkerError::ParentGone,
+        }
+    }
+}
+
+/// Dove un destinatario scrive le risposte di una richiesta: lo scrittore, l'identificativo
+/// della richiesta, il segnale del padre terminato e il motivo dell'arresto.
+struct Outbox<'w, W: Write> {
+    writer: &'w mut FrameWriter<W>,
+    id: RequestId,
+    parent_gone: &'w AtomicBool,
+    halt: Option<Halt>,
+}
+
+impl<W: Write> Outbox<'_, W> {
+    /// Scrive `response` (e svuota il buffer se `flush`), salvo che il padre sia
+    /// terminato: allora, o se la scrittura fallisce, registra il motivo e ferma.
+    fn send(&mut self, response: &Response, flush: bool) -> Result<(), Stopped> {
+        if self.parent_gone.load(Ordering::Relaxed) {
+            self.halt = Some(Halt::ParentGone);
+            return Err(Stopped);
+        }
+        let written = self
+            .writer
+            .write(response)
+            .and_then(|()| if flush { self.writer.flush() } else { Ok(()) });
+        written.map_err(|error| {
+            self.halt = Some(Halt::Protocol(error));
+            Stopped
+        })
+    }
+}
+
 /// Esegue una richiesta e manda le risposte, chiudendo con [`Response::Done`].
 fn serve<W: Write>(
     writer: &mut FrameWriter<W>,
     request: &ExtractRequest,
+    parent_gone: &AtomicBool,
 ) -> Result<(), WorkerError> {
-    let mut sink = ResponseSink {
+    let mut outbox = Outbox {
         writer: &mut *writer,
         id: request.id,
-        error: None,
+        parent_gone,
+        halt: None,
     };
-    let outcome = extract_path(&request.path, &request.options, &mut sink);
-    if let Some(error) = sink.error {
-        return Err(WorkerError::Protocol(error));
+    let outcome = extract_path(&request.path, &request.options, &mut outbox);
+    if let Some(halt) = outbox.halt {
+        return Err(halt.into());
     }
     debug_assert!(outcome.is_ok(), "solo questo destinatario può fermare");
     writer
@@ -171,24 +268,26 @@ fn serve<W: Write>(
 fn serve_entry<W: Write>(
     writer: &mut FrameWriter<W>,
     request: &EntryRequest,
+    parent_gone: &AtomicBool,
 ) -> Result<(), WorkerError> {
-    let mut sink = EntryDataSink {
+    let mut outbox = Outbox {
         writer: &mut *writer,
         id: request.id,
-        error: None,
+        parent_gone,
+        halt: None,
     };
     let outcome = extract_entry(
         &request.path,
         &request.inner,
         request.max_bytes,
         &request.options,
-        &mut sink,
+        &mut outbox,
     );
-    if let Some(error) = sink.error {
-        return Err(WorkerError::Protocol(error));
+    if let Some(halt) = outbox.halt {
+        return Err(halt.into());
     }
     let Ok(outcome) = outcome else {
-        // Solo questo destinatario può fermare, e lo fa solo con un errore già restituito.
+        // Solo questo destinatario può fermare, e lo fa solo con un motivo già registrato.
         return Err(WorkerError::Protocol(ProtocolError::Malformed));
     };
     writer
@@ -200,51 +299,23 @@ fn serve_entry<W: Write>(
         .map_err(WorkerError::Protocol)
 }
 
-/// Destinatario che scrive ogni pezzo di una voce come [`Response::EntryData`].
-struct EntryDataSink<'w, W: Write> {
-    writer: &'w mut FrameWriter<W>,
-    id: RequestId,
-    error: Option<ProtocolError>,
-}
-
-impl<W: Write> EntrySink for EntryDataSink<'_, W> {
+/// Ogni pezzo di una voce come [`Response::EntryData`].
+impl<W: Write> EntrySink for Outbox<'_, W> {
     fn bytes(&mut self, chunk: &[u8]) -> Result<(), Stopped> {
-        self.writer
-            .write(&Response::EntryData {
-                id: self.id,
-                bytes: chunk.to_vec(),
-            })
-            .map_err(|error| {
-                self.error = Some(error);
-                Stopped
-            })
+        let response = Response::EntryData {
+            id: self.id,
+            bytes: chunk.to_vec(),
+        };
+        self.send(&response, false)
     }
 }
 
-/// Destinatario che scrive ogni evento come [`Response::Event`].
-struct ResponseSink<'w, W: Write> {
-    writer: &'w mut FrameWriter<W>,
-    id: RequestId,
-    error: Option<ProtocolError>,
-}
-
-impl<W: Write> EventSink for ResponseSink<'_, W> {
+/// Ogni evento come [`Response::Event`]; il buffer si svuota a ogni fine documento.
+impl<W: Write> EventSink for Outbox<'_, W> {
     fn emit(&mut self, event: ExtractEvent) -> Result<(), Stopped> {
         let end_of_document = event == ExtractEvent::DocumentEnd;
-        let written = self
-            .writer
-            .write(&Response::Event { id: self.id, event })
-            .and_then(|()| {
-                if end_of_document {
-                    self.writer.flush()
-                } else {
-                    Ok(())
-                }
-            });
-        written.map_err(|error| {
-            self.error = Some(error);
-            Stopped
-        })
+        let response = Response::Event { id: self.id, event };
+        self.send(&response, end_of_document)
     }
 }
 
@@ -280,6 +351,11 @@ mod tests {
         out
     }
 
+    /// Serve `input` con il padre vivo.
+    fn serve_all<W: Write>(input: &[u8], output: W) -> Result<(), WorkerError> {
+        serve_requests(input, output, &AtomicBool::new(false))
+    }
+
     #[test]
     fn serves_requests_until_eof() {
         let mut input = Vec::new();
@@ -288,7 +364,7 @@ mod tests {
         assert!(encode_frame(&first, &mut input).is_ok());
         assert!(encode_frame(&second, &mut input).is_ok());
         let mut output = Vec::new();
-        let result = run(input.as_slice(), &mut output, &WorkerConfig::default());
+        let result = serve_all(&input, &mut output);
         assert!(result.is_ok(), "{result:?}");
         let got = responses(&output);
         // Prima richiesta: inizio, almeno un'unità, fine documento, fine richiesta.
@@ -339,7 +415,7 @@ mod tests {
         assert!(encode_frame(&entry, &mut input).is_ok());
         assert!(encode_frame(&missing, &mut input).is_ok());
         let mut output = Vec::new();
-        let result = run(input.as_slice(), &mut output, &WorkerConfig::default());
+        let result = serve_all(&input, &mut output);
         assert!(result.is_ok(), "{result:?}");
         let got = responses(&output);
         let mut bytes = Vec::new();
@@ -369,10 +445,47 @@ mod tests {
         );
     }
 
+    /// Senza limite di memoria il processo estrattore non parte: nessuna richiesta servita.
+    #[test]
+    fn worker_refuses_missing_memory_limit() {
+        let mut input = Vec::new();
+        assert!(encode_frame(&request(1, fixture("formati/spesa.txt")), &mut input).is_ok());
+        let mut output = Vec::new();
+        let result = run(input.as_slice(), &mut output, &WorkerConfig::default());
+        assert!(
+            matches!(result, Err(WorkerError::MemoryLimit(_))),
+            "{result:?}"
+        );
+        assert!(output.is_empty());
+    }
+
+    /// Padre terminato: le richieste in coda non si servono, e un'estrazione in corso si
+    /// ferma al primo evento senza mandarlo.
+    #[test]
+    fn orphaned_worker_stops_at_the_next_event() {
+        let mut input = Vec::new();
+        assert!(encode_frame(&request(1, fixture("formati/spesa.txt")), &mut input).is_ok());
+        let mut output = Vec::new();
+        let gone = AtomicBool::new(true);
+        let result = serve_requests(input.as_slice(), &mut output, &gone);
+        assert!(matches!(result, Err(WorkerError::ParentGone)), "{result:?}");
+        assert!(output.is_empty());
+        let mut writer = FrameWriter::new(Vec::new());
+        let mut outbox = Outbox {
+            writer: &mut writer,
+            id: 1,
+            parent_gone: &gone,
+            halt: None,
+        };
+        assert_eq!(outbox.emit(ExtractEvent::DocumentEnd), Err(Stopped));
+        assert!(matches!(outbox.halt, Some(Halt::ParentGone)));
+        assert!(writer.into_inner().is_empty());
+    }
+
     #[test]
     fn empty_input_exits_cleanly() {
         let mut output = Vec::new();
-        assert!(run(&[][..], &mut output, &WorkerConfig::default()).is_ok());
+        assert!(serve_all(&[], &mut output).is_ok());
         assert!(output.is_empty());
     }
 
@@ -381,7 +494,7 @@ mod tests {
         let mut input = 3_u32.to_le_bytes().to_vec();
         input.extend_from_slice(&[0xFF, 0xFF, 0xFF]);
         let mut output = Vec::new();
-        let result = run(input.as_slice(), &mut output, &WorkerConfig::default());
+        let result = serve_all(&input, &mut output);
         assert!(matches!(
             result,
             Err(WorkerError::Protocol(ProtocolError::VersionMismatch { .. }))
@@ -400,7 +513,7 @@ mod tests {
         assert!(encode_frame(&request(1, fixture("formati/spesa.txt")), &mut input).is_ok());
         input.truncate(input.len() - 1);
         let mut output = Vec::new();
-        let result = run(input.as_slice(), &mut output, &WorkerConfig::default());
+        let result = serve_all(&input, &mut output);
         assert!(matches!(
             result,
             Err(WorkerError::Protocol(ProtocolError::Truncated))
@@ -429,7 +542,7 @@ mod tests {
     fn closed_output_stops_the_worker() {
         let mut input = Vec::new();
         assert!(encode_frame(&request(1, fixture("formati/spesa.txt")), &mut input).is_ok());
-        let result = run(input.as_slice(), ClosedPipe, &WorkerConfig::default());
+        let result = serve_all(&input, ClosedPipe);
         assert!(matches!(
             result,
             Err(WorkerError::Protocol(ProtocolError::Io(_)))

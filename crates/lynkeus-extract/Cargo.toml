@@ -37,5 +37,11 @@ rlimit.workspace = true
 [dev-dependencies]
 proptest.workspace = true
 
+# Il processo estrattore vero (questo stesso test avviato come figlio): senza l'harness dei
+# test, che scriverebbe su stdout, riservato al protocollo.
+[[test]]
+name = "processo"
+harness = false
+
 [lints]
 workspace = true

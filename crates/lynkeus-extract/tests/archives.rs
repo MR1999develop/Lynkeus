@@ -346,3 +346,182 @@ fn sink_can_stop_the_extraction() {
         })
     ));
 }
+
+fn fixture(relative: &str) -> Vec<u8> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures")
+        .join(relative);
+    let bytes = std::fs::read(&path).unwrap_or_default();
+    assert!(!bytes.is_empty(), "fixture mancante: {}", path.display());
+    bytes
+}
+
+/// Uno zip scritto a mano con la sola voce `name`: `data` compresso con deflate, seguito da
+/// zeri fino a `declared` byte, che è la dimensione compressa dichiarata. Il flusso deflate
+/// finisce prima: chi decomprime non legge il riempimento, ma il rapporto calcolato sul
+/// dichiarato scende.
+fn padded_zip(name: &str, data: &[u8], declared: u32) -> Vec<u8> {
+    let mut encoder = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::best());
+    assert!(encoder.write_all(data).is_ok());
+    let mut body = encoder.finish().unwrap_or_default();
+    let declared_len = usize::try_from(declared).unwrap_or(usize::MAX);
+    assert!(body.len() < declared_len);
+    body.resize(declared_len, 0);
+    let mut crc = flate2::Crc::new();
+    crc.update(data);
+    let size = u32::try_from(data.len()).unwrap_or(u32::MAX);
+    let name_len = u16::try_from(name.len()).unwrap_or(u16::MAX);
+    // Versione 2.0, nessuna opzione, deflate, ora 00:00 del 2026-01-01.
+    let common = |out: &mut Vec<u8>| {
+        for value in [20_u16, 0, 8, 0, ((2026 - 1980) << 9) | (1 << 5) | 1] {
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+        for value in [crc.sum(), declared, size] {
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+        out.extend_from_slice(&name_len.to_le_bytes());
+        out.extend_from_slice(&0_u16.to_le_bytes());
+    };
+    let mut zip = 0x0403_4B50_u32.to_le_bytes().to_vec();
+    common(&mut zip);
+    zip.extend_from_slice(name.as_bytes());
+    zip.extend_from_slice(&body);
+    let central_at = u32::try_from(zip.len()).unwrap_or(u32::MAX);
+    let mut central = 0x0201_4B50_u32.to_le_bytes().to_vec();
+    central.extend_from_slice(&20_u16.to_le_bytes());
+    common(&mut central);
+    // Commento, disco, attributi interni ed esterni, posizione dell'intestazione locale.
+    central.extend_from_slice(&[0; 2 + 2 + 2 + 4 + 4]);
+    central.extend_from_slice(name.as_bytes());
+    let central_len = u32::try_from(central.len()).unwrap_or(u32::MAX);
+    zip.extend_from_slice(&central);
+    zip.extend_from_slice(&0x0605_4B50_u32.to_le_bytes());
+    for value in [0_u16, 0, 1, 1] {
+        zip.extend_from_slice(&value.to_le_bytes());
+    }
+    zip.extend_from_slice(&central_len.to_le_bytes());
+    zip.extend_from_slice(&central_at.to_le_bytes());
+    zip.extend_from_slice(&0_u16.to_le_bytes());
+    zip
+}
+
+/// 20 MiB di testo compressi in circa 20 KB, con la dimensione compressa dichiarata gonfiata
+/// a 150 KB da zeri dopo la fine del flusso deflate: sul dichiarato il rapporto (circa
+/// 140:1) è sotto 200:1, sui byte davvero letti dal contenitore no.
+#[test]
+fn padded_zip_hits_ratio_limit() {
+    let data = vec![b'a'; 20 * 1024 * 1024];
+    let zip = padded_zip("riempito.txt", &data, 150 * 1024);
+    let events = run("imbottito.zip", zip, ArchiveLimits::default());
+    assert_eq!(
+        warnings(&events),
+        [(
+            names(&["riempito.txt"]),
+            WarningKind::LimitExceeded(LimitKind::CompressionRatio)
+        )]
+    );
+    // Lo stesso zip senza riempimento ha già il rapporto oltre il limite dichiarato.
+    let honest = padded_zip("riempito.txt", &data, 30 * 1024);
+    let events = run("onesto.zip", honest, ArchiveLimits::default());
+    assert_eq!(
+        warnings(&events),
+        [(
+            names(&["riempito.txt"]),
+            WarningKind::LimitExceeded(LimitKind::CompressionRatio)
+        )]
+    );
+}
+
+/// `data` compresso con gzip.
+fn gzip(data: &[u8]) -> Vec<u8> {
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    assert!(encoder.write_all(data).is_ok());
+    encoder.finish().unwrap_or_default()
+}
+
+/// Lo stesso tar compresso con gzip, chiamato "x.gz" (tar riconosciuto dal contenuto) o
+/// "x.tar.gz": stessi eventi anche con limiti piccoli. Il massimo per voce vale per ogni voce
+/// e non per l'intero tar, e i byte si contano una volta sola.
+#[test]
+fn gz_with_tar_content_has_tar_gz_limits() {
+    let mut builder = tar::Builder::new(Vec::new());
+    for (name, fill) in [("a.txt", b'a'), ("b.txt", b'b'), ("c.txt", b'c')] {
+        let data = vec![fill; 3000];
+        let mut header = tar::Header::new_gnu();
+        header.set_size(3000);
+        header.set_mode(0o644);
+        header.set_cksum();
+        assert!(
+            builder
+                .append_data(&mut header, name, data.as_slice())
+                .is_ok()
+        );
+    }
+    let tar = builder.into_inner().unwrap_or_default();
+    // Il tar (circa 11 KB) supera il massimo per voce; le voci (9000 byte) stanno nel totale,
+    // contate due volte no.
+    assert!(tar.len() > 10_000);
+    let limits = ArchiveLimits {
+        max_entry_size: ByteSize::from_bytes(4000),
+        max_archive_size: ByteSize::from_bytes(15_000),
+        ..ArchiveLimits::default()
+    };
+    let compressed = gzip(&tar);
+    let as_gz = run("x.gz", compressed.clone(), limits);
+    let as_tar_gz = run("x.tar.gz", compressed, limits);
+    assert_eq!(as_gz, as_tar_gz);
+    assert!(warnings(&as_gz).is_empty(), "{as_gz:?}");
+    assert_eq!(
+        documents(&as_gz),
+        [names(&["a.txt"]), names(&["b.txt"]), names(&["c.txt"])]
+    );
+}
+
+/// Un EPUB è un contenitore come gli altri: dentro uno zip con profondità massima 1 non si
+/// apre, e i suoi capitoli contano tra le voci del file radice.
+#[test]
+fn epub_respects_depth_and_entry_budget() {
+    let book = fixture("formati/libro.epub");
+    let shallow = ArchiveLimits {
+        max_depth: 1,
+        ..ArchiveLimits::default()
+    };
+    let events = run("esterno.zip", zip_of(&[("libro.epub", &book)]), shallow);
+    assert_eq!(
+        warnings(&events),
+        [(
+            names(&["libro.epub"]),
+            WarningKind::LimitExceeded(LimitKind::ArchiveDepth)
+        )]
+    );
+    assert!(documents(&events).is_empty(), "{events:?}");
+    // Tre voci nello zip più due capitoli per libro (il libro ha 6 parti, entro il massimo
+    // di 7 per contenitore): 3 + 2 + 2 = 7, il terzo libro è oltre.
+    let few = ArchiveLimits {
+        max_entries: 7,
+        ..ArchiveLimits::default()
+    };
+    let books = zip_of(&[
+        ("uno.epub", &book),
+        ("due.epub", &book),
+        ("tre.epub", &book),
+    ]);
+    let events = run("libri.zip", books, few);
+    let chapters = |book: &str| {
+        [
+            names(&[book, "OEBPS/cap1.xhtml"]),
+            names(&[book, "OEBPS/cap2.xhtml"]),
+        ]
+    };
+    assert_eq!(
+        documents(&events),
+        [chapters("uno.epub"), chapters("due.epub")].concat()
+    );
+    assert_eq!(
+        warnings(&events),
+        [(
+            names(&["tre.epub"]),
+            WarningKind::LimitExceeded(LimitKind::ArchiveEntries)
+        )]
+    );
+}

@@ -627,8 +627,6 @@ fn run_document(ctx: &mut Ctx<'_>, declared: Format, mut input: Input<'_>) -> Re
     Ok(())
 }
 
-/// Punto d'iniezione dei test: un panic forzato quando si legge la voce con un certo nome,
-/// per provare che un panic dentro un archivio non sposta le etichette delle voci seguenti.
 /// L'errore di un panic intercettato durante la lettura di un documento o di una voce.
 fn panic_error() -> ExtractError {
     ExtractError::Corrupt {
@@ -636,6 +634,8 @@ fn panic_error() -> ExtractError {
     }
 }
 
+/// Punto d'iniezione dei test: un panic forzato quando si legge la voce con un certo nome,
+/// per provare che un panic dentro un archivio non sposta le etichette delle voci seguenti.
 #[cfg(test)]
 pub(crate) mod test_hook {
     use std::cell::RefCell;
