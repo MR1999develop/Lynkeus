@@ -10,18 +10,22 @@
 //! pubblica dei crate.
 
 /// Piece table di un .doc: i primi 4 byte (little-endian) sono la lunghezza del flusso
-/// `WordDocument`, il resto è la tabella (`0Table`/`1Table`).
+/// `WordDocument`, il resto è la tabella (`0Table`/`1Table`). Oracoli: due letture danno gli
+/// stessi paragrafi, ognuno con testo e senza caratteri di controllo, al più un carattere per
+/// CP del testo principale.
 pub fn doc_piece_table(data: &[u8]) {
     crate::extract::word97::fuzz(data);
 }
 
 /// Record di un .ppt: `data` è il flusso `PowerPoint Document`, preceduto da un record
-/// `Current User` se il primo record è di quel tipo.
+/// `Current User` se il primo record è di quel tipo. Oracoli: due letture danno le stesse
+/// diapositive, con numeri crescenti da 1 e testi senza caratteri di controllo.
 pub fn ppt_records(data: &[u8]) {
     crate::extract::ppt::fuzz(data);
 }
 
-/// Tokenizer RTF.
+/// Tokenizer RTF. Oracoli: due letture danno gli stessi paragrafi, ognuno con testo e senza
+/// caratteri di controllo, al più un carattere per byte dell'input.
 pub fn rtf(data: &[u8]) {
     crate::extract::rtf::fuzz(data);
 }

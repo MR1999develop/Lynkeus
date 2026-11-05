@@ -288,7 +288,9 @@ impl Search<'_> {
     }
 
     /// Legge e cerca un documento; se qualche documento interno va riletto (vedi
-    /// [`crate::batch`]), lo rilegge.
+    /// [`crate::batch`]), lo rilegge, anche se la prima lettura si è interrotta dopo di lui
+    /// (i documenti completi restano validi). La seconda lettura si ferma all'ultimo
+    /// documento da rileggere.
     fn document(&self, documents: &DocumentSource, document: &QueuedDocument) -> Result<(), Stop> {
         let progress = &self.context.progress;
         progress.set_current(Some(Arc::new(DocPath::file(&document.path))));
@@ -296,14 +298,10 @@ impl Search<'_> {
         let end = self.extract_document(documents, document, Pass::First, &mut rereads)?;
         if end == ExtractEnd::Completed {
             progress.add(Counter::FilesSearched, 1);
-            if !rereads.is_empty() {
-                self.extract_document(
-                    documents,
-                    document,
-                    Pass::Reread(&rereads),
-                    &mut Vec::new(),
-                )?;
-            }
+        }
+        let read = matches!(end, ExtractEnd::Completed | ExtractEnd::Failed(_));
+        if read && !rereads.is_empty() {
+            self.extract_document(documents, document, Pass::Reread(&rereads), &mut Vec::new())?;
         }
         Ok(())
     }
@@ -575,7 +573,202 @@ fn error_path(error: &ignore::Error) -> Option<&Path> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{BufReader, Read, Write};
+    use std::num::NonZeroUsize;
+
+    use lynkeus_core::{Combine, Location, MatchOptions, Term, TextUnit, WildcardMode};
+    use lynkeus_extract::ExtractEvent;
+    use lynkeus_extract::protocol::{FrameReader, FrameWriter, Request, RequestId, Response};
+
     use super::*;
+    use crate::launcher::{LaunchedWorker, WorkerExit, WorkerLauncher, WorkerProcess};
+    use crate::pool::ExtractorPool;
+    use crate::request::{Filters, Limits};
+
+    /// Le risposte di un processo estrattore finto alla sua `n`-esima richiesta (da 0), con
+    /// l'id della richiesta. Senza `Done` in fondo il processo poi tace (scadenza).
+    type Script = fn(usize, RequestId) -> Vec<Response>;
+
+    /// Processi estrattori finti, thread di questo processo collegati con due tubi, che
+    /// rispondono con uno [`Script`] (contando le richieste di tutti i processi).
+    struct ScriptedLauncher {
+        script: Script,
+        requests: Arc<AtomicUsize>,
+    }
+
+    /// Il "processo" di [`ScriptedLauncher`]: il thread finisce quando lo stdin si chiude.
+    struct ScriptedProcess;
+
+    impl WorkerProcess for ScriptedProcess {
+        fn wait_timeout(&mut self, _timeout: Duration) -> io::Result<Option<WorkerExit>> {
+            Ok(Some(WorkerExit::Success))
+        }
+        fn kill(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl WorkerLauncher for ScriptedLauncher {
+        fn launch(&self) -> io::Result<LaunchedWorker> {
+            let (child_stdin, parent_stdin) = io::pipe()?;
+            let (parent_stdout, child_stdout) = io::pipe()?;
+            let script = self.script;
+            let requests = Arc::clone(&self.requests);
+            thread::spawn(move || serve_script(child_stdin, child_stdout, script, &requests));
+            Ok(LaunchedWorker {
+                stdin: Box::new(parent_stdin),
+                stdout: Box::new(parent_stdout),
+                process: Box::new(ScriptedProcess),
+            })
+        }
+    }
+
+    /// Risponde a ogni richiesta con lo script, finché lo stdin resta aperto.
+    fn serve_script(input: impl Read, output: impl Write, script: Script, count: &AtomicUsize) {
+        let mut reader = FrameReader::new(BufReader::new(input));
+        let mut writer = FrameWriter::new(output);
+        while let Ok(Some(Request::Extract(request))) = reader.read::<Request>() {
+            let n = count.fetch_add(1, Ordering::Relaxed);
+            for response in script(n, request.id) {
+                if writer.write(&response).is_err() {
+                    return;
+                }
+            }
+            if writer.flush().is_err() {
+                return;
+            }
+        }
+    }
+
+    fn event(id: RequestId, event: ExtractEvent) -> Response {
+        Response::Event { id, event }
+    }
+
+    fn start(id: RequestId, name: &str) -> Response {
+        event(
+            id,
+            ExtractEvent::DocumentStart {
+                inner: vec![name.to_owned()],
+                format: lynkeus_extract::Format::Text,
+            },
+        )
+    }
+
+    fn line(id: RequestId, n: u32, text: &str) -> Response {
+        event(
+            id,
+            ExtractEvent::Unit(TextUnit {
+                location: Location::Line(n),
+                text: text.to_owned(),
+            }),
+        )
+    }
+
+    /// `a.txt` intera (20 righe "carta", poi "zeta"), poi un `b.pdf` che non finisce.
+    fn archive_then_silence(id: RequestId, lines_of_a: u32) -> Vec<Response> {
+        let mut responses = vec![start(id, "a.txt")];
+        responses.extend((1..=lines_of_a.min(20)).map(|n| line(id, n, "carta")));
+        if lines_of_a > 20 {
+            responses.push(line(id, 21, "zeta"));
+            responses.push(event(id, ExtractEvent::DocumentEnd));
+            responses.push(start(id, "b.pdf"));
+        }
+        responses
+    }
+
+    /// Cerca "ar" e "zeta" (AND) in un documento finto, con 10 posti per i risultati
+    /// trattenuti: `a.txt` non trova posto e va riletta. Gli eventi della ricerca.
+    fn search_scripted(script: Script) -> Vec<SearchEvent> {
+        let terms = ["ar", "zeta"]
+            .iter()
+            .map(|t| Term::parse(t, WildcardMode::Enabled).expect("termine valido"))
+            .collect();
+        let request = SearchRequest {
+            roots: Vec::new(),
+            query: Query::new(terms, MatchOptions::default(), Combine::All)
+                .and_then(|q| q.compile())
+                .expect("query valida"),
+            filters: Filters::default(),
+            limits: Limits {
+                extract_timeout: Duration::from_millis(300),
+                ..Limits::default()
+            },
+        };
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        let context = WorkerContext {
+            sender,
+            notify: Arc::new(|| {}),
+            progress: Arc::new(Progress::default()),
+            cancel: Arc::new(AtomicBool::new(false)),
+            documents: None,
+        };
+        let launcher = ScriptedLauncher {
+            script,
+            requests: Arc::new(AtomicUsize::new(0)),
+        };
+        let pool = ExtractorPool::new(Arc::new(launcher), NonZeroUsize::MIN);
+        let documents = DocumentSource::new(pool, None);
+        let search = Search {
+            request: &request,
+            context: &context,
+            filter: FileFilter::new(&request.filters),
+            halt: Halt::default(),
+            budget: Budget::new(1000),
+            held: HeldHits::new(10),
+        };
+        let queued = QueuedDocument {
+            root: 0,
+            path: PathBuf::from("archivio.zip"),
+        };
+        assert_eq!(search.document(&documents, &queued), Ok(()));
+        drop(context);
+        receiver.try_iter().collect()
+    }
+
+    /// Le righe consegnate per la voce `inner` e gli avvisi (voce, motivo).
+    fn outcome(events: &[SearchEvent], inner: &str) -> (usize, Vec<(Vec<String>, WarningKind)>) {
+        let mut hits = 0;
+        let mut warnings = Vec::new();
+        for event in events {
+            match event {
+                SearchEvent::Hits(batch) => {
+                    hits += batch.iter().filter(|h| h.doc.inner == [inner]).count();
+                }
+                SearchEvent::Warning(warning) => {
+                    warnings.push((warning.doc.inner.clone(), warning.kind));
+                }
+                _ => {}
+            }
+        }
+        (hits, warnings)
+    }
+
+    /// B-05: la prima lettura finisce per scadenza su `b.pdf`, dopo `a.txt` completa ma da
+    /// rileggere: la seconda lettura consegna le 21 righe di `a.txt` e si ferma lì (senza
+    /// un'altra scadenza né un altro avviso); `b.pdf` ha il suo avviso una volta sola.
+    #[test]
+    fn rereads_are_delivered_after_a_failed_first_read() {
+        let events = search_scripted(|_, id| archive_then_silence(id, 21));
+        let (hits, warnings) = outcome(&events, "a.txt");
+        assert_eq!(hits, 21);
+        assert_eq!(warnings, [(vec!["b.pdf".to_owned()], WarningKind::Timeout)]);
+    }
+
+    /// Se anche la seconda lettura si interrompe prima della fine di `a.txt`, i suoi
+    /// risultati non si perdono in silenzio: `a.txt` ha un avviso.
+    #[test]
+    fn a_reread_cut_short_warns_the_documents_it_misses() {
+        let events = search_scripted(|n, id| archive_then_silence(id, if n == 0 { 21 } else { 5 }));
+        let (hits, warnings) = outcome(&events, "a.txt");
+        assert_eq!(hits, 0);
+        assert_eq!(
+            warnings,
+            [
+                (vec!["b.pdf".to_owned()], WarningKind::Timeout),
+                (vec!["a.txt".to_owned()], WarningKind::Timeout),
+            ]
+        );
+    }
 
     #[test]
     fn budget_reservations() {

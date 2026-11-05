@@ -10,6 +10,8 @@ byte per byte deterministico): solo la libreria standard di Python.
 - sparso.zip: sparso.xlsx seguito da nota.txt, per provare che le voci dopo il foglio si
   leggono ancora.
 - slide-ripetute.pptx: una presentazione che elenca 10.000 volte la stessa diapositiva.
+- testo-ripetuto.ods: una cella di testo di 300 caratteri ripetuta su 16.384 colonne e 255
+  righe (meno di 1 KB): un lettore che clona il testo per ogni ripetizione supera 1 GB.
 - dizionario-enorme.7z: un 7z (LZMA2, intestazione non compressa) con una riga di testo e il
   dizionario dichiarato portato a 2 GiB: un decodificatore che lo allocasse subito
   supererebbe il limite di memoria dell'estrattore. Richiede 7-Zip
@@ -165,7 +167,40 @@ def huge_dictionary_7z():
     return bytes(data)
 
 
+def repeated_text_ods():
+    """Un ods di meno di 1 KB: una cella di testo di 300 caratteri ripetuta su 16.384 colonne
+    e 255 righe. Le celle (circa 4,2 milioni) stanno sotto un tetto contato in celle, ma un
+    lettore che clona il testo per ogni ripetizione ne fa oltre 1 GB."""
+    mime = "application/vnd.oasis.opendocument.spreadsheet"
+    manifest = (
+        '<manifest:manifest xmlns:manifest="urn:oasis:names:tc:opendocument:xmlns:manifest:1.0">'
+        f'<manifest:file-entry manifest:full-path="/" manifest:media-type="{mime}"/>'
+        '</manifest:manifest>'
+    )
+    content = (
+        '<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" '
+        'xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" '
+        'xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0">'
+        '<office:body><office:spreadsheet><table:table table:name="Ripetuto">'
+        '<table:table-row table:number-rows-repeated="255">'
+        '<table:table-cell office:value-type="string" table:number-columns-repeated="16384">'
+        f'<text:p>{"aragosta " * 33}fin</text:p></table:table-cell></table:table-row>'
+        '</table:table></office:spreadsheet></office:body></office:document-content>'
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        for name, data, method in (("mimetype", mime, zipfile.ZIP_STORED),
+                                   ("META-INF/manifest.xml", manifest, zipfile.ZIP_DEFLATED),
+                                   ("content.xml", content, zipfile.ZIP_DEFLATED)):
+            info = zipfile.ZipInfo(name, DATE)
+            info.compress_type = method
+            info.external_attr = 0o644 << 16
+            z.writestr(info, data)
+    return buf.getvalue()
+
+
 def main():
+    write("testo-ripetuto.ods", repeated_text_ods())
     xlsx = sparse_xlsx()
     write("sparso.xlsx", xlsx)
     write("sparso.zip", zip_bytes([("sparso.xlsx", xlsx), ("nota.txt", "aragosta in nota\n".encode())]))

@@ -37,8 +37,9 @@
 //! **Pulizia**: LRU sul totale dei byte delle voci; la data di modifica di una voce letta si
 //! aggiorna, così l'ordine sopravvive al riavvio e vale tra istanze del programma. Una voce
 //! che da sola supera il limite non si salva. L'indice in memoria si rilegge dalla cartella
-//! ogni `RESCAN_PUTS` scritture e a ogni cambio di limite, così le voci scritte da un'altra
-//! istanza contano nel limite.
+//! dopo `RESCAN_PUTS` scritture, e non più spesso di una volta ogni `RESCAN_SHARE` voci
+//! dell'indice (la rilettura costa quanto le voci), e a ogni cambio di limite, così le voci
+//! scritte da un'altra istanza contano nel limite.
 //!
 //! L'I/O (elenco della cartella, cancellazioni) avviene sempre fuori dal lucchetto
 //! dell'indice.
@@ -67,8 +68,19 @@ pub const DEFAULT_CACHE_SIZE: ByteSize = ByteSize::from_mib(500);
 /// si salva (si rilegge ogni volta).
 pub const MAX_ENTRY_BYTES: usize = 64 * 1024 * 1024;
 
-/// Ogni quante scritture l'indice si rilegge dalla cartella.
+/// Scritture almeno tra due riletture della cartella.
 const RESCAN_PUTS: u64 = 64;
+
+/// Una rilettura della cartella ogni tante voci dell'indice: la rilettura è lineare nelle
+/// voci, così il suo costo per scrittura resta fisso.
+const RESCAN_SHARE: u64 = 16;
+
+/// Vero se, dopo `puts` scritture dall'ultima rilettura, con `entries` voci nell'indice, la
+/// cartella va riletta: almeno [`RESCAN_PUTS`] scritture e almeno una ogni [`RESCAN_SHARE`]
+/// voci.
+fn rescan_due(puts: u64, entries: u64) -> bool {
+    puts >= RESCAN_PUTS.max(entries / RESCAN_SHARE)
+}
 
 const MAGIC: [u8; 4] = *b"LKC\0";
 const HEADER_BYTES: usize = 4 + 2 + 2 + 32 + 4 + 4 + 4;
@@ -417,9 +429,10 @@ impl TextCache {
         let (victims, rescan) = self.with_index(|index| {
             index.insert(name.clone(), entry_bytes);
             index.puts_since_scan += 1;
+            let entries = u64::try_from(index.entries.len()).unwrap_or(u64::MAX);
             (
                 index.evict(max, Some(&name)),
-                index.puts_since_scan >= RESCAN_PUTS,
+                rescan_due(index.puts_since_scan, entries),
             )
         });
         self.remove_files(&victims);
@@ -945,6 +958,20 @@ mod tests {
         assert_eq!(cache.read(&key(1), &mut first), CacheRead::Stopped);
         assert_eq!(first.0.len(), 1);
         assert_eq!(cache.get(&key(1)), Some(events("carta")));
+    }
+
+    /// La cartella si rilegge dopo almeno [`RESCAN_PUTS`] scritture e almeno una ogni
+    /// [`RESCAN_SHARE`] voci dell'indice: con molte voci piccole la rilettura (lineare nelle
+    /// voci: circa 50-70 ms con 20.000-30.000 voci su NTFS) costa per scrittura una quota
+    /// fissa, non una che cresce con la cache.
+    #[test]
+    fn rescan_cadence_grows_with_the_index() {
+        assert!(!rescan_due(RESCAN_PUTS - 1, 0));
+        assert!(rescan_due(RESCAN_PUTS, 0));
+        assert!(rescan_due(RESCAN_PUTS, 64 * RESCAN_SHARE));
+        let entries = 10_000_u64;
+        assert!(!rescan_due(entries / RESCAN_SHARE - 1, 10_000));
+        assert!(rescan_due(entries / RESCAN_SHARE, 10_000));
     }
 
     /// Le voci scritte da un'altra istanza contano nel limite dopo la rilettura; l'ordine

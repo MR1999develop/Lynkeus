@@ -7,8 +7,6 @@
 use std::fs::File;
 use std::io;
 use std::path::Path;
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 
 /// Apre `path` in sola lettura per una lettura dall'inizio alla fine.
 ///
@@ -35,25 +33,47 @@ pub fn limit_address_space(bytes: u64) -> io::Result<MemoryLimitOwner> {
     imp::limit_address_space(bytes)
 }
 
-/// Mette `parent_gone` a vero quando il processo che ha avviato questo termina.
+/// Chiama `on_gone` quando il processo padre `expected` (il pid passato dal processo
+/// principale; senza, il padre letto all'avvio) non è più il padre di questo processo.
 ///
-/// Linux: un thread legge il padre in `/proc/self/stat` ogni [`PARENT_CHECK_INTERVAL`];
-/// quando cambia (il padre è terminato e il processo è passato a `init` o a un
-/// sottomietitore) imposta il segnale ed esce. Il segnale lo legge chi serve le richieste.
-/// Non si usano `PR_SET_PDEATHSIG` né un `pidfd`: il primo partirebbe alla fine del *thread*
-/// che ha avviato il processo (il motore li avvia da thread che finiscono con la ricerca,
-/// mentre il processo resta nel pool), e in questo crate nessun modulo di gestione dei
-/// processi è ammesso (controllo `nospawn` di `xtask`). Windows: non fa nulla, il Job
-/// Object del padre (`KILL_ON_JOB_CLOSE`) termina l'estrattore. Altri sistemi: non fa nulla.
+/// Linux: un thread legge il padre in `/proc/self/stat` subito e poi ogni
+/// [`PARENT_CHECK_INTERVAL`]; appena è diverso da `expected` (il padre è terminato, anche
+/// prima che questo processo iniziasse a sorvegliarlo, e il processo è passato a `init` o a
+/// un sottomietitore) chiama `on_gone` ed esce. `on_gone` può terminare il processo: un
+/// estrattore occupato in un decodificatore non arriverebbe a controllare un segnale.
+///
+/// `PR_SET_PDEATHSIG` non si usa. Oggi i processi nascono dal thread del pool, che vive
+/// quanto il pool, quindi il segnale partirebbe al momento giusto; ma chiamare `prctl`
+/// richiede in questo crate un modulo di gestione dei processi, che il controllo `nospawn` di
+/// `xtask` non ammette, e il figlio dovrebbe comunque confrontare il padre con `expected`
+/// per il padre morto prima della chiamata. Il controllo periodico copre entrambi i casi entro
+/// [`PARENT_CHECK_INTERVAL`]. Windows: non fa nulla, il Job Object del padre
+/// (`KILL_ON_JOB_CLOSE`) termina l'estrattore. Altri sistemi: non fa nulla.
 ///
 /// Errore se il padre non si legge o il thread non parte.
-pub fn watch_parent(parent_gone: Arc<AtomicBool>) -> io::Result<()> {
-    imp::watch_parent(parent_gone)
+pub fn watch_parent(
+    expected: Option<u32>,
+    on_gone: impl FnOnce() + Send + 'static,
+) -> io::Result<()> {
+    imp::watch_parent(expected, on_gone)
 }
 
 /// Intervallo dei controlli del padre.
 #[cfg(any(target_os = "linux", test))]
 const PARENT_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Legge il padre con `read_parent` finché è `expected`, chiamando `pause` tra una lettura e
+/// l'altra; torna appena è diverso o non si legge, anche alla prima lettura.
+#[cfg(any(target_os = "linux", test))]
+fn wait_while_parent_is(
+    expected: u32,
+    mut read_parent: impl FnMut() -> io::Result<u32>,
+    mut pause: impl FnMut(),
+) {
+    while read_parent().ok() == Some(expected) {
+        pause();
+    }
+}
 
 /// Il pid del padre dalla riga di `/proc/<pid>/stat` ("pid (nome) stato ppid …"): il nome
 /// può contenere spazi e parentesi, quindi i campi si contano dopo l'ultima `)`.
@@ -71,8 +91,6 @@ mod imp {
     use std::io;
     use std::os::windows::fs::OpenOptionsExt;
     use std::path::Path;
-    use std::sync::Arc;
-    use std::sync::atomic::AtomicBool;
 
     use super::MemoryLimitOwner;
 
@@ -97,7 +115,10 @@ mod imp {
         clippy::unnecessary_wraps,
         reason = "stessa firma della versione Linux, che può fallire"
     )]
-    pub fn watch_parent(_parent_gone: Arc<AtomicBool>) -> io::Result<()> {
+    pub fn watch_parent(
+        _expected: Option<u32>,
+        _on_gone: impl FnOnce() + Send + 'static,
+    ) -> io::Result<()> {
         Ok(())
     }
 }
@@ -107,8 +128,6 @@ mod imp {
     use std::fs::File;
     use std::io;
     use std::path::Path;
-    use std::sync::Arc;
-    use std::sync::atomic::AtomicBool;
 
     use super::MemoryLimitOwner;
 
@@ -122,25 +141,30 @@ mod imp {
     }
 
     #[cfg(target_os = "linux")]
-    pub fn watch_parent(parent_gone: Arc<AtomicBool>) -> io::Result<()> {
-        use std::sync::atomic::Ordering;
+    pub fn watch_parent(
+        expected: Option<u32>,
+        on_gone: impl FnOnce() + Send + 'static,
+    ) -> io::Result<()> {
         use std::thread;
 
-        use super::PARENT_CHECK_INTERVAL;
+        use super::{PARENT_CHECK_INTERVAL, wait_while_parent_is};
 
         /// Pila del thread di sorveglianza: legge un file corto.
         const WATCH_STACK_BYTES: usize = 64 * 1024;
 
-        let parent = current_parent()?;
+        let expected = match expected {
+            Some(pid) => pid,
+            None => current_parent()?,
+        };
         thread::Builder::new()
             .name("lynkeus-padre".to_owned())
             .stack_size(WATCH_STACK_BYTES)
             .spawn(move || {
                 // Un padre che non si legge più conta come cambiato: meglio fermarsi.
-                while current_parent().ok() == Some(parent) {
+                wait_while_parent_is(expected, current_parent, || {
                     thread::sleep(PARENT_CHECK_INTERVAL);
-                }
-                parent_gone.store(true, Ordering::Relaxed);
+                });
+                on_gone();
             })?;
         Ok(())
     }
@@ -158,7 +182,10 @@ mod imp {
         clippy::unnecessary_wraps,
         reason = "stessa firma della versione Linux, che può fallire"
     )]
-    pub fn watch_parent(_parent_gone: Arc<AtomicBool>) -> io::Result<()> {
+    pub fn watch_parent(
+        _expected: Option<u32>,
+        _on_gone: impl FnOnce() + Send + 'static,
+    ) -> io::Result<()> {
         Ok(())
     }
 }
@@ -179,5 +206,41 @@ mod tests {
         assert_eq!(parent_from_stat("7 (x) S"), None);
         assert_eq!(parent_from_stat("7 (x) S -"), None);
         assert!(PARENT_CHECK_INTERVAL.as_millis() > 0);
+    }
+
+    /// Letture del padre in sequenza; finite, il padre non si legge più.
+    fn parents<const N: usize>(sequence: [u32; N]) -> impl FnMut() -> io::Result<u32> {
+        let mut sequence = sequence.into_iter();
+        move || sequence.next().ok_or_else(|| io::Error::other("finito"))
+    }
+
+    /// Il padre atteso si confronta dalla prima lettura: un padre già morto prima della
+    /// sorveglianza (processo già passato a `init`) si vede subito; un padre che cambia dopo
+    /// si vede alla lettura seguente; un padre che non si legge conta come cambiato.
+    #[test]
+    fn parent_watch_partitions() {
+        let mut pauses = 0;
+        wait_while_parent_is(42, parents([1]), || pauses += 1);
+        assert_eq!(pauses, 0, "padre già cambiato prima di iniziare");
+        let mut pauses = 0;
+        wait_while_parent_is(42, parents([42, 42, 1]), || pauses += 1);
+        assert_eq!(pauses, 2);
+        let mut pauses = 0;
+        wait_while_parent_is(42, parents([42]), || pauses += 1);
+        assert_eq!(pauses, 1, "padre illeggibile alla seconda lettura");
+    }
+
+    /// Su Linux, con un padre atteso che non è il padre vero, `on_gone` arriva subito.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn wrong_expected_parent_is_gone_at_once() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        // Nessun processo ha questo pid (il massimo di Linux è 2^22).
+        let not_my_parent = u32::MAX;
+        let started = watch_parent(Some(not_my_parent), move || {
+            let _sent = tx.send(());
+        });
+        assert!(started.is_ok());
+        assert!(rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok());
     }
 }

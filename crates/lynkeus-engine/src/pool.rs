@@ -81,8 +81,9 @@ const STOP_RECHECK: Duration = Duration::from_millis(25);
 /// standard non ha un'attesa con scadenza su un processo).
 const REAP_TICK: Duration = Duration::from_millis(10);
 
-/// Messaggi letti e non ancora consumati per processo: con unità fino a 1 MiB, al più circa
-/// 16 MiB in memoria.
+/// Messaggi letti e non ancora consumati per processo: con frame al più di 1,25 MiB
+/// (`MAX_FRAME_BYTES`, controllato dal lettore prima di allocare), al più circa 20 MiB in
+/// memoria anche se il processo non rispetta i suoi limiti.
 const MESSAGE_QUEUE: usize = 16;
 
 /// Tentativi per un file quando il processo non prende la richiesta (morto da libero, o la

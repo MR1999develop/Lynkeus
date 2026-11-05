@@ -352,14 +352,29 @@ fn push_text_atom(record: &Record<'_>, lines: &mut Vec<String>) {
 
 /// Punto d'ingresso per il fuzzing: `data` è il flusso `PowerPoint Document`; se i primi
 /// byte sono un `Current User` valido (record di tipo 0x0FF6 in testa) li si usa come tale e
-/// il resto come flusso. Non deve mai andare in panic.
+/// il resto come flusso. Non deve mai andare in panic. Oracoli: due letture danno le stesse
+/// diapositive; i numeri crescono a partire da 1; ogni testo ha testo e nessun carattere di
+/// controllo (salvo tabulazione e a capo). Nessun tetto ai caratteri: un contenitore annidato
+/// in un altro si legge, giustamente, con tutte e due le diapositive.
 #[cfg(any(test, feature = "fuzzing"))]
 pub(crate) fn fuzz(data: &[u8]) {
     let (user, stream) = match record_at(data, 0) {
         Some((record, end)) if record.kind == 0x0FF6 => (data.get(..end), data.get(end..)),
         _ => (None, Some(data)),
     };
-    let _ignored = slide_texts(stream.unwrap_or_default(), user);
+    let stream = stream.unwrap_or_default();
+    let first = slide_texts(stream, user).ok();
+    assert_eq!(first, slide_texts(stream, user).ok(), "due letture diverse");
+    let slides = first.unwrap_or_default();
+    let numbers: Vec<u32> = slides.iter().map(|(number, _)| *number).collect();
+    assert!(
+        numbers.first().is_none_or(|first| *first >= 1),
+        "{numbers:?}"
+    );
+    assert!(numbers.is_sorted_by(|a, b| a < b), "{numbers:?}");
+    let texts: Vec<String> = slides.into_iter().map(|(_, text)| text).collect();
+    let violation = super::paragraph_violation(&texts, usize::MAX);
+    assert_eq!(violation, None, "{texts:?}");
 }
 
 #[cfg(test)]
@@ -570,6 +585,10 @@ mod tests {
                 let total: usize = texts.iter().map(|(_, t)| t.len()).sum();
                 prop_assert!(total <= stream.len() * 2);
             }
+            // Gli oracoli del fuzzing su input plausibili, che raggiungono più codice.
+            let mut input = user.clone();
+            input.extend_from_slice(&stream);
+            fuzz(&input);
         }
     }
 }

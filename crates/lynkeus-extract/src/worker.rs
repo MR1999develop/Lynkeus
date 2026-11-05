@@ -5,22 +5,26 @@
 //! [`protocol`](crate::protocol).
 //!
 //! L'app avvia lo stesso eseguibile con l'opzione nascosta `--extract-worker` seguita da
-//! [`WorkerConfig::to_args`], e nel figlio chiama [`run`] con stdin e stdout. Il ciclo:
+//! [`WorkerConfig::to_args`] (limite di memoria e pid del padre), e nel figlio chiama [`run`]
+//! con stdin, stdout e ciò che va fatto se il padre muore (l'app termina il processo). Il
+//! ciclo:
 //!
 //! 1. all'avvio, prima di leggere qualunque file, avvia la sorveglianza del padre
-//!    ([`watch_parent`]) e imposta il limite di memoria (`RLIMIT_AS` su Linux; su Windows lo
-//!    impone il Job Object del padre). Senza limite configurato, o se una delle due cose non
-//!    riesce, esce con errore: un estrattore senza limite non parte;
+//!    ([`watch_parent`], con il pid ricevuto) e imposta il limite di memoria (`RLIMIT_AS` su
+//!    Linux; su Windows lo impone il Job Object del padre). Senza limite configurato, o se
+//!    una delle due cose non riesce, esce con errore: un estrattore senza limite non parte;
 //! 2. per ogni [`Request::Extract`] chiama [`extract_path`] e manda gli eventi man mano
 //!    (il buffer si svuota a ogni fine documento e alla fine della richiesta); per ogni
 //!    [`Request::ExtractEntry`] chiama [`extract_entry`] e manda i byte della voce a pezzi,
 //!    poi l'esito;
 //! 3. esce con `Ok` quando stdin finisce tra una richiesta e l'altra (il padre lo chiude per
 //!    fermarlo), con errore su un frame non valido (dopo aver mandato
-//!    [`Response::Rejected`]), se stdout non si scrive più o se il padre è terminato: in
-//!    quel caso l'estrazione in corso si ferma al primo evento e le richieste in coda non si
-//!    servono. Così un estrattore occupato non resta orfano (Linux; su Windows il Job Object
-//!    del padre lo termina).
+//!    [`Response::Rejected`]), se stdout non si scrive più o se il padre è terminato. Quando
+//!    il padre termina la sorveglianza chiama la funzione del chiamante, che nell'app
+//!    termina subito il processo anche se un decodificatore è occupato; se la funzione
+//!    torna, l'estrazione in corso si ferma al primo evento e le richieste in coda non si
+//!    servono. Così un estrattore non resta orfano (Linux; su Windows il Job Object del
+//!    padre lo termina).
 //!
 //! Il processo legge solo i file richiesti, non scrive su disco, non avvia programmi e non
 //! usa la rete. Stdout è riservato al protocollo: niente `print!` in questo crate (i log, se
@@ -53,6 +57,9 @@ pub const DEFAULT_MEMORY_LIMIT: ByteSize = ByteSize::from_gib(1);
 /// Limite minimo accettato: sotto, il processo non riuscirebbe nemmeno a partire.
 pub const MIN_MEMORY_LIMIT: ByteSize = ByteSize::from_mib(64);
 
+/// Opzione che porta il pid del processo principale.
+pub const PARENT_PID_FLAG: &str = "--parent-pid";
+
 /// Configurazione del processo estrattore, passata come argomenti dal padre.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct WorkerConfig {
@@ -60,6 +67,10 @@ pub struct WorkerConfig {
     /// per [`run`]: con `None` il processo non parte. `None` resta possibile solo per chi
     /// avvia un processo di prova che non chiama [`run`].
     pub memory_limit: Option<ByteSize>,
+    /// Pid del processo principale, che lo passa per sé: il figlio riconosce così la sua
+    /// morte anche se avviene prima che inizi a sorvegliarlo. Con `None` vale il padre letto
+    /// all'avvio della sorveglianza (un "processo" di prova nello stesso processo).
+    pub parent_pid: Option<u32>,
 }
 
 /// Argomenti del processo estrattore non validi.
@@ -71,21 +82,24 @@ pub enum ArgsError {
     /// Opzione senza valore.
     #[error("valore mancante dopo {MEMORY_LIMIT_FLAG}")]
     MissingValue,
-    /// Valore non numerico o sotto [`MIN_MEMORY_LIMIT`].
-    #[error("limite di memoria non valido")]
+    /// Valore non numerico, limite sotto [`MIN_MEMORY_LIMIT`] o pid zero.
+    #[error("valore non valido")]
     InvalidValue,
 }
 
 impl WorkerConfig {
     /// Gli argomenti da passare al figlio dopo `--extract-worker`.
     pub fn to_args(&self) -> Vec<OsString> {
-        match self.memory_limit {
-            Some(limit) => vec![
-                OsString::from(MEMORY_LIMIT_FLAG),
-                OsString::from(limit.bytes().to_string()),
-            ],
-            None => Vec::new(),
+        let mut args = Vec::new();
+        if let Some(limit) = self.memory_limit {
+            args.push(OsString::from(MEMORY_LIMIT_FLAG));
+            args.push(OsString::from(limit.bytes().to_string()));
         }
+        if let Some(pid) = self.parent_pid {
+            args.push(OsString::from(PARENT_PID_FLAG));
+            args.push(OsString::from(pid.to_string()));
+        }
+        args
     }
 
     /// Legge gli argomenti che seguono `--extract-worker` (quelli di [`WorkerConfig::to_args`]).
@@ -94,16 +108,27 @@ impl WorkerConfig {
         let mut config = WorkerConfig::default();
         let mut args = args.into_iter();
         while let Some(arg) = args.next() {
-            if arg != MEMORY_LIMIT_FLAG {
+            let flag = if arg == MEMORY_LIMIT_FLAG {
+                MEMORY_LIMIT_FLAG
+            } else if arg == PARENT_PID_FLAG {
+                PARENT_PID_FLAG
+            } else {
                 return Err(ArgsError::Unknown);
-            }
+            };
             let value = args.next().ok_or(ArgsError::MissingValue)?;
-            let bytes = value
-                .to_str()
-                .and_then(|v| v.parse::<u64>().ok())
-                .filter(|b| *b >= MIN_MEMORY_LIMIT.bytes())
-                .ok_or(ArgsError::InvalidValue)?;
-            config.memory_limit = Some(ByteSize::from_bytes(bytes));
+            let number = value.to_str().and_then(|v| v.parse::<u64>().ok());
+            if flag == MEMORY_LIMIT_FLAG {
+                let bytes = number
+                    .filter(|b| *b >= MIN_MEMORY_LIMIT.bytes())
+                    .ok_or(ArgsError::InvalidValue)?;
+                config.memory_limit = Some(ByteSize::from_bytes(bytes));
+            } else {
+                let pid = number
+                    .and_then(|n| u32::try_from(n).ok())
+                    .filter(|pid| *pid > 0)
+                    .ok_or(ArgsError::InvalidValue)?;
+                config.parent_pid = Some(pid);
+            }
         }
         Ok(config)
     }
@@ -126,26 +151,33 @@ pub enum WorkerError {
     Protocol(#[source] ProtocolError),
 }
 
-/// Mette `parent_gone` a vero quando il processo che ha avviato questo termina (Linux; su
-/// Windows non fa nulla, il Job Object del padre termina l'estrattore). [`run`] la chiama
-/// da sé e ferma l'estrazione al primo evento dopo il segnale; serve a parte solo a un
-/// processo di prova che non usa [`run`].
+/// Chiama `on_gone` quando il processo padre `expected` (il pid ricevuto con
+/// [`PARENT_PID_FLAG`]; senza, il padre letto all'avvio) termina, anche se è terminato prima
+/// della chiamata (Linux; su Windows non fa nulla, il Job Object del padre termina
+/// l'estrattore). `on_gone` gira in un thread di sorveglianza e può terminare il processo.
+/// [`run`] la chiama da sé; serve a parte solo a un processo di prova che non usa [`run`].
 ///
 /// Errore se la sorveglianza non parte.
-pub fn watch_parent(parent_gone: Arc<AtomicBool>) -> io::Result<()> {
-    platform::watch_parent(parent_gone)
+pub fn watch_parent(
+    expected: Option<u32>,
+    on_gone: impl FnOnce() + Send + 'static,
+) -> io::Result<()> {
+    platform::watch_parent(expected, on_gone)
 }
 
 /// Il ciclo del processo estrattore su `input` (stdin) e `output` (stdout).
 ///
-/// Prima di leggere qualunque richiesta avvia la sorveglianza del padre e impone il limite
-/// di memoria di `config`, obbligatorio: senza, [`WorkerError::MemoryLimit`] e nessuna
-/// richiesta servita. Restituisce `Ok` quando `input` finisce tra una richiesta e l'altra,
-/// [`WorkerError::ParentGone`] se il padre termina prima.
+/// Prima di leggere qualunque richiesta avvia la sorveglianza del padre di `config` e impone
+/// il limite di memoria di `config`, obbligatorio: senza, [`WorkerError::MemoryLimit`] e
+/// nessuna richiesta servita. Quando il padre termina chiama `on_parent_gone` (l'app termina
+/// il processo: in questo crate nessun modulo gestisce i processi); se torna, l'estrazione in
+/// corso si ferma al primo evento. Restituisce `Ok` quando `input` finisce tra una richiesta
+/// e l'altra, [`WorkerError::ParentGone`] se il padre termina prima.
 pub fn run<R: Read, W: Write>(
     input: R,
     output: W,
     config: &WorkerConfig,
+    on_parent_gone: impl FnOnce() + Send + 'static,
 ) -> Result<(), WorkerError> {
     let Some(limit) = config.memory_limit else {
         return Err(WorkerError::MemoryLimit(io::Error::new(
@@ -154,7 +186,12 @@ pub fn run<R: Read, W: Write>(
         )));
     };
     let parent_gone = Arc::new(AtomicBool::new(false));
-    watch_parent(Arc::clone(&parent_gone)).map_err(WorkerError::ParentWatch)?;
+    let signal = Arc::clone(&parent_gone);
+    watch_parent(config.parent_pid, move || {
+        signal.store(true, Ordering::Relaxed);
+        on_parent_gone();
+    })
+    .map_err(WorkerError::ParentWatch)?;
     platform::limit_address_space(limit.bytes()).map_err(WorkerError::MemoryLimit)?;
     serve_requests(input, output, &parent_gone)
 }
@@ -451,7 +488,12 @@ mod tests {
         let mut input = Vec::new();
         assert!(encode_frame(&request(1, fixture("formati/spesa.txt")), &mut input).is_ok());
         let mut output = Vec::new();
-        let result = run(input.as_slice(), &mut output, &WorkerConfig::default());
+        let result = run(
+            input.as_slice(),
+            &mut output,
+            &WorkerConfig::default(),
+            || {},
+        );
         assert!(
             matches!(result, Err(WorkerError::MemoryLimit(_))),
             "{result:?}"
@@ -553,8 +595,26 @@ mod tests {
     fn args_round_trip_and_partitions() {
         let config = WorkerConfig {
             memory_limit: Some(DEFAULT_MEMORY_LIMIT),
+            parent_pid: Some(4321),
         };
         assert_eq!(WorkerConfig::from_args(config.to_args()), Ok(config));
+        let parent = |value: &str| {
+            WorkerConfig::from_args([OsString::from(PARENT_PID_FLAG), OsString::from(value)])
+        };
+        assert_eq!(
+            parent("77"),
+            Ok(WorkerConfig {
+                memory_limit: None,
+                parent_pid: Some(77),
+            })
+        );
+        assert_eq!(parent("0"), Err(ArgsError::InvalidValue));
+        assert_eq!(parent("-1"), Err(ArgsError::InvalidValue));
+        assert_eq!(parent("4294967296"), Err(ArgsError::InvalidValue));
+        assert_eq!(
+            WorkerConfig::from_args([OsString::from(PARENT_PID_FLAG)]),
+            Err(ArgsError::MissingValue)
+        );
         assert_eq!(
             WorkerConfig::from_args(Vec::new()),
             Ok(WorkerConfig::default())

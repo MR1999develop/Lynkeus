@@ -10,7 +10,7 @@
 
 use std::io::Cursor;
 
-use cfb::CompoundFile;
+use cfb::{CompoundFile, Version};
 
 use crate::error::ExtractError;
 use crate::extract::budget::{LimitedReader, read_all};
@@ -49,9 +49,13 @@ impl Compound {
 /// Un file composto nuovo, in memoria, con il solo flusso `name` (dalla radice) di contenuto
 /// `data`: a una libreria che rilegge il file composto per conto suo si dà così proprio il
 /// flusso che si è già esaminato, qualunque cosa contenesse la directory originale.
+///
+/// Versione 3 (settori da 512 byte), quella dei file di Office 97-2003: il lettore di
+/// `calamine` calcola il numero massimo di settori piccoli dalla dimensione dei settori
+/// grandi, e con la versione 4 (settori da 4096 byte) si ferma dopo circa 2 KB di flusso.
 pub(crate) fn single_stream(name: &str, data: &[u8]) -> Result<Vec<u8>, ExtractError> {
     let written = (|| -> std::io::Result<Vec<u8>> {
-        let mut file = CompoundFile::create(Cursor::new(Vec::new()))?;
+        let mut file = CompoundFile::create_with_version(Version::V3, Cursor::new(Vec::new()))?;
         {
             let mut stream = file.create_stream(name)?;
             std::io::Write::write_all(&mut stream, data)?;

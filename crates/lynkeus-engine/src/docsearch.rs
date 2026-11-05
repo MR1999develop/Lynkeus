@@ -9,7 +9,10 @@
 //! [`HitBatcher`] per documento, come la ricerca nei file di testo. Gli avvisi diventano
 //! avvisi della ricerca con il documento a cui si riferiscono; i documenti saltati si
 //! contano. I documenti che il batcher vuole rileggere ([`Verdict::Reread`]) si raccolgono:
-//! chi chiama rilegge il file con [`Pass::Reread`], che guarda solo quei documenti.
+//! chi chiama rilegge il file con [`Pass::Reread`], che guarda solo quei documenti e chiede
+//! di fermare l'estrazione appena li ha consegnati tutti (i documenti seguono lo stesso
+//! ordine, quindi un errore più avanti nel file, come una scadenza, non si ripete). Se la
+//! seconda lettura si interrompe prima, ognuno dei documenti mancanti ha un avviso.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -52,6 +55,8 @@ pub(crate) struct DocSearch<'a, S: HitSink> {
     open: Option<OpenDocument<'a>>,
     /// Voci dei documenti da rileggere.
     rereads: Vec<Vec<String>>,
+    /// Seconda lettura: le voci dei documenti non ancora consegnati.
+    pending: Vec<Vec<String>>,
     /// Perché la ricerca si è fermata durante la consegna, se è successo.
     stopped: Option<Stop>,
 }
@@ -78,6 +83,10 @@ impl<'a, S: HitSink> DocSearch<'a, S> {
             pass,
             open: None,
             rereads: Vec::new(),
+            pending: match pass {
+                Pass::First => Vec::new(),
+                Pass::Reread(wanted) => wanted.to_vec(),
+            },
             stopped: None,
         }
     }
@@ -92,14 +101,29 @@ impl<'a, S: HitSink> DocSearch<'a, S> {
         std::mem::take(&mut self.rereads)
     }
 
-    /// Avvisa che l'estrazione si è interrotta: l'avviso va al documento aperto (i suoi
-    /// risultati si scartano), altrimenti al file.
+    /// Avvisa che l'estrazione si è interrotta. Prima lettura: l'avviso va al documento
+    /// aperto (i suoi risultati si scartano), altrimenti al file. Seconda lettura: a ogni
+    /// documento da rileggere non ancora consegnato.
     pub(crate) fn warn_interrupted(&mut self, kind: WarningKind) -> Result<(), Stop> {
-        let doc = match self.open.take() {
+        let open = self.open.take();
+        if let Pass::Reread(_) = self.pass {
+            for inner in std::mem::take(&mut self.pending) {
+                let doc = self.doc(inner);
+                self.sink.warn(doc, kind)?;
+            }
+            return Ok(());
+        }
+        let doc = match open {
             Some(open) => open.doc,
             None => self.doc(Vec::new()),
         };
         self.sink.warn(doc, kind)
+    }
+
+    /// Vero se la seconda lettura ha consegnato tutti i suoi documenti: il resto del file non
+    /// serve.
+    fn rereads_done(&self) -> bool {
+        matches!(self.pass, Pass::Reread(_)) && self.pending.is_empty()
     }
 
     /// Il documento di un evento: il file più le voci `inner`.
@@ -160,6 +184,7 @@ impl<'a, S: HitSink> DocSearch<'a, S> {
         let Some(open) = self.open.take() else {
             return Ok(());
         };
+        self.pending.retain(|inner| *inner != open.doc.inner);
         match open.batcher.finish() {
             Verdict::Hits(hits) if hits.is_empty() => Ok(()),
             Verdict::Hits(hits) => self.sink.deliver(hits),
@@ -200,14 +225,20 @@ impl<'a, S: HitSink> DocSearch<'a, S> {
 }
 
 impl<S: HitSink> EventSink for DocSearch<'_, S> {
+    /// Ferma l'estrazione se la ricerca si ferma, o se la seconda lettura ha consegnato tutti
+    /// i suoi documenti (allora [`DocSearch::stopped`] resta `None`).
     fn emit(&mut self, event: ExtractEvent) -> Result<(), Stopped> {
-        if self.stopped.is_some() {
+        if self.stopped.is_some() || self.rereads_done() {
             return Err(Stopped);
         }
         self.handle(event).map_err(|stop| {
             self.stopped = Some(stop);
             Stopped
-        })
+        })?;
+        if self.rereads_done() {
+            return Err(Stopped);
+        }
+        Ok(())
     }
 }
 
@@ -288,7 +319,7 @@ mod tests {
 
     /// Senza posti per trattenere (altri documenti li occupano) la voce con tutti i termini
     /// si segna da rileggere e non consegna nulla; la seconda lettura consegna solo lei, per
-    /// intero, senza ripetere gli avvisi.
+    /// intero, senza ripetere gli avvisi, e ferma l'estrazione appena l'ha consegnata.
     #[test]
     fn documents_without_places_are_reread() {
         let request = request(&["ar", "zeta"]);
@@ -318,9 +349,12 @@ mod tests {
             0,
             Pass::Reread(&rereads),
         );
-        for event in archive() {
-            assert!(search.emit(event).is_ok());
-        }
+        let stopped_at = archive()
+            .into_iter()
+            .position(|event| search.emit(event).is_err());
+        // Inizio, 21 righe, fine di `a.txt`: poi l'estrazione non serve più.
+        assert_eq!(stopped_at, Some(22));
+        assert_eq!(search.stopped(), None, "non è un arresto della ricerca");
         assert!(search.take_rereads().is_empty());
         drop(search);
         assert_eq!(second.hits.len(), 21);
