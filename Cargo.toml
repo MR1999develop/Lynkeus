@@ -56,6 +56,9 @@ crc32fast = "1.5.4"
 crossbeam-channel = "0.5.17"
 # Cartella di configurazione della piattaforma (settings.toml).
 directories = "6.0.0"
+# Nome della pipe e token dell'istanza unica dal generatore del sistema operativo; già
+# nell'albero tramite ahash (eframe).
+getrandom = "0.3.4"
 # Solo per i benchmark (dev-dependency), senza grafici né rayon.
 criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
 # Senza `default_fonts`: i font di egui includono Ubuntu-Light (licenza Ubuntu Font),
@@ -100,17 +103,28 @@ quick-xml = "0.42.0"
 regex = "1.13.1"
 # Limite di memoria (`RLIMIT_AS`) del processo estrattore su Linux.
 rlimit = "0.11.0"
+# Solo Linux, API safe sopra le chiamate di sistema (già nell'albero tramite zbus e
+# async-io): `geteuid`, `fstat` su descrittore aperto con `O_NOFOLLOW` (cartelle private),
+# `umask` e `SO_PEERCRED` (socket dell'istanza unica).
+rustix = { version = "1.1.6", default-features = false, features = ["std", "fs", "process", "net"] }
 # Dialoghi nativi per scegliere cartelle e file; su Linux tramite il portale XDG (nessuna libreria GTK).
 rfd = { version = "0.17.2", default-features = false, features = ["xdg-portal", "wayland"] }
 # Archivi 7z: solo lettura (niente `compress`), niente AES (le voci cifrate danno un avviso),
 # niente bzip2 e PPMd; `deflate` usa flate2, già nell'albero.
 sevenz-rust2 = { version = "0.24.2", default-features = false, features = ["deflate"] }
 serde = { version = "1.0.229", features = ["derive"] }
+# Confronto in tempo costante del token dell'istanza unica.
+subtle = { version = "2.6.1", default-features = false, features = ["std"] }
 sys-locale = "0.3.2"
 # Archivi tar, solo lettura: senza `xattr` (nulla si scrive su disco).
 tar = { version = "0.4.46", default-features = false }
 tempfile = "3.27.0"
 thiserror = "2.0.21"
+# Log dell'app in file (solo nel guscio): rotazione giornaliera con un numero massimo di
+# file, livello regolabile a runtime (`reload`), senza colori ANSI.
+tracing = { version = "0.1.44", default-features = false, features = ["std"] }
+tracing-appender = "0.2.5"
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "std"] }
 toml = { version = "1.1.8", default-features = false, features = ["parse", "display", "serde"] }
 # NFC/NFD dei termini e tabella delle varianti accentate (lynkeus-core).
 unicode-normalization = "0.1.26"
@@ -120,13 +134,21 @@ unicode-normalization = "0.1.26"
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
     "Win32_System_IO",
     "Win32_System_JobObjects",
     "Win32_System_LibraryLoader",
     "Win32_System_Pipes",
     "Win32_System_SystemServices",
     "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
 ] }
+# Voci del clic destro in HKCU\Software\Classes (solo Windows), con la stessa windows-sys.
+winreg = "0.56.0"
+# Solo build.rs di lynkeus-app su Windows: icona, informazioni di versione e manifest
+# nell'eseguibile (usa rc.exe del Windows SDK).
+winresource = { version = "0.1.34", default-features = false }
 # Portale XDG OpenURI (OpenFile, OpenDirectory) su Linux: apre e mostra i file senza
 # avviare programmi cercati per nome. Già nell'albero tramite AccessKit.
 zbus = { version = "5.19.0", default-features = false, features = ["async-io", "blocking-api"] }

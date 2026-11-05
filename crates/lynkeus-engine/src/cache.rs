@@ -38,14 +38,14 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use lynkeus_core::ByteSize;
 use lynkeus_extract::protocol::{FrameReader, PROTOCOL_VERSION, encode_frame};
 use lynkeus_extract::{ExtractEvent, ExtractOptions, SequenceCheck};
 
-use crate::platform;
+use crate::platform::{PortablePrivateFs, PrivateFs};
 
 /// Versione del formato delle voci.
 pub const CACHE_FORMAT_VERSION: u16 = 1;
@@ -217,6 +217,7 @@ pub struct TextCache {
     dir: PathBuf,
     max_bytes: AtomicU64,
     index: Mutex<Option<Index>>,
+    private_fs: Arc<dyn PrivateFs>,
 }
 
 /// Contatore per i nomi dei temporanei del processo.
@@ -224,13 +225,23 @@ static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 impl TextCache {
     /// Una cache nella cartella `dir` (creata, privata, al primo salvataggio), con limite
-    /// `max`. Non tocca il disco finché non serve.
+    /// `max`. Non tocca il disco finché non serve. Cartella e file si creano con
+    /// [`PortablePrivateFs`]; l'app ne passa uno proprio con [`TextCache::with_private_fs`].
     pub fn new(dir: PathBuf, max: ByteSize) -> TextCache {
         TextCache {
             dir,
             max_bytes: AtomicU64::new(max.bytes()),
             index: Mutex::new(None),
+            private_fs: Arc::new(PortablePrivateFs),
         }
+    }
+
+    /// La stessa cache, con cartella e file creati da `private_fs` (su Windows quello
+    /// dell'app, con il descrittore esplicito).
+    #[must_use]
+    pub fn with_private_fs(mut self, private_fs: Arc<dyn PrivateFs>) -> TextCache {
+        self.private_fs = private_fs;
+        self
     }
 
     /// La cartella della cache.
@@ -300,7 +311,7 @@ impl TextCache {
         }
         // Prima l'indice (che fa anche la pulizia dei temporanei avanzati), poi il file.
         drop(self.lock_index_loaded());
-        platform::create_private_dir(&self.dir)?;
+        self.private_fs.create_dir(&self.dir)?;
         let name = key.file_name();
         let target = self.dir.join(&name);
         let temp = self.write_temp(&name, &entry)?;
@@ -376,7 +387,7 @@ impl TextCache {
                 "{name}.{}-{unique}.{TEMP_EXTENSION}",
                 std::process::id()
             ));
-            match platform::create_new_private_file(&temp) {
+            match self.private_fs.create_new_file(&temp) {
                 Ok(mut file) => {
                     let written = file.write_all(entry);
                     drop(file);

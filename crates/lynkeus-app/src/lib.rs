@@ -11,14 +11,19 @@
 #![deny(unsafe_code)]
 
 mod app;
+pub mod cli;
+pub mod context_menu;
+pub mod diagnostics;
 pub mod export;
 pub mod extraction;
 pub mod form;
 pub mod format;
 pub mod i18n;
+pub mod instance;
 pub mod launch;
 pub mod platform;
 pub mod preview;
+pub mod private_dirs;
 pub mod results;
 mod root_check;
 pub mod settings;

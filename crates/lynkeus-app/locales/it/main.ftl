@@ -330,8 +330,43 @@ menu-cache-size = Dimensione massima
 # $mib (numero): dimensione in megabyte.
 menu-cache-size-choice = { $mib } MB
 menu-cache-clear = Svuota la cache
-reason-no-cache = Il sistema non indica una cartella per la cache.
+reason-no-cache = La cartella della cache non è disponibile (il sistema non la indica o non è privata).
 reason-cache-clearing = La cache si sta svuotando.
 # $mib (numero): megabyte liberati.
 notice-cache-cleared = Cache svuotata: { $mib } MB liberati.
 notice-cache-clear-failed = Errore: la cache non si è svuotata del tutto. Chiudi le altre finestre di Lynkeus Searcher e riprova.
+
+## Voci d'archivio che non si aprono
+
+# $file (testo): voce d'archivio, come mostrata nella tabella.
+notice-entry-encrypted = Errore: { $file } è protetto da password e non si può estrarre per aprirlo. Apri l'archivio con il suo programma ("Mostra nella cartella") e inserisci la password lì.
+# $file (testo): voce d'archivio, come mostrata nella tabella.
+notice-entry-limit = Errore: { $file } supera i limiti di sicurezza per gli archivi (dimensione, compressione o tempo) e non è stato estratto. Apri l'archivio con il suo programma ("Mostra nella cartella").
+# $file (testo): voce d'archivio, come mostrata nella tabella.
+notice-entry-corrupt = Errore: { $file } non si può estrarre perché l'archivio è danneggiato o è cambiato dopo la ricerca. Ripeti la ricerca o apri l'archivio con il suo programma.
+# $file (testo): voce d'archivio, come mostrata nella tabella.
+notice-entry-unreadable = Errore: { $file } non si è potuto estrarre: l'archivio non si legge (spostato, in uso o senza permessi) o non c'è spazio libero. Controlla e riprova.
+
+## Clic destro e diagnostica (menu Strumenti)
+
+# Testo della voce nel menu del clic destro di Explorer e Nautilus.
+context-menu-label = Cerca con Lynkeus
+menu-context-menu = "Cerca con Lynkeus" nel clic destro
+menu-context-menu-hint = Aggiunge "Cerca con Lynkeus" al menu del clic destro su file e cartelle; la voce apre questa finestra con l'elemento scelto tra i luoghi in cui cercare. Su Windows 11 è in "Mostra altre opzioni".
+reason-no-context-menu = La voce del clic destro non è disponibile su questo sistema.
+reason-context-menu-updating = La voce del clic destro si sta aggiornando.
+notice-context-menu-exe-path = Errore: la voce del clic destro non è stata aggiunta perché il percorso del programma contiene caratteri non ammessi. Sposta Lynkeus Searcher in una cartella con un nome semplice e riprova.
+notice-context-menu-too-long = Errore: la voce del clic destro non è stata aggiunta perché il percorso del programma è troppo lungo. Sposta Lynkeus Searcher in una cartella più vicina alla radice del disco e riprova.
+notice-context-menu-exe-dir = Errore: la voce del clic destro non è stata aggiunta perché altri utenti possono modificare la cartella del programma. Sposta Lynkeus Searcher nella tua cartella utente o in Programmi e riprova.
+notice-context-menu-foreign = Errore: nel clic destro c'è già una voce con lo stesso nome di un altro programma; non è stata modificata.
+notice-context-menu-io = Errore: la voce del clic destro non è stata aggiornata. Riprova; se succede ancora, controlla i permessi del tuo profilo.
+# $count (numero): cartelle rifiutate.
+notice-private-dirs = { $count ->
+        [one] Attenzione: una cartella dell'app è accessibile ad altri utenti e per sicurezza non viene usata in questa sessione (cache, log o impostazioni potrebbero non essere salvati). Controlla i permessi delle cartelle di Lynkeus Searcher nel tuo profilo.
+       *[other] Attenzione: { $count } cartelle dell'app sono accessibili ad altri utenti e per sicurezza non vengono usate in questa sessione (cache, log o impostazioni potrebbero non essere salvati). Controlla i permessi delle cartelle di Lynkeus Searcher nel tuo profilo.
+    }
+menu-log-level = Dettaglio del log
+log-level-error = Solo errori
+log-level-warn = Errori e avvisi
+log-level-info = Anche le informazioni
+log-level-debug = Tutto (per la diagnosi)

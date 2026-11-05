@@ -14,7 +14,12 @@
 //! - Ricerca delle DLL ristretta alla cartella di sistema (Windows).
 //! - Avvio del processo estrattore: su Windows nel Job Object con `CreateProcessW`
 //!   (`windows_ffi`), altrove con il lanciatore portabile dell'engine.
-//! - Cartelle della cache e dei file temporanei aperti dagli archivi.
+//! - Cartelle dell'app ([`AppDirs`]) e cartelle e file privati ([`private_fs`]: descrittore
+//!   esplicito su Windows, 0700 e 0600 su Linux).
+//! - Istanza unica: named pipe (Windows) o socket Unix (Linux) con tempi limite
+//!   ([`InstanceListener`], [`connect_instance`]).
+//! - Voce del clic destro: registro dell'utente (Windows) o script di Nautilus (Linux)
+//!   ([`ContextMenu`]).
 
 #[cfg(windows)]
 mod windows_ffi;
@@ -25,7 +30,7 @@ use std::sync::Arc;
 
 use egui::{FontData, FontDefinitions, FontFamily};
 use lynkeus_core::ByteSize;
-use lynkeus_engine::WorkerLauncher;
+use lynkeus_engine::{PrivateFs, WorkerLauncher};
 
 use crate::theme::SEMIBOLD;
 
@@ -67,20 +72,6 @@ pub fn worker_launcher(
         exe,
         Some(memory_limit),
     )?))
-}
-
-/// La cartella della cache dei documenti: `%LOCALAPPDATA%\Lynkeus Searcher\cache` su
-/// Windows, `~/.cache/lynkeus-searcher` su Linux. `None` se il sistema non ne indica una.
-pub fn cache_dir() -> Option<PathBuf> {
-    directories::ProjectDirs::from("", "", APP_DIR_NAME).map(|dirs| dirs.cache_dir().to_owned())
-}
-
-/// La cartella privata dei file estratti dagli archivi per aprirli:
-/// `%LOCALAPPDATA%\Lynkeus Searcher\data\temp` su Windows,
-/// `~/.local/share/lynkeus-searcher/temp` su Linux.
-pub fn opened_entries_dir() -> Option<PathBuf> {
-    directories::ProjectDirs::from("", "", APP_DIR_NAME)
-        .map(|dirs| dirs.data_local_dir().join("temp"))
 }
 
 #[cfg(windows)]
@@ -201,13 +192,6 @@ mod job_launcher {
 const APP_DIR_NAME: &str = "Lynkeus Searcher";
 #[cfg(not(windows))]
 const APP_DIR_NAME: &str = "lynkeus-searcher";
-
-/// La cartella di configurazione dell'app: `%APPDATA%\Lynkeus Searcher\config` su
-/// Windows, `~/.config/lynkeus-searcher` su Linux. `None` se il sistema non ne indica una
-/// (nessuna cartella utente): le impostazioni restano allora solo in memoria.
-pub fn config_dir() -> Option<PathBuf> {
-    directories::ProjectDirs::from("", "", APP_DIR_NAME).map(|dirs| dirs.config_dir().to_owned())
-}
 
 /// Rende durevole la rinomina appena fatta in `dir`.
 ///
@@ -415,4 +399,848 @@ fn monospace_candidates() -> Vec<PathBuf> {
     ]
     .map(PathBuf::from)
     .to_vec()
+}
+
+// --- Cartelle e file privati -----------------------------------------------------------
+
+/// Le cartelle e i file privati della piattaforma: su Windows con il descrittore esplicito
+/// (solo utente e SYSTEM, `windows_ffi`), su Linux 0700 e 0600 con la verifica delle
+/// cartelle esistenti (engine).
+#[cfg(windows)]
+pub fn private_fs() -> Arc<dyn PrivateFs> {
+    Arc::new(windows_ffi::WindowsPrivateFs)
+}
+
+/// Vedi la versione per Windows.
+#[cfg(not(windows))]
+pub fn private_fs() -> Arc<dyn PrivateFs> {
+    Arc::new(lynkeus_engine::PortablePrivateFs)
+}
+
+/// Le cartelle dell'app nel profilo dell'utente.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppDirs {
+    /// Configurazione: `settings.toml` e posizione della finestra.
+    pub config: PathBuf,
+    /// Dati locali: lock e file dell'istanza unica.
+    pub data: PathBuf,
+    /// Cache del testo dei documenti.
+    pub cache: PathBuf,
+    /// Log (con rotazione).
+    pub logs: PathBuf,
+    /// Rapporti di crash.
+    pub crash_reports: PathBuf,
+    /// File estratti dagli archivi per aprirli.
+    pub opened_entries: PathBuf,
+}
+
+impl AppDirs {
+    /// Le cartelle della piattaforma (`directories`); `None` se il sistema non indica una
+    /// cartella dell'utente.
+    ///
+    /// Windows: `%APPDATA%\Lynkeus Searcher\config`, `%LOCALAPPDATA%\Lynkeus Searcher\{data,
+    /// cache}` e sotto `data` le cartelle `logs`, `crash-reports`, `temp`. Linux:
+    /// `~/.config/lynkeus-searcher`, `~/.cache/lynkeus-searcher`,
+    /// `~/.local/share/lynkeus-searcher` con le stesse sottocartelle.
+    pub fn for_user() -> Option<AppDirs> {
+        let dirs = directories::ProjectDirs::from("", "", APP_DIR_NAME)?;
+        let data = dirs.data_local_dir().to_owned();
+        Some(AppDirs {
+            config: dirs.config_dir().to_owned(),
+            cache: dirs.cache_dir().to_owned(),
+            logs: data.join("logs"),
+            crash_reports: data.join("crash-reports"),
+            opened_entries: data.join("temp"),
+            data,
+        })
+    }
+}
+
+// --- Istanza unica: trasporto ------------------------------------------------------------
+
+/// Prefisso del nome del canale dell'istanza unica.
+const ENDPOINT_PREFIX: &str = "lynkeus-searcher-";
+
+#[cfg(not(windows))]
+pub use instance_unix::{InstanceConnection, InstanceListener, InstanceStopper, connect_instance};
+#[cfg(windows)]
+pub use instance_windows::{
+    InstanceConnection, InstanceListener, InstanceStopper, connect_instance,
+};
+
+#[cfg(windows)]
+mod instance_windows {
+    use std::io;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    use super::ENDPOINT_PREFIX;
+    use super::windows_ffi::{
+        PipeClient, PipeServer, StopSignal, allow_set_foreground, current_user, process_user,
+    };
+    use crate::instance::Channel;
+
+    const PIPE_PREFIX: &str = r"\\.\pipe\";
+
+    /// La pipe dell'istanza unica (`\\.\pipe\lynkeus-searcher-<casuale>`).
+    #[derive(Debug)]
+    pub struct InstanceListener {
+        server: PipeServer,
+        stop: Arc<StopSignal>,
+        endpoint: String,
+    }
+
+    impl InstanceListener {
+        /// Crea la pipe con il suffisso casuale `suffix`; errore se il nome esiste già.
+        pub fn bind(suffix: &str) -> io::Result<InstanceListener> {
+            let endpoint = format!("{PIPE_PREFIX}{ENDPOINT_PREFIX}{suffix}");
+            Ok(InstanceListener {
+                server: PipeServer::create(&endpoint)?,
+                stop: Arc::new(StopSignal::new()?),
+                endpoint,
+            })
+        }
+
+        /// Il nome da scrivere nel file dell'istanza.
+        pub fn endpoint(&self) -> &str {
+            &self.endpoint
+        }
+
+        /// Chi può fermare [`InstanceListener::accept`] da un altro thread.
+        pub fn stopper(&self) -> InstanceStopper {
+            InstanceStopper {
+                stop: Arc::clone(&self.stop),
+            }
+        }
+
+        /// Aspetta un client; `None` dopo lo stop.
+        pub fn accept(&self) -> io::Result<Option<InstanceConnection<'_>>> {
+            Ok(self
+                .server
+                .accept(&self.stop)?
+                .then_some(InstanceConnection::Server(&self.server)))
+        }
+    }
+
+    /// Ferma il server dell'istanza.
+    #[derive(Debug)]
+    pub struct InstanceStopper {
+        stop: Arc<StopSignal>,
+    }
+
+    impl InstanceStopper {
+        /// Interrompe l'attesa di un client.
+        pub fn stop(&self) {
+            self.stop.set();
+        }
+    }
+
+    /// Una connessione: lato server (chiusa nel `Drop`) o lato client.
+    #[derive(Debug)]
+    pub enum InstanceConnection<'a> {
+        /// Il client connesso alla pipe del server.
+        Server(&'a PipeServer),
+        /// La pipe aperta dal client.
+        Client(PipeClient),
+    }
+
+    impl Drop for InstanceConnection<'_> {
+        fn drop(&mut self) {
+            if let InstanceConnection::Server(server) = self {
+                server.disconnect();
+            }
+        }
+    }
+
+    impl Channel for InstanceConnection<'_> {
+        fn read_exact(&mut self, buffer: &mut [u8], deadline: Instant) -> io::Result<()> {
+            match self {
+                InstanceConnection::Server(server) => server.read_exact(buffer, deadline),
+                InstanceConnection::Client(client) => client.read_exact(buffer, deadline),
+            }
+        }
+
+        fn write_all(&mut self, bytes: &[u8], deadline: Instant) -> io::Result<()> {
+            match self {
+                InstanceConnection::Server(server) => server.write_all(bytes, deadline),
+                InstanceConnection::Client(client) => client.write_all(bytes, deadline),
+            }
+        }
+    }
+
+    /// Si connette alla prima istanza: pipe aperta con SQoS Identification, server
+    /// verificato come processo dello stesso utente prima di mandare il token, poi permesso
+    /// di portarsi in primo piano.
+    pub fn connect_instance(
+        endpoint: &str,
+        deadline: Instant,
+    ) -> io::Result<InstanceConnection<'static>> {
+        let valid_name = endpoint
+            .strip_prefix(PIPE_PREFIX)
+            .is_some_and(|name| name.starts_with(ENDPOINT_PREFIX) && !name.contains('\\'));
+        if !valid_name {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "nome della pipe non valido",
+            ));
+        }
+        let client = PipeClient::connect(endpoint, deadline)?;
+        let pid = client.server_pid()?;
+        if process_user(pid)? != current_user()? {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "pipe di un altro utente",
+            ));
+        }
+        if let Err(error) = allow_set_foreground(pid) {
+            tracing::debug!(%error, "AllowSetForegroundWindow non riuscita");
+        }
+        Ok(InstanceConnection::Client(client))
+    }
+}
+
+#[cfg(not(windows))]
+mod instance_unix {
+    use std::io::{self, Read, Write};
+    use std::marker::PhantomData;
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Instant;
+
+    use rustix::fs::{Mode, OFlags};
+
+    use super::ENDPOINT_PREFIX;
+    use crate::instance::Channel;
+
+    /// `$XDG_RUNTIME_DIR` se è una cartella dell'utente senza permessi per altri; altrimenti
+    /// l'istanza unica resta spenta (fallire chiusi).
+    fn runtime_dir() -> io::Result<PathBuf> {
+        let dir = std::env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .filter(|dir| dir.is_absolute())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "XDG_RUNTIME_DIR"))?;
+        let fd = rustix::fs::open(
+            &dir,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?;
+        let stat = rustix::fs::fstat(&fd)?;
+        if stat.st_uid != rustix::process::geteuid().as_raw() || stat.st_mode & 0o077 != 0 {
+            return Err(lynkeus_engine::NotPrivate::error());
+        }
+        Ok(dir)
+    }
+
+    /// Il socket dell'istanza unica in `$XDG_RUNTIME_DIR`, 0600 già alla creazione.
+    #[derive(Debug)]
+    pub struct InstanceListener {
+        listener: UnixListener,
+        path: PathBuf,
+        endpoint: String,
+        stop: Arc<AtomicBool>,
+    }
+
+    impl InstanceListener {
+        /// Crea il socket con il suffisso casuale `suffix`; errore se il nome esiste già.
+        pub fn bind(suffix: &str) -> io::Result<InstanceListener> {
+            let path = runtime_dir()?.join(format!("{ENDPOINT_PREFIX}{suffix}.sock"));
+            let endpoint = path
+                .to_str()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "percorso"))?
+                .to_owned();
+            // La umask vale per tutto il processo: si chiama all'avvio, prima della
+            // finestra; 0177 dà 0600 al socket.
+            let previous = rustix::process::umask(Mode::from_bits_truncate(0o177));
+            let bound = UnixListener::bind(&path);
+            rustix::process::umask(previous);
+            Ok(InstanceListener {
+                listener: bound?,
+                path,
+                endpoint,
+                stop: Arc::new(AtomicBool::new(false)),
+            })
+        }
+
+        /// Il percorso da scrivere nel file dell'istanza.
+        pub fn endpoint(&self) -> &str {
+            &self.endpoint
+        }
+
+        /// Chi può fermare [`InstanceListener::accept`] da un altro thread.
+        pub fn stopper(&self) -> InstanceStopper {
+            InstanceStopper {
+                stop: Arc::clone(&self.stop),
+                path: self.path.clone(),
+            }
+        }
+
+        /// Aspetta un client dello stesso utente (`SO_PEERCRED`); `None` dopo lo stop.
+        pub fn accept(&self) -> io::Result<Option<InstanceConnection<'_>>> {
+            loop {
+                let (stream, _) = self.listener.accept()?;
+                if self.stop.load(Ordering::Relaxed) {
+                    return Ok(None);
+                }
+                let peer = rustix::net::sockopt::socket_peercred(&stream)?;
+                if peer.uid != rustix::process::geteuid() {
+                    tracing::warn!("istanza unica: connessione di un altro utente rifiutata");
+                    continue;
+                }
+                return Ok(Some(InstanceConnection {
+                    stream,
+                    _server: PhantomData,
+                }));
+            }
+        }
+    }
+
+    impl Drop for InstanceListener {
+        fn drop(&mut self) {
+            let _removed = std::fs::remove_file(&self.path);
+        }
+    }
+
+    /// Ferma il server dell'istanza.
+    #[derive(Debug)]
+    pub struct InstanceStopper {
+        stop: Arc<AtomicBool>,
+        path: PathBuf,
+    }
+
+    impl InstanceStopper {
+        /// Interrompe l'attesa di un client (connettendosi al socket per svegliarla).
+        pub fn stop(&self) {
+            self.stop.store(true, Ordering::Relaxed);
+            let _woken = UnixStream::connect(&self.path);
+        }
+    }
+
+    /// Una connessione con tempi limite.
+    #[derive(Debug)]
+    pub struct InstanceConnection<'a> {
+        stream: UnixStream,
+        _server: PhantomData<&'a ()>,
+    }
+
+    /// Il tempo che resta fino a `deadline`, o `TimedOut`.
+    fn remaining(deadline: Instant) -> io::Result<std::time::Duration> {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            Err(io::Error::from(io::ErrorKind::TimedOut))
+        } else {
+            Ok(left)
+        }
+    }
+
+    impl Channel for InstanceConnection<'_> {
+        fn read_exact(&mut self, buffer: &mut [u8], deadline: Instant) -> io::Result<()> {
+            let mut filled = 0;
+            while filled < buffer.len() {
+                self.stream.set_read_timeout(Some(remaining(deadline)?))?;
+                let rest = buffer.get_mut(filled..).unwrap_or_default();
+                match self.stream.read(rest) {
+                    Ok(0) => return Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
+                    Ok(read) => filled += read,
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok(())
+        }
+
+        fn write_all(&mut self, bytes: &[u8], deadline: Instant) -> io::Result<()> {
+            self.stream.set_write_timeout(Some(remaining(deadline)?))?;
+            self.stream.write_all(bytes)
+        }
+    }
+
+    /// Si connette alla prima istanza (socket in una cartella dell'utente).
+    pub fn connect_instance(
+        endpoint: &str,
+        deadline: Instant,
+    ) -> io::Result<InstanceConnection<'static>> {
+        let path = Path::new(endpoint);
+        let valid = path.is_absolute()
+            && path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with(ENDPOINT_PREFIX));
+        if !valid {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "percorso del socket non valido",
+            ));
+        }
+        let stream = UnixStream::connect(path)?;
+        stream.set_read_timeout(Some(remaining(deadline)?))?;
+        Ok(InstanceConnection {
+            stream,
+            _server: PhantomData,
+        })
+    }
+}
+
+// --- Clic destro --------------------------------------------------------------------------
+
+#[cfg(not(windows))]
+pub use context_menu_nautilus::ContextMenu;
+#[cfg(windows)]
+pub use context_menu_windows::ContextMenu;
+
+#[cfg(windows)]
+mod context_menu_windows {
+    use std::io;
+    use std::path::Path;
+
+    use winreg::RegKey;
+    use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_WRITE};
+
+    use crate::context_menu::{
+        ContextMenuStore, FoundItem, MenuEntry, MenuState, MenuTarget, classify_windows,
+    };
+
+    /// Le voci in `HKCU\Software\Classes` (mai tramite `HKEY_CLASSES_ROOT`, che fonde
+    /// utente e macchina). La chiave si apre a ogni operazione (`RegKey` non è `Sync`).
+    pub struct ContextMenu {
+        classes_path: String,
+    }
+
+    impl ContextMenu {
+        /// Le voci dell'utente corrente.
+        pub fn for_current_user() -> io::Result<ContextMenu> {
+            let menu = ContextMenu::with_classes_path(r"Software\Classes");
+            menu.classes()?;
+            Ok(menu)
+        }
+
+        /// Le voci sotto `HKCU\<classes_path>` al posto di `Software\Classes` (test su una
+        /// radice propria).
+        pub fn with_classes_path(classes_path: &str) -> ContextMenu {
+            ContextMenu {
+                classes_path: classes_path.to_owned(),
+            }
+        }
+
+        fn classes(&self) -> io::Result<RegKey> {
+            RegKey::predef(HKEY_CURRENT_USER)
+                .open_subkey_with_flags(&self.classes_path, KEY_READ | KEY_WRITE)
+        }
+
+        fn read(&self, target: MenuTarget) -> io::Result<Option<FoundItem>> {
+            let key = match self.classes()?.open_subkey(target.key_path()) {
+                Ok(key) => key,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(error),
+            };
+            let label = key.get_value::<String, _>("").ok();
+            let command = key
+                .open_subkey("command")
+                .ok()
+                .and_then(|command| command.get_value::<String, _>("").ok());
+            Ok(Some(FoundItem { label, command }))
+        }
+    }
+
+    impl ContextMenuStore for ContextMenu {
+        fn state(&self, entry: &MenuEntry) -> io::Result<MenuState> {
+            let found = [
+                self.read(MenuTarget::ALL[0])?,
+                self.read(MenuTarget::ALL[1])?,
+                self.read(MenuTarget::ALL[2])?,
+            ];
+            Ok(classify_windows(&found, entry))
+        }
+
+        fn install(&self, entry: &MenuEntry) -> io::Result<()> {
+            let icon = entry.exe().display().to_string();
+            let classes = self.classes()?;
+            for target in MenuTarget::ALL {
+                let (key, _) = classes.create_subkey(target.key_path())?;
+                key.set_value("", &entry.label())?;
+                key.set_value("Icon", &icon)?;
+                let (command, _) = key.create_subkey("command")?;
+                command.set_value("", &entry.windows_command(target))?;
+            }
+            Ok(())
+        }
+
+        fn remove(&self, _entry: &MenuEntry) -> io::Result<()> {
+            let classes = self.classes()?;
+            for target in MenuTarget::ALL {
+                match classes.delete_subkey_all(target.key_path()) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok(())
+        }
+
+        fn exe_dir_writable_by_others(&self, exe: &Path) -> io::Result<bool> {
+            let dir = exe
+                .parent()
+                .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+            super::windows_ffi::dir_writable_by_others(dir)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::context_menu::{disable, enable, refresh};
+
+        /// Una radice di prova propria in `HKCU\Software`, tolta alla fine.
+        struct TestRoot {
+            parent: RegKey,
+            name: String,
+        }
+
+        impl TestRoot {
+            fn new() -> TestRoot {
+                let mut bytes = [0u8; 8];
+                getrandom::fill(&mut bytes).expect("casuale");
+                let suffix: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+                let parent = RegKey::predef(HKEY_CURRENT_USER)
+                    .open_subkey_with_flags("Software", KEY_READ | KEY_WRITE)
+                    .expect("HKCU\\Software");
+                TestRoot {
+                    parent,
+                    name: format!("LynkeusSearcherTest-{suffix}"),
+                }
+            }
+
+            fn menu(&self) -> ContextMenu {
+                self.parent.create_subkey(&self.name).expect("radice");
+                ContextMenu::with_classes_path(&format!(r"Software\{}", self.name))
+            }
+
+            fn key(&self, path: &str) -> io::Result<RegKey> {
+                self.parent.open_subkey(format!("{}\\{path}", self.name))
+            }
+        }
+
+        impl Drop for TestRoot {
+            fn drop(&mut self) {
+                let _removed = self.parent.delete_subkey_all(&self.name);
+            }
+        }
+
+        fn entry(exe: &str) -> MenuEntry {
+            MenuEntry::new(Path::new(exe), "Cerca con Lynkeus", &[]).expect("voce")
+        }
+
+        /// Il registro scritto e riletto: formato atteso con spazi e Unicode nel percorso,
+        /// eseguibile spostato riscritto, ciclo accendi-spegni che lascia la radice vuota.
+        #[test]
+        fn registry_entries_are_written_read_and_removed() {
+            let root = TestRoot::new();
+            let menu = root.menu();
+            let exe = r"C:\Programmi portatili\Città è\lynkeus-searcher.exe";
+            let first = entry(exe);
+            assert_eq!(menu.state(&first).expect("stato"), MenuState::Missing);
+            menu.install(&first).expect("scritta");
+            assert_eq!(menu.state(&first).expect("stato"), MenuState::Current);
+
+            let folder = root
+                .key(r"Directory\shell\LynkeusSearcher")
+                .expect("chiave");
+            assert_eq!(
+                folder.get_value::<String, _>("").expect("testo"),
+                "Cerca con Lynkeus"
+            );
+            assert_eq!(folder.get_value::<String, _>("Icon").expect("icona"), exe);
+            let command = root
+                .key(r"Directory\shell\LynkeusSearcher\command")
+                .and_then(|k| k.get_value::<String, _>(""))
+                .expect("comando");
+            assert_eq!(command, format!("\"{exe}\" --add \"%1\""));
+            let background = root
+                .key(r"Directory\Background\shell\LynkeusSearcher\command")
+                .and_then(|k| k.get_value::<String, _>(""))
+                .expect("comando");
+            assert_eq!(background, format!("\"{exe}\" --add \"%V\""));
+            assert!(root.key(r"*\shell\LynkeusSearcher\command").is_ok());
+
+            // Eseguibile spostato: la voce si riconosce come nostra e si riscrive.
+            let moved = entry(r"D:\Nuova cartella\lynkeus-searcher.exe");
+            assert_eq!(menu.state(&moved).expect("stato"), MenuState::Outdated);
+            menu.install(&moved).expect("riscritta");
+            assert_eq!(menu.state(&moved).expect("stato"), MenuState::Current);
+
+            menu.remove(&moved).expect("tolta");
+            assert_eq!(menu.state(&moved).expect("stato"), MenuState::Missing);
+            let classes = root.key("").expect("radice");
+            assert_eq!(
+                classes.enum_keys().count(),
+                2,
+                "restano solo `*` e `Directory`"
+            );
+            for class in [
+                r"*\shell",
+                r"Directory\shell",
+                r"Directory\Background\shell",
+            ] {
+                let shell = root.key(class).expect("shell");
+                assert_eq!(shell.enum_keys().count(), 0, "{class}");
+            }
+        }
+
+        /// Una voce con il nostro nome ma di un altro programma: non sovrascritta, non tolta.
+        #[test]
+        fn a_foreign_entry_is_left_alone() {
+            let root = TestRoot::new();
+            let menu = root.menu();
+            let classes = root.key("").expect("radice");
+            let (foreign, _) = classes
+                .create_subkey(r"Directory\shell\LynkeusSearcher\command")
+                .expect("chiave");
+            foreign
+                .set_value("", &r#""C:\altro\programma.exe" "%1""#)
+                .expect("valore");
+            let ours = entry(r"C:\L\lynkeus-searcher.exe");
+            assert_eq!(menu.state(&ours).expect("stato"), MenuState::Foreign);
+            assert_eq!(
+                refresh(&NotWritable(&menu), &ours),
+                Err(crate::context_menu::MenuError::Foreign)
+            );
+            assert_eq!(
+                enable(&NotWritable(&menu), &ours),
+                Err(crate::context_menu::MenuError::Foreign)
+            );
+            assert_eq!(disable(&menu, &ours), Ok(()));
+            let still = foreign.get_value::<String, _>("").expect("valore");
+            assert_eq!(still, r#""C:\altro\programma.exe" "%1""#);
+        }
+
+        /// Lo stesso registro, con la cartella dell'eseguibile considerata sicura (quella
+        /// dell'eseguibile di prova non esiste).
+        struct NotWritable<'a>(&'a ContextMenu);
+
+        impl ContextMenuStore for NotWritable<'_> {
+            fn state(&self, entry: &MenuEntry) -> io::Result<MenuState> {
+                self.0.state(entry)
+            }
+            fn install(&self, entry: &MenuEntry) -> io::Result<()> {
+                self.0.install(entry)
+            }
+            fn remove(&self, entry: &MenuEntry) -> io::Result<()> {
+                self.0.remove(entry)
+            }
+            fn exe_dir_writable_by_others(&self, _exe: &Path) -> io::Result<bool> {
+                Ok(false)
+            }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+mod context_menu_nautilus {
+    use std::fs::{self, DirBuilder, OpenOptions};
+    use std::io::{self, Read, Write};
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+    use std::path::{Path, PathBuf};
+
+    use crate::context_menu::{ContextMenuStore, MenuEntry, MenuState, classify_scripts};
+
+    /// Byte massimi letti da uno script esistente.
+    const MAX_SCRIPT_BYTES: u64 = 64 * 1024;
+
+    /// Gli script di Nautilus in `~/.local/share/nautilus/scripts`.
+    pub struct ContextMenu {
+        scripts: PathBuf,
+    }
+
+    impl ContextMenu {
+        /// La cartella degli script dell'utente.
+        pub fn for_current_user() -> io::Result<ContextMenu> {
+            let base = directories::BaseDirs::new()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "cartella utente"))?;
+            Ok(ContextMenu {
+                scripts: base.data_dir().join("nautilus").join("scripts"),
+            })
+        }
+
+        /// Gli script in `dir` (test su una cartella propria).
+        pub fn with_scripts_dir(dir: PathBuf) -> ContextMenu {
+            ContextMenu { scripts: dir }
+        }
+
+        /// La cartella degli script, creata (0700) se manca; rifiutata se è di altri o
+        /// scrivibile da gruppo e altri.
+        fn checked_dir(&self) -> io::Result<&Path> {
+            DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&self.scripts)?;
+            let meta = fs::symlink_metadata(&self.scripts)?;
+            let mine = meta.uid() == rustix::process::geteuid().as_raw();
+            if !meta.is_dir() || !mine || meta.mode() & 0o022 != 0 {
+                return Err(lynkeus_engine::NotPrivate::error());
+            }
+            Ok(&self.scripts)
+        }
+
+        fn names(entry: &MenuEntry) -> impl Iterator<Item = &str> {
+            std::iter::once(entry.label()).chain(entry.other_labels().iter().map(String::as_str))
+        }
+
+        /// Il contenuto dei file con i nomi della voce, se ci sono (senza seguire
+        /// collegamenti).
+        fn found(&self, entry: &MenuEntry) -> io::Result<Vec<(String, String)>> {
+            let mut found = Vec::new();
+            for name in Self::names(entry) {
+                if !safe_file_name(name) {
+                    continue;
+                }
+                let opened = OpenOptions::new()
+                    .read(true)
+                    .custom_flags(i32::try_from(rustix::fs::OFlags::NOFOLLOW.bits()).unwrap_or(0))
+                    .open(self.scripts.join(name));
+                let mut file = match opened {
+                    Ok(file) => file,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                    Err(_) => {
+                        // Un collegamento o un file illeggibile con il nostro nome: altrui.
+                        found.push((name.to_owned(), String::new()));
+                        continue;
+                    }
+                };
+                let mut bytes = Vec::new();
+                (&mut file).take(MAX_SCRIPT_BYTES).read_to_end(&mut bytes)?;
+                found.push((
+                    name.to_owned(),
+                    String::from_utf8_lossy(&bytes).into_owned(),
+                ));
+            }
+            Ok(found)
+        }
+    }
+
+    /// Un nome di file senza separatori, punti iniziali né caratteri di controllo.
+    fn safe_file_name(name: &str) -> bool {
+        !name.is_empty()
+            && !name.starts_with('.')
+            && !name.contains('/')
+            && !name.chars().any(char::is_control)
+    }
+
+    impl ContextMenuStore for ContextMenu {
+        fn state(&self, entry: &MenuEntry) -> io::Result<MenuState> {
+            Ok(classify_scripts(&self.found(entry)?, entry))
+        }
+
+        fn install(&self, entry: &MenuEntry) -> io::Result<()> {
+            if !safe_file_name(entry.label()) {
+                return Err(io::Error::from(io::ErrorKind::InvalidInput));
+            }
+            let dir = self.checked_dir()?;
+            // Temporaneo nuovo (0700, senza seguire collegamenti), poi rinomina.
+            let temp = dir.join(format!(".lynkeus-searcher-{}.tmp", std::process::id()));
+            let _stale = fs::remove_file(&temp);
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o700)
+                .custom_flags(i32::try_from(rustix::fs::OFlags::NOFOLLOW.bits()).unwrap_or(0))
+                .open(&temp)?;
+            let written = file
+                .write_all(entry.nautilus_script().as_bytes())
+                .and_then(|()| file.sync_all())
+                .and_then(|()| fs::rename(&temp, dir.join(entry.label())));
+            if let Err(error) = written {
+                let _removed = fs::remove_file(&temp);
+                return Err(error);
+            }
+            // Gli script nostri con il nome di un'altra lingua.
+            for (name, content) in self.found(entry)? {
+                if name != entry.label()
+                    && content.lines().nth(1) == Some(crate::context_menu::SCRIPT_MARKER)
+                {
+                    fs::remove_file(dir.join(name))?;
+                }
+            }
+            Ok(())
+        }
+
+        fn remove(&self, entry: &MenuEntry) -> io::Result<()> {
+            for (name, content) in self.found(entry)? {
+                if content.lines().nth(1) == Some(crate::context_menu::SCRIPT_MARKER) {
+                    fs::remove_file(self.scripts.join(name))?;
+                }
+            }
+            Ok(())
+        }
+
+        fn exe_dir_writable_by_others(&self, exe: &Path) -> io::Result<bool> {
+            let dir = exe
+                .parent()
+                .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+            let meta = fs::metadata(dir)?;
+            let owner_ok = meta.uid() == 0 || meta.uid() == rustix::process::geteuid().as_raw();
+            Ok(!owner_ok || meta.mode() & 0o022 != 0)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        use super::*;
+
+        fn entry(exe: &Path) -> MenuEntry {
+            MenuEntry::new(
+                exe,
+                "Cerca con Lynkeus",
+                &["Search with Lynkeus".to_owned()],
+            )
+            .expect("voce")
+        }
+
+        /// Lo script generato, eseguito con nomi di file ostili, passa all'eseguibile
+        /// esattamente i percorsi ricevuti.
+        #[test]
+        fn the_script_passes_paths_verbatim() {
+            let dir = tempfile::tempdir().expect("cartella");
+            let bin = dir.path().join("bin con 'apice'");
+            fs::create_dir(&bin).expect("cartella");
+            let out = dir.path().join("argomenti");
+            let fake = bin.join("lynkeus-searcher");
+            fs::write(
+                &fake,
+                format!(
+                    "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\0' \"$a\"; done > '{}'\n",
+                    out.display()
+                ),
+            )
+            .expect("eseguibile finto");
+            fs::set_permissions(&fake, fs::Permissions::from_mode(0o700)).expect("chmod");
+            let menu = ContextMenu::with_scripts_dir(dir.path().join("scripts"));
+            let entry = entry(&fake);
+            menu.install(&entry).expect("installato");
+            assert_eq!(menu.state(&entry).expect("stato"), MenuState::Current);
+            let script = dir.path().join("scripts").join(entry.label());
+            let mode = fs::metadata(&script).expect("script").permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700);
+            let names = ["a'b", "$(x)", "-r", "a b", "riga\nnuova", "--add"];
+            let status = Command::new("/bin/sh")
+                .arg(&script)
+                .args(names)
+                .status()
+                .expect("script eseguito");
+            assert!(status.success());
+            let received = fs::read(&out).expect("argomenti");
+            let received: Vec<&[u8]> = received
+                .split(|b| *b == 0)
+                .filter(|a| !a.is_empty())
+                .collect();
+            let mut expected: Vec<&[u8]> = vec![b"--add", b"--"];
+            expected.extend(names.iter().map(|n| n.as_bytes()));
+            assert_eq!(received, expected);
+            menu.remove(&entry).expect("tolto");
+            assert_eq!(menu.state(&entry).expect("stato"), MenuState::Missing);
+        }
+    }
 }

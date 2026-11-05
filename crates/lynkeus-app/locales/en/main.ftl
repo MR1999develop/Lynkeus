@@ -330,8 +330,43 @@ menu-cache-size = Maximum size
 # $mib (number): size in megabytes.
 menu-cache-size-choice = { $mib } MB
 menu-cache-clear = Clear the cache
-reason-no-cache = The system does not provide a folder for the cache.
+reason-no-cache = The cache folder is not available (the system does not provide one or it is not private).
 reason-cache-clearing = The cache is being cleared.
 # $mib (number): megabytes freed.
 notice-cache-cleared = Cache cleared: { $mib } MB freed.
 notice-cache-clear-failed = Error: the cache was not fully cleared. Close the other Lynkeus Searcher windows and try again.
+
+## Archive entries that do not open
+
+# $file (text): archive entry, as shown in the table.
+notice-entry-encrypted = Error: { $file } is password protected and cannot be extracted to open it. Open the archive with its own program ("Show in folder") and enter the password there.
+# $file (text): archive entry, as shown in the table.
+notice-entry-limit = Error: { $file } exceeds the safety limits for archives (size, compression or time) and was not extracted. Open the archive with its own program ("Show in folder").
+# $file (text): archive entry, as shown in the table.
+notice-entry-corrupt = Error: { $file } cannot be extracted because the archive is damaged or changed after the search. Search again or open the archive with its own program.
+# $file (text): archive entry, as shown in the table.
+notice-entry-unreadable = Error: { $file } could not be extracted: the archive cannot be read (moved, in use or no permission) or there is no free space. Check and try again.
+
+## Right-click and diagnostics (Tools menu)
+
+# Text of the item in the right-click menu of Explorer and Nautilus.
+context-menu-label = Search with Lynkeus
+menu-context-menu = "Search with Lynkeus" in the right-click menu
+menu-context-menu-hint = Adds "Search with Lynkeus" to the right-click menu of files and folders; the item opens this window with the chosen item among the places to search. On Windows 11 it is under "Show more options".
+reason-no-context-menu = The right-click item is not available on this system.
+reason-context-menu-updating = The right-click item is being updated.
+notice-context-menu-exe-path = Error: the right-click item was not added because the program path contains characters that are not allowed. Move Lynkeus Searcher to a folder with a simple name and try again.
+notice-context-menu-too-long = Error: the right-click item was not added because the program path is too long. Move Lynkeus Searcher to a folder closer to the root of the drive and try again.
+notice-context-menu-exe-dir = Error: the right-click item was not added because other users can change the program folder. Move Lynkeus Searcher to your user folder or to Program Files and try again.
+notice-context-menu-foreign = Error: the right-click menu already has an item with the same name from another program; it was not changed.
+notice-context-menu-io = Error: the right-click item was not updated. Try again; if it happens again, check the permissions of your profile.
+# $count (number): refused folders.
+notice-private-dirs = { $count ->
+        [one] Warning: one app folder can be accessed by other users and is not used in this session for safety (cache, log or settings may not be saved). Check the permissions of the Lynkeus Searcher folders in your profile.
+       *[other] Warning: { $count } app folders can be accessed by other users and are not used in this session for safety (cache, log or settings may not be saved). Check the permissions of the Lynkeus Searcher folders in your profile.
+    }
+menu-log-level = Log detail
+log-level-error = Errors only
+log-level-warn = Errors and warnings
+log-level-info = Information too
+log-level-debug = Everything (for diagnosis)

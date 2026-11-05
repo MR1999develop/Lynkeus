@@ -9,6 +9,8 @@ use egui::{Label, RichText, Ui};
 
 use super::Action;
 use crate::app::{Application, Notice};
+use crate::context_menu::MenuError;
+use crate::launch::EntryFailure;
 use crate::theme::{self, SPACE};
 
 pub(super) fn bar(app: &Application, ui: &mut Ui, actions: &mut Vec<Action>) {
@@ -49,6 +51,31 @@ pub(super) fn bar(app: &Application, ui: &mut Ui, actions: &mut Vec<Action>) {
             false,
         ),
         Notice::CacheClearFailed => (i18n.tr("notice-cache-clear-failed"), true),
+        Notice::EntryFailed { file, reason } => {
+            let id = match reason {
+                EntryFailure::Encrypted => "notice-entry-encrypted",
+                EntryFailure::LimitExceeded => "notice-entry-limit",
+                EntryFailure::Corrupt => "notice-entry-corrupt",
+                EntryFailure::Unreadable => "notice-entry-unreadable",
+            };
+            (i18n.tr_args(id, &[("file", file.clone().into())]), true)
+        }
+        Notice::ContextMenuFailed(error) => {
+            let id = match error {
+                MenuError::ExeNotAbsolute | MenuError::ExeUnsafeChars => {
+                    "notice-context-menu-exe-path"
+                }
+                MenuError::CommandTooLong => "notice-context-menu-too-long",
+                MenuError::ExeDirWritable => "notice-context-menu-exe-dir",
+                MenuError::Foreign => "notice-context-menu-foreign",
+                MenuError::Io(_) => "notice-context-menu-io",
+            };
+            (i18n.tr(id), true)
+        }
+        Notice::PrivateDirsRefused { count } => (
+            i18n.tr_args("notice-private-dirs", &[("count", (*count).into())]),
+            true,
+        ),
     };
     ui.add_space(SPACE[0]);
     // Da destra: Chiudi, l'eventuale azione, poi il testo nello spazio che resta.
