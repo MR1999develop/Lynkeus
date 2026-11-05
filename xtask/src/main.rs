@@ -3,7 +3,8 @@
 
 //! Automazione del progetto, avviata con `cargo xtask <comando>`.
 //!
-//! - `check`: gli stessi controlli in locale e in CI (fmt, clippy, test, cargo-deny);
+//! - `check`: gli stessi controlli in locale e in CI (nessun avvio di processi nei decoder,
+//!   fmt, clippy, test, cargo-deny);
 //! - `check-linux`: controllo di compilazione per Linux da qualsiasi macchina;
 //! - `dist`: build di rilascio verificata e pacchetto zip con `SHA256SUMS`.
 //!
@@ -11,6 +12,7 @@
 
 mod check;
 mod dist;
+mod nospawn;
 mod process;
 mod remap;
 mod scan;
@@ -21,7 +23,8 @@ const USAGE: &str = "\
 Uso: cargo xtask <comando>
 
 Comandi:
-  check        fmt, clippy -D warnings, test e cargo deny, fermandosi al primo errore
+  check        nessun processo nei decoder, fmt, clippy -D warnings, test e cargo deny,
+               fermandosi al primo errore
   check-linux  cargo check del workspace per x86_64-unknown-linux-gnu
   dist         build di rilascio verificata, zip e SHA256SUMS in dist/";
 

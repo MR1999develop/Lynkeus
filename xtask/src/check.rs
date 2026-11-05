@@ -5,6 +5,7 @@
 
 use anyhow::{Context, Result};
 
+use crate::nospawn;
 use crate::process::{cargo, run_inherited, workspace_root};
 
 /// Un passo del controllo: nome mostrato e argomenti di cargo.
@@ -57,9 +58,12 @@ const LINUX_STEP: Step = Step {
     ],
 };
 
-/// Esegue fmt, clippy, test e cargo-deny; si ferma al primo passo che fallisce.
+/// Esegue il controllo "nessun avvio di processi nei decoder", poi fmt, clippy, test e
+/// cargo-deny; si ferma al primo passo che fallisce.
 pub fn run_all() -> Result<()> {
     let root = workspace_root()?;
+    eprintln!("xtask: ── nospawn ── {}", nospawn::CHECKED_DIR);
+    nospawn::run(&root).context("passo «nospawn» fallito")?;
     for step in CHECK_STEPS {
         run_step(step, &root).with_context(|| format!("passo «{}» fallito", step.name))?;
     }
