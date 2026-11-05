@@ -11,13 +11,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use egui::accesskit::Live;
-use egui::{Key, Role};
+use egui::{Color32, Key, Role};
 use egui_kittest::Harness;
 use egui_kittest::kittest::{NodeT, Queryable};
 use fluent_templates::fluent_bundle::FluentValue;
 use lynkeus_app::i18n::{I18n, Language};
 use lynkeus_app::preview::Loaded;
 use lynkeus_app::settings::{ExtensionMode, FilterSettings, LayoutSettings};
+use lynkeus_app::theme::SystemContrast;
 use lynkeus_app::{Application, Notice, PreviewState, Settings, Tab, setup_context};
 
 /// Tempo massimo per una ricerca nei file di prova.
@@ -634,4 +635,37 @@ fn language_menu_switches_the_interface_to_english() {
     harness.get_by_role_and_label(Role::Label, &en.tr("form-terms-title"));
     assert!(harness.query_by_label(&it.tr("form-terms-title")).is_none());
     assert_eq!(harness.state().settings().language, Some(Language::English));
+}
+
+/// Quando la finestra torna in primo piano l'app rilegge il tema a contrasto elevato del
+/// sistema: un tema cambiato o spento nel frattempo non resta applicato. Senza l'evento
+/// nessuna rilettura.
+#[test]
+fn regaining_focus_rereads_the_system_contrast() {
+    let stale = SystemContrast {
+        window: Color32::from_rgb(1, 2, 3),
+        window_text: Color32::from_rgb(250, 251, 252),
+        highlight: Color32::from_rgb(4, 5, 6),
+        highlight_text: Color32::from_rgb(253, 254, 255),
+        button_face: Color32::from_rgb(7, 8, 9),
+    };
+    let mut app = Application::build(Settings::default()).expect("app costruita");
+    app.set_system_contrast(Some(stale));
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1280.0, 800.0))
+        .build_eframe(move |cc| {
+            setup_context(&cc.egui_ctx, &app);
+            app
+        });
+    harness.run();
+    assert_eq!(harness.state().system_contrast(), Some(stale));
+    harness
+        .input_mut()
+        .events
+        .push(egui::Event::WindowFocused(true));
+    harness.run();
+    assert_eq!(
+        harness.state().system_contrast(),
+        lynkeus_app::platform::high_contrast()
+    );
 }

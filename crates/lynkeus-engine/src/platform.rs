@@ -113,12 +113,6 @@ fn refused() -> io::Error {
     )
 }
 
-/// Le cartelle private di questo crate: `PortablePrivateFs` fuori da Windows,
-/// [`RefusingFs`] su Windows.
-pub(crate) fn default_private_fs() -> std::sync::Arc<dyn PrivateFs> {
-    imp::default_private_fs()
-}
-
 /// Vero se il file o la cartella è nascosto o di sistema: su Windows attributi `HIDDEN` o
 /// `SYSTEM`; altrove nome che inizia con un punto.
 pub fn is_hidden(name: &OsStr, metadata: Option<&Metadata>) -> bool {
@@ -214,17 +208,10 @@ mod imp {
     use std::ffi::OsStr;
     use std::fs::Metadata;
     use std::os::windows::fs::MetadataExt;
-    use std::sync::Arc;
-
-    use super::{PrivateFs, RefusingFs};
 
     pub const CASE_INSENSITIVE: bool = true;
 
     pub const KEPT_ENV_VARS: &[&str] = &["SystemRoot"];
-
-    pub fn default_private_fs() -> Arc<dyn PrivateFs> {
-        Arc::new(RefusingFs)
-    }
 
     const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
     const FILE_ATTRIBUTE_SYSTEM: u32 = 0x4;
@@ -255,19 +242,13 @@ mod imp {
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
     use std::path::Path;
 
-    use std::sync::Arc;
-
     use rustix::fs::{Mode, OFlags};
 
-    use super::{NotPrivate, PortablePrivateFs, PrivateFs};
+    use super::NotPrivate;
 
     pub const CASE_INSENSITIVE: bool = false;
 
     pub const KEPT_ENV_VARS: &[&str] = &[];
-
-    pub fn default_private_fs() -> Arc<dyn PrivateFs> {
-        Arc::new(PortablePrivateFs)
-    }
 
     /// Permessi di gruppo e altri: in una cartella privata devono essere tutti spenti.
     const GROUP_OTHER_BITS: u32 = 0o077;

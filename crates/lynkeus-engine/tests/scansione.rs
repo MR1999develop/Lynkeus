@@ -137,6 +137,9 @@ fn binaries_are_skipped_and_counted() {
         found.summary.counts
     );
     assert!(found.warnings.is_empty());
+    // Scansione finita senza arresti: il totale è noto ed è quello dei file incontrati.
+    assert_eq!(found.summary.counts.files_total, Some(4));
+    assert_eq!(found.summary.counts.files_seen, 4);
 }
 
 fn utf16(text: &str, little_endian: bool, bom: bool) -> Vec<u8> {
@@ -285,6 +288,8 @@ fn cancel_during_the_search() {
     assert_eq!(found.summary.outcome, Outcome::Cancelled);
     assert!(found.hits.len() < 599, "{}", found.hits.len());
     assert!(cancelled_at.elapsed() < TIMEOUT);
+    // Annullata durante la scansione: il totale non è mai stato noto.
+    assert_eq!(found.summary.counts.files_total, None);
 }
 
 /// `cancel_and_wait` annulla e aspetta il thread della ricerca: dopo, il thread ha già

@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use lynkeus_core::{ByteSize, CompiledQuery};
 use lynkeus_engine::{
     DocPath, DocumentSource, Hit, Limits, Notify, Outcome, PrivateFs, ProgressSnapshot, Received,
-    SearchEvent, SearchHandle, SearchRequest, Summary, Warning, start_search,
+    SearchEvent, SearchHandle, SearchRequest, Summary, TextCache, Warning, start_search,
 };
 
 use crate::context_menu::{self, ContextMenuStore, MenuEntry, MenuError};
@@ -29,21 +29,22 @@ use crate::instance::InstanceServer;
 use crate::export::{self, ExportScope, ExportSettings};
 use crate::extraction::{self, ExtractionSetup, OpenedEntries, PoolDocumentUnits};
 use crate::form::{
-    FilterForm, FormErrors, FormField, MAX_ROOTS, PathInputError, PathInputStatus, RootAdded,
-    RootKind, SearchForm, TermRowError, absolute_root,
+    FormErrors, FormField, MAX_ROOTS, PathInputError, PathInputStatus, RootAdded, RootKind,
+    SearchForm, TermRowError, absolute_root,
 };
 use crate::i18n::{I18n, Language};
 use crate::launch::{
-    self, ArchiveEntryExtractor, EntryFailure, LaunchOutcome, LaunchTask, NoArchiveExtraction,
-    OpenPlan,
+    self, ArchiveEntryExtractor, LaunchOutcome, LaunchTask, NoArchiveExtraction, OpenPlan,
 };
+pub use crate::notices::Notice;
+use crate::notices::Notices;
 use crate::platform;
 use crate::preview::{self, DocumentUnits, Loaded, NoDocumentUnits, PreviewError, PreviewRequest};
 use crate::results::{ResultsView, SortColumn, SortSpec, Step};
 use crate::root_check::{RootCheck, RootChecks};
 use crate::settings::{
     CACHE_SIZE_MIB_RANGE, CacheSettings, LayoutSettings, Settings, SettingsError, SettingsFile,
-    SettingsProblem, push_recent,
+    push_recent,
 };
 use crate::theme::{SystemContrast, ThemeChoice};
 
@@ -54,6 +55,9 @@ pub const MAX_HITS_PER_FRAME: usize = 5_000;
 
 /// Dopo quanto tempo la barra d'avanzamento compare.
 pub const PROGRESS_DELAY: Duration = Duration::from_secs(1);
+
+/// Dopo quanto tempo l'avanzamento dice anche il tempo restante stimato.
+pub const ESTIMATE_DELAY: Duration = Duration::from_secs(10);
 
 /// Quanto si aspetta all'uscita un salvataggio delle impostazioni ancora in corso.
 const SETTINGS_SAVE_WAIT: Duration = Duration::from_secs(2);
@@ -80,6 +84,8 @@ pub enum SearchStatus {
         counts: ProgressSnapshot,
         /// Tempo dall'avvio.
         elapsed: Duration,
+        /// Quando il totale dei file è diventato noto; `None` prima.
+        counted: Option<CountedAt>,
     },
     /// Ricerca finita (completata, annullata o al limite dei risultati).
     Finished(Summary),
@@ -89,8 +95,11 @@ pub enum SearchStatus {
 
 /// L'avanzamento da mostrare durante una ricerca.
 ///
-/// Il motore conta i file man mano che li trova e non sa quanti ne troverà: il totale non
-/// è mai noto prima della fine, quindi l'avanzamento è indeterminato, con i conteggi.
+/// Il motore conta i file man mano che li trova: finché la scansione delle cartelle non
+/// finisce il totale è ignoto e l'avanzamento è indeterminato, con i conteggi. Poi il totale
+/// è noto ([`ProgressSnapshot::files_total`]) e l'avanzamento è una frazione; oltre
+/// [`ESTIMATE_DELAY`] anche con il tempo restante, al ritmo tenuto da quando il totale è
+/// noto (i file che restano sono documenti, più lenti dei file di testo letti prima).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Progress {
     /// Totale ignoto: `done` file esaminati su `seen` trovati finora.
@@ -100,25 +109,99 @@ pub enum Progress {
         /// File trovati finora (almeno `done`).
         seen: u64,
     },
+    /// Totale noto: `done` file esaminati su `total`.
+    Determinate {
+        /// File letti, saltati o con un avviso (al più `total`).
+        done: u64,
+        /// File da esaminare in tutto.
+        total: u64,
+        /// Tempo restante stimato: solo oltre [`ESTIMATE_DELAY`] e dopo almeno un file
+        /// esaminato da quando il totale è noto.
+        remaining: Option<Duration>,
+    },
+}
+
+impl Progress {
+    /// La parte fatta, da 0 a 1, per una barra; `None` se il totale è ignoto. Un totale di
+    /// zero file è già tutto fatto.
+    pub fn fraction(&self) -> Option<f32> {
+        /// Passi della frazione: abbastanza per una barra di qualche centinaio di punti.
+        const STEPS: u16 = 1000;
+        let Progress::Determinate { done, total, .. } = *self else {
+            return None;
+        };
+        let steps = done
+            .saturating_mul(u64::from(STEPS))
+            .checked_div(total)
+            .map_or(STEPS, |steps| {
+                u16::try_from(steps).unwrap_or(STEPS).min(STEPS)
+            });
+        Some(f32::from(steps) / f32::from(STEPS))
+    }
+}
+
+/// Il momento in cui il totale dei file è diventato noto, visto dall'app.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CountedAt {
+    /// Tempo dall'avvio della ricerca.
+    pub elapsed: Duration,
+    /// File esaminati in quel momento.
+    pub done: u64,
+}
+
+/// File esaminati: letti, saltati o con un avviso.
+fn examined(counts: &ProgressSnapshot) -> u64 {
+    counts
+        .files_searched
+        .saturating_add(counts.files_skipped)
+        .saturating_add(counts.binary_skipped)
+        .saturating_add(counts.warnings)
+}
+
+/// Il tempo che resta per `left` file al ritmo tenuto da `counted` fino a `elapsed`, quando
+/// i file esaminati erano `done`; `None` se da allora nessun file è stato esaminato.
+fn remaining_time(counted: CountedAt, elapsed: Duration, done: u64, left: u64) -> Option<Duration> {
+    let progressed = done.checked_sub(counted.done).filter(|n| *n > 0)?;
+    let since = elapsed.checked_sub(counted.elapsed)?;
+    let millis = since
+        .as_millis()
+        .saturating_mul(u128::from(left))
+        .checked_div(u128::from(progressed))?;
+    Some(Duration::from_millis(
+        u64::try_from(millis).unwrap_or(u64::MAX),
+    ))
 }
 
 impl SearchStatus {
     /// L'avanzamento da mostrare: solo durante una ricerca, dopo [`PROGRESS_DELAY`].
     pub fn progress(&self) -> Option<Progress> {
-        let SearchStatus::Running { counts, elapsed } = self else {
+        let SearchStatus::Running {
+            counts,
+            elapsed,
+            counted,
+        } = self
+        else {
             return None;
         };
         if *elapsed < PROGRESS_DELAY {
             return None;
         }
-        let done = counts
-            .files_searched
-            .saturating_add(counts.files_skipped)
-            .saturating_add(counts.binary_skipped)
-            .saturating_add(counts.warnings);
-        Some(Progress::Indeterminate {
+        let done = examined(counts);
+        let Some(total) = counts.files_total else {
+            return Some(Progress::Indeterminate {
+                done,
+                seen: counts.files_seen.max(done),
+            });
+        };
+        // Un documento può dare più avvisi (voci d'archivio): `done` non supera il totale.
+        let done = done.min(total);
+        let remaining = counted
+            .filter(|_| *elapsed >= ESTIMATE_DELAY)
+            .and_then(|counted| remaining_time(counted, *elapsed, done, total - done));
+        Some(Progress::Determinate {
             done,
-            seen: counts.files_seen.max(done),
+            total,
+            remaining,
         })
     }
 }
@@ -220,84 +303,6 @@ impl PreviewState {
     }
 }
 
-/// Un messaggio per l'utente sopra la tabella, finché non lo chiude o ne arriva un altro.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Notice {
-    /// Il file è un programma o uno script: non si apre.
-    Executable {
-        /// Il documento (per "Mostra nella cartella").
-        doc: Arc<DocPath>,
-    },
-    /// Aprire una voce d'archivio non è ancora possibile.
-    ArchiveEntry,
-    /// Il sistema non ha aperto il file.
-    OpenFailed {
-        /// Il documento, come mostrato.
-        file: String,
-    },
-    /// Il sistema non ha mostrato il file nella cartella.
-    RevealFailed {
-        /// Il documento, come mostrato.
-        file: String,
-    },
-    /// Righe copiate negli appunti.
-    Copied {
-        /// Quante.
-        rows: usize,
-    },
-    /// Esportazione riuscita.
-    Exported {
-        /// Righe scritte.
-        rows: usize,
-        /// Il file scritto.
-        file: String,
-    },
-    /// Esportazione non riuscita: il file di prima, se c'era, è intatto.
-    ExportFailed {
-        /// Il file che si voleva scrivere.
-        file: String,
-    },
-    /// Il sistema non ha avviato il thread di lavoro.
-    NoThread,
-    /// Cache dei documenti svuotata.
-    CacheCleared {
-        /// MiB liberati (arrotondati per eccesso).
-        freed_mib: u64,
-    },
-    /// La cache non si è svuotata del tutto (file in uso o permessi).
-    CacheClearFailed,
-    /// Una voce d'archivio non si è estratta per aprirla.
-    EntryFailed {
-        /// Il documento, come mostrato.
-        file: String,
-        /// Perché.
-        reason: EntryFailure,
-    },
-    /// La voce del clic destro non si è accesa o spenta.
-    ContextMenuFailed(MenuError),
-    /// Cartelle dell'app non private (di altri o aperte ad altri): le funzioni che le
-    /// usano sono spente per questa sessione.
-    PrivateDirsRefused {
-        /// Quante cartelle.
-        count: usize,
-    },
-    /// Luoghi non aggiunti: l'elenco ha già il massimo di voci.
-    RootsLimit {
-        /// Il massimo ([`MAX_ROOTS`]).
-        max: usize,
-    },
-    /// Filtri riportati ai predefiniti; "Annulla" rimette questi.
-    FiltersReset {
-        /// I filtri di prima.
-        previous: Box<FilterForm>,
-    },
-    /// Le modifiche alle impostazioni non arrivano sul disco.
-    SettingsNotSaved(SettingsProblem),
-    /// Il file delle impostazioni non era valido: messo da parte, si riparte dai
-    /// predefiniti.
-    SettingsReplaced,
-}
-
 /// Una scelta fatta in un dialogo di sistema, aperto in un thread.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FileChoice {
@@ -357,6 +362,8 @@ struct LaunchJob {
 struct Job {
     handle: SearchHandle,
     started: Instant,
+    /// Quando il totale dei file è diventato noto.
+    counted: Option<CountedAt>,
 }
 
 /// Stato della ricerca, interno.
@@ -426,13 +433,15 @@ pub struct Application {
     archive_extractor: Arc<dyn ArchiveEntryExtractor>,
     launch_job: Option<LaunchJob>,
     export_job: Option<ExportJob>,
-    notice: Option<Notice>,
+    notices: Notices,
     /// Pool dei processi estrattori e cache; `None` finché non si collega (test senza
     /// documenti).
     document_source: Option<Arc<DocumentSource>>,
     /// Cartella privata dei file estratti dagli archivi per aprirli.
     opened_entries: Option<Arc<OpenedEntries>>,
     cache_job: Option<Receiver<io::Result<ByteSize>>>,
+    /// Vero dopo aver detto (log e messaggio) che la cache non si scrive: una volta sola.
+    cache_failure_reported: bool,
     /// Cartelle e file privati (descrittore esplicito su Windows).
     private_fs: Arc<dyn PrivateFs>,
     /// Prima istanza degli avvii con `--add`: riceve i percorsi delle altre.
@@ -460,11 +469,14 @@ impl Application {
         let form = SearchForm::from_settings(&settings, |_| RootKind::Pending);
         let saved = settings_file.as_ref().map(|_| settings.clone());
         let blocked = settings_file.as_ref().and_then(SettingsFile::save_blocked);
-        let notice = match (blocked, &settings_file) {
-            (Some(problem), _) => Some(Notice::SettingsNotSaved(problem)),
-            (None, Some(file)) => file.replaced_invalid().then_some(Notice::SettingsReplaced),
-            (None, None) => None,
-        };
+        let mut notices = Notices::default();
+        match (blocked, &settings_file) {
+            (Some(problem), _) => notices.push(Notice::SettingsNotSaved(problem)),
+            (None, Some(file)) if file.replaced_invalid() => {
+                notices.push(Notice::SettingsReplaced);
+            }
+            (None, _) => {}
+        }
         let mut root_checks = RootChecks::new();
         for root in &form.roots {
             root_checks.request(root.path.clone());
@@ -487,10 +499,11 @@ impl Application {
             archive_extractor: Arc::new(NoArchiveExtraction),
             launch_job: None,
             export_job: None,
-            notice,
+            notices,
             document_source: None,
             opened_entries: None,
             cache_job: None,
+            cache_failure_reported: false,
             private_fs: platform::private_fs(),
             instance: None,
             context_menu: None,
@@ -516,8 +529,9 @@ impl Application {
         self.waker = waker;
     }
 
-    /// I colori del tema a contrasto elevato del sistema, letti all'avvio dalla piattaforma;
-    /// `None` se il tema non è attivo. La vista li applica con [`crate::setup_context`].
+    /// I colori del tema a contrasto elevato del sistema, letti dalla piattaforma all'avvio
+    /// e quando la finestra torna in primo piano; `None` se il tema non è attivo. La vista li
+    /// applica con [`crate::setup_context`].
     pub fn set_system_contrast(&mut self, contrast: Option<SystemContrast>) {
         self.system_contrast = contrast;
     }
@@ -594,7 +608,7 @@ impl Application {
             }
             RootAdded::Duplicate => false,
             RootAdded::LimitReached => {
-                self.notice = Some(Notice::RootsLimit { max: MAX_ROOTS });
+                self.notices.push(Notice::RootsLimit { max: MAX_ROOTS });
                 false
             }
         }
@@ -744,6 +758,7 @@ impl Application {
         self.job = JobState::Running(Job {
             handle,
             started: Instant::now(),
+            counted: None,
         });
         self.remember_recent();
         Ok(())
@@ -766,14 +781,50 @@ impl Application {
         }
     }
 
+    /// Annulla la ricerca in corso e aspetta che il suo thread finisca (entro circa un
+    /// secondo), scartando gli eventi non letti. Per l'uscita, prima di chiudere i processi
+    /// estrattori: nessun thread di ricerca li usa più mentre si chiudono. Mai durante
+    /// l'uso, sul thread dell'interfaccia.
+    pub fn cancel_search_and_wait(&mut self) {
+        if let JobState::Running(job) = std::mem::replace(&mut self.job, JobState::Idle) {
+            job.handle.cancel_and_wait();
+        }
+        self.current_file = None;
+    }
+
     /// Legge gli eventi arrivati, al massimo circa `max_hits` righe di risultato.
     pub fn pump_events(&mut self, max_hits: usize) -> Pump {
         let pump = self.receive(max_hits);
         self.view.extend_to(&self.results.hits, &self.results.roots);
         if pump == Pump::Ended {
             self.view.finish(&self.results.hits, &self.results.roots);
+            self.report_cache_failures();
         }
         pump
+    }
+
+    /// La prima volta che la cache dei documenti ha scritture non riuscite: lo registra nel
+    /// log (quante e la prima) e lo dice con un messaggio. Una volta sola per sessione.
+    fn report_cache_failures(&mut self) {
+        if self.cache_failure_reported {
+            return;
+        }
+        let failures = self
+            .document_source
+            .as_ref()
+            .and_then(|source| source.cache())
+            .and_then(TextCache::write_failures);
+        let Some(failures) = failures else {
+            return;
+        };
+        self.cache_failure_reported = true;
+        tracing::warn!(
+            count = failures.count,
+            kind = ?failures.first.kind,
+            error = %failures.first.message,
+            "cache dei documenti non scritta"
+        );
+        self.notices.push(Notice::CacheNotWritten);
     }
 
     fn receive(&mut self, max_hits: usize) -> Pump {
@@ -782,6 +833,15 @@ impl Application {
         };
         if let Some(current) = job.handle.progress().current_file() {
             self.current_file = Some(current);
+        }
+        if job.counted.is_none() {
+            let counts = job.handle.progress().snapshot();
+            if counts.files_total.is_some() {
+                job.counted = Some(CountedAt {
+                    elapsed: job.started.elapsed(),
+                    done: examined(&counts),
+                });
+            }
         }
         // Una copia o un'esportazione sta leggendo le righe: gli eventi aspettano in coda
         // (il motore rallenta) invece di copiare tutte le righe per aggiungerne di nuove.
@@ -823,6 +883,7 @@ impl Application {
             JobState::Running(job) => SearchStatus::Running {
                 counts: job.handle.progress().snapshot(),
                 elapsed: job.started.elapsed(),
+                counted: job.counted,
             },
             JobState::Finished(summary) => SearchStatus::Finished(*summary),
             JobState::WorkerLost => SearchStatus::WorkerLost,
@@ -1005,7 +1066,7 @@ impl Application {
         };
         let task = match launch::open_plan(&doc) {
             OpenPlan::Executable => {
-                self.notice = Some(Notice::Executable { doc });
+                self.notices.push(Notice::Executable { doc });
                 return;
             }
             OpenPlan::ArchiveEntry(entry) => LaunchTask::OpenArchiveEntry(entry),
@@ -1049,7 +1110,7 @@ impl Application {
                     done: rx,
                 });
             }
-            Err(_) => self.notice = Some(Notice::NoThread),
+            Err(_) => self.notices.push(Notice::NoThread),
         }
     }
 
@@ -1063,13 +1124,16 @@ impl Application {
             Err(TryRecvError::Disconnected) => LaunchOutcome::Failed,
         };
         let file = job.file.clone();
-        self.notice = match (outcome, &job.task) {
-            (LaunchOutcome::Done, _) => self.notice.take(),
+        let notice = match (outcome, &job.task) {
+            (LaunchOutcome::Done, _) => None,
             (LaunchOutcome::ArchiveUnavailable, _) => Some(Notice::ArchiveEntry),
             (LaunchOutcome::EntryFailed(reason), _) => Some(Notice::EntryFailed { file, reason }),
             (LaunchOutcome::Failed, LaunchTask::Reveal(_)) => Some(Notice::RevealFailed { file }),
             (LaunchOutcome::Failed, _) => Some(Notice::OpenFailed { file }),
         };
+        if let Some(notice) = notice {
+            self.notices.push(notice);
+        }
         self.launch_job = None;
     }
 
@@ -1110,7 +1174,7 @@ impl Application {
                     done: rx,
                 });
             }
-            Err(_) => self.notice = Some(Notice::NoThread),
+            Err(_) => self.notices.push(Notice::NoThread),
         }
     }
 
@@ -1136,12 +1200,12 @@ impl Application {
         match job.done.try_recv() {
             Ok(text) => {
                 self.clipboard = Some(text);
-                self.notice = Some(Notice::Copied { rows: job.rows });
+                self.notices.push(Notice::Copied { rows: job.rows });
             }
             Err(TryRecvError::Empty) => return,
             Err(TryRecvError::Disconnected) => {
                 tracing::error!("thread di copia interrotto");
-                self.notice = Some(Notice::NoThread);
+                self.notices.push(Notice::NoThread);
             }
         }
         self.copy_job = None;
@@ -1212,7 +1276,7 @@ impl Application {
                     done: rx,
                 });
             }
-            Err(_) => self.notice = Some(Notice::NoThread),
+            Err(_) => self.notices.push(Notice::NoThread),
         }
     }
 
@@ -1226,7 +1290,7 @@ impl Application {
             Err(TryRecvError::Disconnected) => Err(io::Error::other("thread interrotto")),
         };
         let file = job.file.clone();
-        self.notice = Some(match written {
+        self.notices.push(match written {
             Ok(()) => Notice::Exported {
                 rows: job.rows,
                 file,
@@ -1248,7 +1312,7 @@ impl Application {
     /// resta senza documenti.
     pub fn connect_extraction(&mut self, setup: &ExtractionSetup) -> io::Result<()> {
         let source = extraction::document_source(setup, self.settings.cache, &self.private_fs)?;
-        self.documents = Arc::new(PoolDocumentUnits::new(Arc::clone(&source), self.limits));
+        self.connect_document_source(Arc::clone(&source));
         if let Some(dir) = &setup.opened_entries_dir {
             let opened = Arc::new(OpenedEntries::new(
                 Arc::clone(&source),
@@ -1265,8 +1329,20 @@ impl Application {
                 .name("pulizia".to_owned())
                 .spawn(move || extraction::clean_stale_sessions(&dir));
         }
-        self.document_source = Some(source);
         Ok(())
+    }
+
+    /// Collega una fonte dei documenti già pronta (pool ed eventuale cache), con le
+    /// impostazioni della cache dell'app: le ricerche successive leggono anche i documenti e
+    /// l'anteprima li usa. [`Application::connect_extraction`] la costruisce con il processo
+    /// estrattore dell'app.
+    pub fn connect_document_source(&mut self, source: Arc<DocumentSource>) {
+        source.set_cache_enabled(self.settings.cache.enabled);
+        if let Some(cache) = source.cache() {
+            cache.set_limit(ByteSize::from_mib(self.settings.cache.max_size_mib));
+        }
+        self.documents = Arc::new(PoolDocumentUnits::new(Arc::clone(&source), self.limits));
+        self.document_source = Some(source);
     }
 
     /// La fonte dei documenti collegata, se c'è.
@@ -1305,19 +1381,28 @@ impl Application {
         }
     }
 
-    /// Cambia la dimensione massima della cache (riportata all'intervallo ammesso); le voci
-    /// in più si tolgono subito, in un thread.
+    /// Cambia la dimensione massima della cache (riportata all'intervallo ammesso). Il
+    /// limite vale subito, nell'ordine delle scelte dell'utente; le voci in più si tolgono in
+    /// un thread (se non parte, alla prossima scrittura della cache).
     pub fn set_cache_size_mib(&mut self, mib: u64) {
         let mib = mib.clamp(*CACHE_SIZE_MIB_RANGE.start(), *CACHE_SIZE_MIB_RANGE.end());
         self.settings.cache.max_size_mib = mib;
-        if let Some(source) = self.document_source.clone() {
-            let _resizing = thread::Builder::new()
-                .name("cache".to_owned())
-                .spawn(move || {
-                    if let Some(cache) = source.cache() {
-                        cache.set_max_size(ByteSize::from_mib(mib));
-                    }
-                });
+        let Some(source) = self.document_source.clone() else {
+            return;
+        };
+        let Some(cache) = source.cache() else {
+            return;
+        };
+        cache.set_limit(ByteSize::from_mib(mib));
+        let evicting = thread::Builder::new()
+            .name("cache".to_owned())
+            .spawn(move || {
+                if let Some(cache) = source.cache() {
+                    cache.evict_to_limit();
+                }
+            });
+        if let Err(error) = evicting {
+            tracing::warn!(%error, "pulizia della cache non avviata");
         }
     }
 
@@ -1349,7 +1434,7 @@ impl Application {
             });
         match spawned {
             Ok(_) => self.cache_job = Some(rx),
-            Err(_) => self.notice = Some(Notice::NoThread),
+            Err(_) => self.notices.push(Notice::NoThread),
         }
     }
 
@@ -1362,7 +1447,7 @@ impl Application {
             Err(TryRecvError::Empty) => return,
             Err(TryRecvError::Disconnected) => Err(io::Error::other("thread interrotto")),
         };
-        self.notice = Some(match cleared {
+        self.notices.push(match cleared {
             Ok(freed) => Notice::CacheCleared {
                 freed_mib: freed.bytes().div_ceil(1024 * 1024),
             },
@@ -1373,19 +1458,26 @@ impl Application {
 
     // --- Messaggi -----------------------------------------------------------------------
 
-    /// Il messaggio da mostrare, se c'è.
+    /// Il messaggio più recente, se c'è.
     pub fn notice(&self) -> Option<&Notice> {
-        self.notice.as_ref()
+        self.notices.newest()
     }
 
-    /// Mostra un messaggio al posto di quello attuale.
+    /// I messaggi da mostrare, dal più recente: al più un esito di un gesto e i problemi
+    /// che restano finché l'utente li chiude ([`Notice::is_lasting`]).
+    pub fn notices(&self) -> &[Notice] {
+        self.notices.all()
+    }
+
+    /// Mostra un messaggio per primo: sostituisce l'esito di un gesto mostrato prima, mai un
+    /// problema che resta (salvo uno dello stesso tipo).
     pub fn set_notice(&mut self, notice: Notice) {
-        self.notice = Some(notice);
+        self.notices.push(notice);
     }
 
-    /// Chiude il messaggio.
-    pub fn dismiss_notice(&mut self) {
-        self.notice = None;
+    /// Chiude il messaggio in posizione `index` di [`Application::notices`].
+    pub fn dismiss_notice(&mut self, index: usize) {
+        self.notices.dismiss(index);
     }
 
     /// Raccoglie, senza attendere, l'esito delle aperture, delle copie, delle esportazioni,
@@ -1404,15 +1496,17 @@ impl Application {
     pub fn reset_filters(&mut self) {
         let previous = Box::new(self.form.filters.clone());
         self.form.filters.reset();
-        self.notice = Some(Notice::FiltersReset { previous });
+        self.notices.push(Notice::FiltersReset { previous });
     }
 
     /// Rimette i filtri di prima dell'ultimo ripristino, se il suo messaggio è ancora
     /// quello mostrato.
     pub fn undo_filters_reset(&mut self) {
-        match self.notice.take() {
-            Some(Notice::FiltersReset { previous }) => self.form.filters = *previous,
-            other => self.notice = other,
+        let reset = self
+            .notices
+            .take_newest_if(|notice| matches!(notice, Notice::FiltersReset { .. }));
+        if let Some(Notice::FiltersReset { previous }) = reset {
+            self.form.filters = *previous;
         }
     }
 
@@ -1555,7 +1649,7 @@ impl Application {
         let entry = match self.menu_entry(&setup.exe) {
             Ok(entry) => entry,
             Err(error) => {
-                self.notice = Some(Notice::ContextMenuFailed(error));
+                self.notices.push(Notice::ContextMenuFailed(error));
                 return;
             }
         };
@@ -1576,7 +1670,7 @@ impl Application {
             });
         match spawned {
             Ok(_) => self.context_menu_job = Some(ContextMenuJob { enabled, done: rx }),
-            Err(_) => self.notice = Some(Notice::NoThread),
+            Err(_) => self.notices.push(Notice::NoThread),
         }
     }
 
@@ -1601,7 +1695,12 @@ impl Application {
             }
             Err(error) => {
                 tracing::warn!(%error, enabled = job.enabled, "voce del clic destro non aggiornata");
-                self.notice = Some(Notice::ContextMenuFailed(error));
+                // Con il programma modificabile da altri la voce nostra è stata tolta (o non
+                // aggiunta): l'opzione si spegne, così il prossimo avvio non la riscrive.
+                if error == MenuError::ExeDirWritable {
+                    self.settings.context_menu = false;
+                }
+                self.notices.push(Notice::ContextMenuFailed(error));
             }
         }
         self.context_menu_job = None;
@@ -1696,7 +1795,7 @@ impl Application {
             Err(error) => {
                 tracing::warn!(%error, "impostazioni non salvate");
                 if !std::mem::replace(&mut self.save_failure_reported, true) {
-                    self.notice = Some(Notice::SettingsNotSaved(error.problem()));
+                    self.notices.push(Notice::SettingsNotSaved(error.problem()));
                 }
             }
         }
@@ -1764,6 +1863,7 @@ mod tests {
     use lynkeus_engine::Outcome;
 
     use super::*;
+    use crate::settings::SettingsProblem;
 
     fn finished(outcome: Outcome) -> JobState {
         JobState::Finished(Summary {
@@ -1819,7 +1919,11 @@ mod tests {
             warnings: 1,
             ..ProgressSnapshot::default()
         };
-        let running = |elapsed| SearchStatus::Running { counts, elapsed };
+        let running = |elapsed| SearchStatus::Running {
+            counts,
+            elapsed,
+            counted: None,
+        };
         assert_eq!(running(Duration::from_millis(999)).progress(), None);
         assert_eq!(
             running(PROGRESS_DELAY).progress(),
@@ -1827,6 +1931,224 @@ mod tests {
         );
         assert_eq!(SearchStatus::Idle.progress(), None);
         assert_eq!(SearchStatus::WorkerLost.progress(), None);
+    }
+
+    /// C-06: finita la scansione il totale è noto e l'avanzamento è una frazione; oltre
+    /// dieci secondi anche il tempo restante, al ritmo tenuto da quando il totale è noto.
+    #[test]
+    fn progress_is_a_fraction_once_the_total_is_known() {
+        let counts = ProgressSnapshot {
+            files_seen: 40,
+            files_searched: 30,
+            files_total: Some(40),
+            ..ProgressSnapshot::default()
+        };
+        // Totale noto a 4 s con 20 file esaminati: 10 file in 6 s, ne restano 10.
+        let counted = CountedAt {
+            elapsed: Duration::from_secs(4),
+            done: 20,
+        };
+        let running = |elapsed, counted| SearchStatus::Running {
+            counts,
+            elapsed,
+            counted,
+        };
+        let determinate = |remaining| {
+            Some(Progress::Determinate {
+                done: 30,
+                total: 40,
+                remaining,
+            })
+        };
+        assert_eq!(
+            running(Duration::from_millis(999), Some(counted)).progress(),
+            None
+        );
+        // Sotto i dieci secondi, nessuna stima.
+        assert_eq!(
+            running(Duration::from_secs(9), Some(counted)).progress(),
+            determinate(None)
+        );
+        assert_eq!(
+            running(ESTIMATE_DELAY, Some(counted)).progress(),
+            determinate(Some(Duration::from_secs(6)))
+        );
+        // Senza il momento del totale, o senza file esaminati da allora, nessuna stima.
+        assert_eq!(running(ESTIMATE_DELAY, None).progress(), determinate(None));
+        let just_counted = CountedAt {
+            elapsed: Duration::from_secs(9),
+            done: 30,
+        };
+        assert_eq!(
+            running(ESTIMATE_DELAY, Some(just_counted)).progress(),
+            determinate(None)
+        );
+        assert_eq!(
+            determinate(None).and_then(|progress| progress.fraction()),
+            Some(0.75)
+        );
+    }
+
+    /// Partizioni della frazione: i file con più avvisi non la portano oltre 1, un totale
+    /// di zero file è già tutto fatto, il totale ignoto non ne ha.
+    #[test]
+    fn fraction_partitions() {
+        let counts = ProgressSnapshot {
+            files_seen: 2,
+            files_searched: 2,
+            warnings: 3,
+            files_total: Some(2),
+            ..ProgressSnapshot::default()
+        };
+        let over = SearchStatus::Running {
+            counts,
+            elapsed: PROGRESS_DELAY,
+            counted: None,
+        }
+        .progress();
+        assert_eq!(
+            over,
+            Some(Progress::Determinate {
+                done: 2,
+                total: 2,
+                remaining: None
+            })
+        );
+        assert_eq!(over.and_then(|p| p.fraction()), Some(1.0));
+        let empty = Progress::Determinate {
+            done: 0,
+            total: 0,
+            remaining: None,
+        };
+        assert_eq!(empty.fraction(), Some(1.0));
+        assert_eq!(
+            Progress::Indeterminate { done: 1, seen: 2 }.fraction(),
+            None
+        );
+    }
+
+    /// Un lanciatore che non avvia nulla: i test della cache non leggono documenti.
+    struct NoLaunch;
+
+    impl lynkeus_engine::WorkerLauncher for NoLaunch {
+        fn launch(&self) -> io::Result<lynkeus_engine::LaunchedWorker> {
+            Err(io::Error::other("nessun processo in questo test"))
+        }
+    }
+
+    /// Una fonte dei documenti senza processi, con la cache in `dir` creata da `fs`.
+    fn source_with_cache(dir: &Path, fs: Arc<dyn PrivateFs>) -> Arc<DocumentSource> {
+        let pool =
+            lynkeus_engine::ExtractorPool::new(Arc::new(NoLaunch), std::num::NonZeroUsize::MIN);
+        let cache = TextCache::at(dir.join("cache"), ByteSize::from_mib(500), fs);
+        Arc::new(DocumentSource::new(pool, Some(cache)))
+    }
+
+    /// Il limite della cache cambia subito, sul thread che chiama, nell'ordine delle
+    /// scelte; solo lo sfratto va in un thread.
+    #[test]
+    fn the_cache_limit_changes_at_once() {
+        let dir = tempfile::tempdir().expect("cartella");
+        let source = source_with_cache(dir.path(), platform::private_fs());
+        let mut app = Application::build(Settings::default()).expect("app");
+        app.connect_document_source(Arc::clone(&source));
+        let limit = || source.cache().map(TextCache::max_size);
+        // Al collegamento valgono le impostazioni dell'app.
+        assert_eq!(
+            limit(),
+            Some(ByteSize::from_mib(CacheSettings::default().max_size_mib))
+        );
+        app.set_cache_size_mib(100);
+        assert_eq!(limit(), Some(ByteSize::from_mib(100)));
+        app.set_cache_size_mib(2_000);
+        app.set_cache_size_mib(u64::MAX);
+        assert_eq!(
+            limit(),
+            Some(ByteSize::from_mib(*CACHE_SIZE_MIB_RANGE.end()))
+        );
+    }
+
+    /// Una cache che non si scrive si dice una volta, a fine ricerca: nel log e con un
+    /// messaggio che resta; le ricerche dopo non lo ripetono.
+    #[test]
+    fn a_cache_that_cannot_be_written_is_reported_once() {
+        use lynkeus_engine::{CacheKey, RefusingFs};
+        use lynkeus_extract::{ExtractEvent, ExtractOptions, Format};
+
+        let dir = tempfile::tempdir().expect("cartella");
+        let source = source_with_cache(dir.path(), Arc::new(RefusingFs));
+        let mut app = Application::build(Settings::default()).expect("app");
+        app.connect_document_source(Arc::clone(&source));
+        app.form.add_root(missing_root(), RootKind::Missing);
+        app.set_term("ar");
+        run_to_end(&mut app);
+        assert!(app.notices().is_empty(), "nessuna scrittura fallita finora");
+
+        let events = [
+            ExtractEvent::DocumentStart {
+                inner: Vec::new(),
+                format: Format::Pdf,
+            },
+            ExtractEvent::DocumentEnd,
+        ];
+        let key = CacheKey::new(
+            Path::new("documento.pdf"),
+            1,
+            std::time::UNIX_EPOCH,
+            &ExtractOptions::default(),
+        );
+        let cache = source.cache().expect("cache");
+        assert!(cache.put(&key, &events).is_err());
+        run_to_end(&mut app);
+        assert_eq!(app.notices(), [Notice::CacheNotWritten]);
+        app.dismiss_notice(0);
+        assert!(cache.put(&key, &events).is_err());
+        run_to_end(&mut app);
+        assert!(app.notices().is_empty(), "detto una volta sola");
+    }
+
+    /// All'avvio l'avviso sulle cartelle non private non nasconde quello sulle
+    /// impostazioni rimesse ai predefiniti: restano entrambi, finché l'utente li chiude.
+    #[test]
+    fn startup_notices_stay_visible_together() {
+        let dir = tempfile::tempdir().expect("cartella");
+        let path = dir.path().join(crate::settings::FILE_NAME);
+        std::fs::write(&path, "non è toml [[[").expect("scritto");
+        let (file, settings, _) = SettingsFile::load(path);
+        let mut app = Application::build_persistent(settings, file).expect("app");
+        app.set_notice(Notice::PrivateDirsRefused { count: 1 });
+        app.set_notice(Notice::Copied { rows: 2 });
+        app.set_notice(Notice::NoThread);
+        assert_eq!(
+            app.notices(),
+            [
+                Notice::NoThread,
+                Notice::PrivateDirsRefused { count: 1 },
+                Notice::SettingsReplaced,
+            ]
+        );
+        app.dismiss_notice(1);
+        assert_eq!(app.notices(), [Notice::NoThread, Notice::SettingsReplaced]);
+    }
+
+    /// All'uscita la ricerca in corso si annulla e il suo thread si aspetta, prima di
+    /// chiudere i processi estrattori.
+    #[test]
+    fn exit_cancels_and_waits_for_the_search() {
+        let dir = tempfile::tempdir().expect("cartella");
+        many_words_file(dir.path(), 50_000);
+        let mut app = Application::build(Settings::default()).expect("app");
+        app.form.add_root(dir.path().to_owned(), RootKind::Folder);
+        app.set_term("ar");
+        app.start_search(Arc::new(|| {})).expect("ricerca avviata");
+        assert!(app.is_searching());
+        app.cancel_search_and_wait();
+        assert!(!app.is_searching());
+        assert_eq!(app.status(), SearchStatus::Idle);
+        assert!(app.current_file().is_none());
+        // Senza ricerca in corso non fa nulla.
+        app.cancel_search_and_wait();
+        assert_eq!(app.pump_events(usize::MAX), Pump::NoSearch);
     }
 
     /// C-04: un modulo non valido mostra il pannello, apre i Filtri se serve e chiede il
@@ -2263,6 +2585,51 @@ mod tests {
         app.set_context_menu(false, &notify);
         wait(&mut app);
         assert!(!app.context_menu_enabled());
+    }
+
+    /// D-06: all'avvio, con l'opzione accesa e il programma modificabile da altri, la voce
+    /// si toglie e l'opzione si spegne (il prossimo avvio non la riscrive); il messaggio lo
+    /// dice.
+    #[test]
+    fn a_writable_program_folder_turns_the_context_menu_off() {
+        use crate::context_menu::MenuState;
+
+        struct Writable;
+        impl ContextMenuStore for Writable {
+            fn state(&self, _entry: &MenuEntry) -> io::Result<MenuState> {
+                Ok(MenuState::Current)
+            }
+            fn install(&self, _entry: &MenuEntry) -> io::Result<()> {
+                Ok(())
+            }
+            fn remove(&self, _entry: &MenuEntry) -> io::Result<()> {
+                Ok(())
+            }
+            fn exe_writable_by_others(&self, _exe: &Path) -> io::Result<bool> {
+                Ok(true)
+            }
+        }
+
+        let settings = Settings {
+            context_menu: true,
+            ..Settings::default()
+        };
+        let mut app = Application::build(settings).expect("app");
+        let exe = std::env::temp_dir().join("lynkeus-searcher.exe");
+        app.connect_context_menu(Arc::new(Writable), exe);
+        app.refresh_context_menu(&(Arc::new(|| {}) as Notify));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.is_updating_context_menu() {
+            assert!(Instant::now() < deadline, "voce non aggiornata");
+            app.pump_actions();
+            thread::yield_now();
+        }
+        assert!(!app.context_menu_enabled());
+        assert!(!app.settings().context_menu);
+        assert_eq!(
+            app.notice(),
+            Some(&Notice::ContextMenuFailed(MenuError::ExeDirWritable))
+        );
     }
 
     #[test]

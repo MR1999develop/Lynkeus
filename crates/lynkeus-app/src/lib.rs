@@ -21,6 +21,7 @@ pub mod format;
 pub mod i18n;
 pub mod instance;
 pub mod launch;
+mod notices;
 pub mod platform;
 pub mod preview;
 pub mod private_dirs;
@@ -31,8 +32,10 @@ pub mod theme;
 mod ui;
 
 pub use app::{
-    Application, EmptyState, FileChoice, MAX_HITS_PER_FRAME, Notice, PROGRESS_DELAY, PreviewKey,
-    PreviewState, Progress, Pump, Results, SearchStatus, StartError, Tab, ViewState,
+    Application, CountedAt, ESTIMATE_DELAY, EmptyState, FileChoice, MAX_HITS_PER_FRAME,
+    PROGRESS_DELAY, PreviewKey, PreviewState, Progress, Pump, Results, SearchStatus, StartError,
+    Tab, ViewState,
 };
+pub use notices::Notice;
 pub use settings::{Settings, SettingsFile};
 pub use ui::setup_context;

@@ -13,7 +13,7 @@ use lynkeus_engine::{
     ExtensionError, Hit, LimitKind, Outcome, ProgressSnapshot, Summary, WarningKind,
 };
 
-use crate::app::SearchStatus;
+use crate::app::{Progress, SearchStatus};
 use crate::form::{ExtensionInputError, MAX_ROOTS, PathInputError, TermRowError};
 use crate::i18n::I18n;
 
@@ -184,11 +184,56 @@ pub fn context_text(snippet: &lynkeus_core::Snippet) -> String {
 pub fn status(i18n: &I18n, status: &SearchStatus, max_results: usize) -> String {
     match status {
         SearchStatus::Idle => i18n.tr("status-idle"),
-        SearchStatus::Running { counts, elapsed } => {
-            i18n.tr_args("status-running", &counts_args(counts, *elapsed))
-        }
+        SearchStatus::Running {
+            counts, elapsed, ..
+        } => i18n.tr_args("status-running", &counts_args(counts, *elapsed)),
         SearchStatus::Finished(summary) => finished(i18n, summary, max_results),
         SearchStatus::WorkerLost => i18n.tr("status-worker-lost"),
+    }
+}
+
+/// Il testo dell'avanzamento: i conteggi, con il totale quando è noto e, se stimato, il
+/// tempo restante (in secondi sotto il minuto, poi in minuti, arrotondati per eccesso).
+pub fn progress(i18n: &I18n, progress: Progress) -> String {
+    /// Sotto questa durata il tempo restante si dice in secondi.
+    const MINUTE: Duration = Duration::from_secs(60);
+    match progress {
+        Progress::Indeterminate { done, seen } => i18n.tr_args(
+            "status-progress",
+            &[("done", done.into()), ("seen", seen.into())],
+        ),
+        Progress::Determinate {
+            done,
+            total,
+            remaining,
+        } => {
+            let Some(left) = remaining else {
+                return i18n.tr_args(
+                    "status-progress-total",
+                    &[("done", done.into()), ("total", total.into())],
+                );
+            };
+            let seconds = u64::try_from(left.as_millis().div_ceil(1000))
+                .unwrap_or(u64::MAX)
+                .max(1);
+            let (id, unit, amount) = if left < MINUTE {
+                ("status-progress-seconds-left", "seconds", seconds)
+            } else {
+                (
+                    "status-progress-minutes-left",
+                    "minutes",
+                    seconds.div_ceil(60),
+                )
+            };
+            i18n.tr_args(
+                id,
+                &[
+                    ("done", done.into()),
+                    ("total", total.into()),
+                    (unit, amount.into()),
+                ],
+            )
+        }
     }
 }
 
@@ -336,6 +381,7 @@ mod tests {
             let running = SearchStatus::Running {
                 counts,
                 elapsed: Duration::from_secs(1),
+                counted: None,
             };
             let done = SearchStatus::Finished(Summary {
                 outcome: Outcome::Completed,
@@ -376,9 +422,52 @@ mod tests {
         let running = SearchStatus::Running {
             counts,
             elapsed: Duration::from_secs(3),
+            counted: None,
         };
         let text = plain(&status(&it, &running, 10));
         assert!(text.contains("1 file letto"), "{text}");
         assert!(text.contains("2 parole trovate"), "{text}");
+    }
+
+    /// C-06: l'avanzamento dice il totale quando è noto e, se stimato, il tempo restante:
+    /// secondi sotto il minuto, poi minuti, sempre per eccesso.
+    #[test]
+    fn progress_texts() {
+        let it = italian();
+        let text = |progress| plain(&super::progress(&it, progress));
+        assert_eq!(
+            text(Progress::Indeterminate { done: 3, seen: 10 }),
+            "3 di 10 file trovati finora"
+        );
+        let determinate = |remaining| Progress::Determinate {
+            done: 30,
+            total: 40,
+            remaining,
+        };
+        assert_eq!(text(determinate(None)), "30 di 40 file");
+        let cases = [
+            (Duration::ZERO, "30 di 40 file, ancora circa 1 s"),
+            (
+                Duration::from_millis(41_200),
+                "30 di 40 file, ancora circa 42 s",
+            ),
+            (
+                Duration::from_millis(59_999),
+                "30 di 40 file, ancora circa 60 s",
+            ),
+            (Duration::from_secs(60), "30 di 40 file, ancora circa 1 min"),
+            (Duration::from_secs(61), "30 di 40 file, ancora circa 2 min"),
+        ];
+        for (left, expected) in cases {
+            assert_eq!(text(determinate(Some(left))), expected, "{left:?}");
+        }
+        let en = I18n::new(Language::English);
+        assert_eq!(
+            plain(&super::progress(
+                &en,
+                determinate(Some(Duration::from_secs(90)))
+            )),
+            "30 of 40 files, about 2 min left"
+        );
     }
 }

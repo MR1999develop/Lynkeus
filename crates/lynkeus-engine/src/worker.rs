@@ -132,6 +132,7 @@ impl Search<'_> {
         let index = Arc::new(plan.index);
         let Some(documents) = &self.context.documents else {
             self.walk(&index, None);
+            self.finish_scan();
             return;
         };
         let (queue, pending) = crossbeam_channel::bounded(DOCUMENT_QUEUE);
@@ -150,9 +151,19 @@ impl Search<'_> {
             // Senza lettori i documenti diventerebbero avvisi uno per uno: meglio la scansione
             // dei soli file di testo, con i documenti contati tra i saltati.
             self.walk(&index, (readers > 0).then_some(&queue));
+            // Da qui restano solo i documenti in coda o in lettura.
+            self.finish_scan();
             // La coda chiusa dice ai lettori che non arriva altro.
             drop(queue);
         });
+    }
+
+    /// La scansione è finita: se nulla l'ha fermata, il totale dei file è noto. I thread
+    /// della scansione sono già stati raccolti da `walk`, quindi i loro conteggi si vedono.
+    fn finish_scan(&self) {
+        if self.halt.get().is_none() {
+            self.context.progress.finish_scan();
+        }
     }
 
     /// Scansione parallela delle radici; i documenti vanno in `documents`, se c'è.

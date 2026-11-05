@@ -40,6 +40,8 @@ pub const FOCUS_WIDTH: f32 = 2.0;
 pub const FOCUS_GAP: f32 = 2.0;
 /// Larghezza del segno sul bordo sinistro delle righe selezionate, in punti.
 pub const SELECTION_MARK_WIDTH: f32 = 4.0;
+/// Larghezza della barra d'avanzamento nella barra di stato, in punti.
+pub const PROGRESS_WIDTH: f32 = 160.0;
 
 /// Nome della famiglia SemiBold, registrata da [`crate::platform::install_fonts`].
 pub const SEMIBOLD: &str = "semibold";

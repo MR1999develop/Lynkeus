@@ -124,16 +124,21 @@ thiserror = "2.0.21"
 # file, livello regolabile a runtime (`reload`), senza colori ANSI.
 tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 tracing-appender = "0.2.5"
+# Gli avvisi delle librerie che scrivono con il crate `log` (eframe, winit, wgpu) passano a
+# `tracing` e finiscono nel log dell'app (`LogTracer`); senza `interest-cache` (lru, ahash).
+tracing-log = { version = "0.2.0", default-features = false, features = ["log-tracer", "std"] }
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "std"] }
 toml = { version = "1.1.8", default-features = false, features = ["parse", "display", "serde"] }
 # NFC/NFD dei termini e tabella delle varianti accentate (lynkeus-core).
 unicode-normalization = "0.1.26"
 # API Win32 senza involucri, solo in `lynkeus-app/src/platform/windows_ffi.rs`: processo
 # estrattore con CreateProcessW nel Job Object (limite di memoria per processo, che `win32job`
-# non offre: experiments/jobobject/ESITI.md), SetDefaultDllDirectories, AssocIsDangerous e
-# SystemParametersInfoW.
+# non offre: experiments/jobobject/ESITI.md), SetDefaultDllDirectories, AssocIsDangerous,
+# SystemParametersInfoW e GetSysColor.
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
+    # GetSysColor (colori del tema a contrasto elevato).
+    "Win32_Graphics_Gdi",
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",

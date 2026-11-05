@@ -2,9 +2,15 @@
 // Copyright (C) 2026 MR
 
 //! Avanzamento di una ricerca, letto dall'interfaccia senza mai bloccarsi.
+//!
+//! Il totale dei file non si conosce in anticipo: la scansione delle cartelle li conta
+//! mentre i lettori li esaminano. Quando la scansione finisce (senza arresti) il totale
+//! diventa noto ([`ProgressSnapshot::files_total`]) e chi mostra l'avanzamento può passare
+//! da una barra indeterminata a una frazione con il tempo restante. Restano allora da
+//! leggere solo i documenti già in coda o in lettura nei processi estrattori.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, TryLockError};
+use std::sync::{Arc, Mutex, OnceLock, TryLockError};
 
 use crate::doc::DocPath;
 
@@ -21,6 +27,7 @@ pub struct Progress {
     binary_skipped: AtomicU64,
     hits: AtomicU64,
     warnings: AtomicU64,
+    files_total: OnceLock<u64>,
     current: Mutex<Option<Arc<DocPath>>>,
 }
 
@@ -39,6 +46,10 @@ pub struct ProgressSnapshot {
     pub hits: u64,
     /// Avvisi inviati.
     pub warnings: u64,
+    /// File da esaminare in tutto: `Some` da quando la scansione delle cartelle è finita
+    /// senza arresti (da lì è uguale a `files_seen`), `None` prima, o se la ricerca si è
+    /// fermata durante la scansione (annullata, limite dei risultati).
+    pub files_total: Option<u64>,
 }
 
 /// Un contatore di [`Progress`] (uso interno del crate).
@@ -63,6 +74,7 @@ impl Progress {
             binary_skipped: load(&self.binary_skipped),
             hits: load(&self.hits),
             warnings: load(&self.warnings),
+            files_total: self.files_total.get().copied(),
         }
     }
 
@@ -86,6 +98,15 @@ impl Progress {
             Counter::Warnings => &self.warnings,
         };
         target.fetch_add(amount, Ordering::Relaxed);
+    }
+
+    /// La scansione delle cartelle è finita senza arresti: `files_seen` è il totale. Da
+    /// chiamare quando tutti i thread della scansione sono finiti (i loro conteggi sono
+    /// visibili a chi chiama); una seconda chiamata non cambia il totale.
+    pub(crate) fn finish_scan(&self) {
+        let total = self.files_seen.load(Ordering::Relaxed);
+        // Solo la prima chiamata conta: il totale non cambia più.
+        let _first = self.files_total.set(total);
     }
 
     /// Aggiorna il file corrente; se il lucchetto è occupato salta l'aggiornamento.
@@ -113,5 +134,19 @@ mod tests {
         let doc = Arc::new(DocPath::file("a.txt"));
         progress.set_current(Some(doc.clone()));
         assert_eq!(progress.current_file(), Some(doc));
+    }
+
+    /// Il totale è ignoto finché la scansione non finisce, poi resta quello di allora.
+    #[test]
+    fn the_total_is_known_once_the_scan_ends() {
+        let progress = Progress::default();
+        progress.add(Counter::FilesSeen, 2);
+        assert_eq!(progress.snapshot().files_total, None);
+        progress.finish_scan();
+        progress.add(Counter::FilesSearched, 2);
+        assert_eq!(progress.snapshot().files_total, Some(2));
+        progress.add(Counter::FilesSeen, 1);
+        progress.finish_scan();
+        assert_eq!(progress.snapshot().files_total, Some(2));
     }
 }

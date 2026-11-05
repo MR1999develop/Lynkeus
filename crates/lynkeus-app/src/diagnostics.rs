@@ -6,7 +6,9 @@
 //! - **Log** ([`init_logging`]): `tracing` in `logs/lynkeus-searcher.<data>.log`, un file al
 //!   giorno, al più [`MAX_LOG_FILES`] (i più vecchi si cancellano); livello scelto nelle
 //!   impostazioni e cambiato a runtime ([`LogControl::set_level`]). Solo motivo, percorso e
-//!   contatori: mai testo dei documenti, token o nome del canale dell'istanza unica.
+//!   contatori: mai testo dei documenti, token o nome del canale dell'istanza unica. Le
+//!   librerie che scrivono con il crate `log` (eframe, winit, wgpu) finiscono nello stesso
+//!   log, con lo stesso livello (`LogTracer` di `tracing-log`).
 //! - **Rapporti di crash** ([`install_crash_reporter`]): un panic scrive
 //!   `crash-<secondi>-<pid>.txt` con versione, sistema, thread, posizione e messaggio ripulito
 //!   da percorsi e testi tra virgolette ([`redact`]); al più [`MAX_CRASH_REPORTS`] file, i più
@@ -19,6 +21,8 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use lynkeus_engine::PrivateFs;
+use tracing_log::LogTracer;
+use tracing_log::log;
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -82,6 +86,17 @@ impl LogLevel {
             LogLevel::Debug => LevelFilter::DEBUG,
         }
     }
+
+    /// Lo stesso livello per il crate `log`: le librerie non preparano nemmeno i messaggi
+    /// sotto il livello scelto.
+    fn log_filter(self) -> log::LevelFilter {
+        match self {
+            LogLevel::Error => log::LevelFilter::Error,
+            LogLevel::Warn => log::LevelFilter::Warn,
+            LogLevel::Info => log::LevelFilter::Info,
+            LogLevel::Debug => log::LevelFilter::Debug,
+        }
+    }
 }
 
 /// Cambia il livello del log a runtime.
@@ -91,11 +106,12 @@ pub struct LogControl {
 }
 
 impl LogControl {
-    /// Da qui in poi registra a `level`.
+    /// Da qui in poi registra a `level`, anche i messaggi delle librerie che usano `log`.
     pub fn set_level(&self, level: LogLevel) {
         if let Err(error) = self.handle.modify(|filter| *filter = level.filter()) {
             tracing::warn!(%error, "livello del log non cambiato");
         }
+        log::set_max_level(level.log_filter());
     }
 }
 
@@ -123,7 +139,22 @@ pub fn init_logging(dir: Option<&Path>, level: LogLevel) -> Option<LogControl> {
             .with(tracing_subscriber::fmt::layer().with_writer(io::stderr))
             .try_init(),
     };
-    installed.ok().map(|()| LogControl { handle })
+    installed.ok()?;
+    forward_log_records(level);
+    Some(LogControl { handle })
+}
+
+/// Fa passare a `tracing` i messaggi delle librerie che scrivono con il crate `log`
+/// (eframe, winit, wgpu), fino a `level`; [`LogControl::set_level`] lo cambia poi con il
+/// resto del log. Se un altro logger di `log` è già installato restano a lui, e lo si
+/// registra.
+fn forward_log_records(level: LogLevel) {
+    if let Err(error) = LogTracer::builder()
+        .with_max_level(level.log_filter())
+        .init()
+    {
+        tracing::warn!(%error, "messaggi del crate log non inoltrati");
+    }
 }
 
 /// Le informazioni di un panic, già senza dati personali.
@@ -418,6 +449,49 @@ mod tests {
             "/home/utente/.cargo/registry/src/x/egui/src/ui.rs"
         };
         assert_eq!(source_file(absolute), "…/src/ui.rs");
+    }
+
+    /// Un buffer condiviso in cui il log di prova scrive.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl Write for Captured {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .map_err(|_| io::Error::other("buffer avvelenato"))?
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Captured {
+        fn text(&self) -> String {
+            let bytes = self.0.lock().map(|b| b.clone()).unwrap_or_default();
+            String::from_utf8_lossy(&bytes).into_owned()
+        }
+    }
+
+    /// Gli avvisi di una libreria che scrive con il crate `log` arrivano nel log dell'app;
+    /// i messaggi sotto il livello scelto no.
+    #[test]
+    fn log_crate_records_reach_the_log() {
+        forward_log_records(LogLevel::Warn);
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = Registry::default()
+            .with(tracing_subscriber::fmt::layer().with_writer(move || writer.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            log::warn!(target: "wgpu_core", "superficie persa");
+            log::debug!(target: "winit", "evento della finestra");
+        });
+        let text = captured.text();
+        assert!(text.contains("superficie persa"), "{text}");
+        assert!(!text.contains("evento della finestra"), "{text}");
     }
 
     #[test]

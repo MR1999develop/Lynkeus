@@ -36,8 +36,11 @@
 //! stdout e dorme; il test lo uccide e controlla che il figlio rimasto senza padre esca. Con
 //! [`BUSY_ORPHAN_PARENT_FLAG`] il figlio, dopo il lock, resta occupato (`lucchetto-occupato`).
 //!
-//! Su Linux il processo estrattore chiede al kernel di essere ucciso quando muore il padre
-//! (`PR_SET_PDEATHSIG`), come il processo estrattore vero.
+//! Come il processo estrattore vero, all'avvio sorveglia il padre con
+//! `lynkeus_extract::worker::watch_parent` (Linux; su Windows lo chiude il Job Object o il
+//! pool). Il processo vero controlla il segnale a ogni evento; qui lo controllano le attese
+//! dei comportamenti scorretti: chi dorme o gira a vuoto esce appena il padre non c'è più,
+//! così nessun processo di prova resta orfano.
 //!
 //! Non fa parte del pacchetto distribuito.
 
@@ -48,7 +51,8 @@ use std::num::NonZeroUsize;
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use lynkeus_core::{Location, TextUnit};
 use lynkeus_engine::{CommandLauncher, ExtractEnd, ExtractorPool};
@@ -56,7 +60,7 @@ use lynkeus_extract::protocol::{
     EntryRequest, ExtractRequest, FrameReader, FrameWriter, ProtocolError, Request, RequestId,
     Response,
 };
-use lynkeus_extract::worker::WorkerConfig;
+use lynkeus_extract::worker::{WorkerConfig, watch_parent};
 use lynkeus_extract::{
     EntrySink, EventSink, ExtractEvent, ExtractOptions, Format, Stopped, WarningKind,
     extract_entry, extract_path,
@@ -80,8 +84,16 @@ const OVERSIZED_UNIT_BYTES: usize = 2 * 1024 * 1024;
 /// Byte di ogni unità di `inonda.*`.
 const FLOOD_UNIT_BYTES: usize = 64 * 1024;
 
-/// Un'attesa che il test non vede mai finire.
+/// Un'attesa che il test non vede mai finire. Anche il limite di vita di un processo che
+/// dorme o gira a vuoto: su Windows `watch_parent` non fa nulla (lì i processi li chiude il
+/// pool), e un processo di prova rimasto senza padre esce comunque.
 const FOREVER: Duration = Duration::from_secs(3600);
+
+/// Ogni quanto un processo che dorme guarda se il padre c'è ancora.
+const ORPHAN_POLL: Duration = Duration::from_millis(50);
+
+/// Codice d'uscita di un processo rimasto senza padre, o che non riesce a sorvegliarlo.
+const ORPHAN_EXIT: i32 = 4;
 
 fn main() -> ExitCode {
     let mut args = std::env::args_os().skip(1).peekable();
@@ -98,40 +110,50 @@ fn main() -> ExitCode {
     if first != Some(OsString::from("--extract-worker")) {
         return ExitCode::from(2);
     }
-    die_with_parent();
+    let parent_gone = Arc::new(AtomicBool::new(false));
+    if watch_parent(Arc::clone(&parent_gone)).is_err() {
+        std::process::exit(ORPHAN_EXIT);
+    }
     if args.peek() == Some(&OsString::from(DEAF_FLAG)) {
-        std::thread::sleep(FOREVER);
-        return ExitCode::FAILURE;
+        idle_until_orphaned(&parent_gone);
     }
     if WorkerConfig::from_args(args).is_err() {
         return ExitCode::from(2);
     }
     let stdin = io::stdin().lock();
     let stdout = io::stdout().lock();
-    match serve(stdin, stdout) {
+    match serve(stdin, stdout, &parent_gone) {
         Ok(()) => ExitCode::SUCCESS,
         Err(_) => ExitCode::FAILURE,
     }
 }
 
-/// Linux: il kernel uccide questo processo quando muore il thread che l'ha avviato; se il
-/// padre è già morto prima di questa chiamata, esce subito.
-#[cfg(target_os = "linux")]
-fn die_with_parent() {
-    use rustix::process::{Pid, Signal, getppid, set_parent_process_death_signal};
-    if set_parent_process_death_signal(Some(Signal::KILL)).is_err() {
-        std::process::exit(4);
+/// Dorme finché il padre c'è (per il test, per sempre; al più [`FOREVER`]), poi esce: un
+/// processo che non risponde più, ma non resta orfano.
+fn idle_until_orphaned(parent_gone: &AtomicBool) -> ! {
+    let deadline = Instant::now() + FOREVER;
+    while !parent_gone.load(Ordering::Relaxed) && Instant::now() < deadline {
+        std::thread::sleep(ORPHAN_POLL);
     }
-    if getppid().is_none_or(Pid::is_init) {
-        std::process::exit(4);
-    }
+    std::process::exit(ORPHAN_EXIT);
 }
 
-/// Altrove la vita del figlio la lega il padre (Job Object su Windows).
-#[cfg(not(target_os = "linux"))]
-fn die_with_parent() {}
+/// Gira a vuoto sulla CPU senza leggere stdin finché il padre c'è (al più [`FOREVER`]),
+/// poi esce: come il processo vero, che a ogni evento guarda il segnale di `watch_parent`.
+fn spin_until_orphaned(parent_gone: &AtomicBool) -> ! {
+    let deadline = Instant::now() + FOREVER;
+    let mut counter = 0_u64;
+    while !parent_gone.load(Ordering::Relaxed) && Instant::now() < deadline {
+        counter = std::hint::black_box(counter.wrapping_add(1));
+    }
+    std::process::exit(ORPHAN_EXIT);
+}
 
-fn serve(input: impl io::Read, output: impl Write) -> Result<(), ProtocolError> {
+fn serve(
+    input: impl io::Read,
+    output: impl Write,
+    parent_gone: &AtomicBool,
+) -> Result<(), ProtocolError> {
     let mut reader = FrameReader::new(BufReader::new(input));
     let mut writer = FrameWriter::new(BufWriter::new(output));
     // I file bloccati da `lucchetto.*`: restano aperti fino all'uscita del processo.
@@ -154,7 +176,7 @@ fn serve(input: impl io::Read, output: impl Write) -> Result<(), ProtocolError> 
             "lento" => {
                 writer.write(&event(id, start()))?;
                 writer.flush()?;
-                std::thread::sleep(FOREVER);
+                idle_until_orphaned(parent_gone);
             }
             "muore" => {
                 writer.write(&event(id, start()))?;
@@ -167,8 +189,7 @@ fn serve(input: impl io::Read, output: impl Write) -> Result<(), ProtocolError> 
                 out.write_all(b"ciao, sono un messaggio di log\n")
                     .and_then(|()| out.flush())
                     .map_err(ProtocolError::Io)?;
-                std::thread::sleep(FOREVER);
-                return Ok(());
+                idle_until_orphaned(parent_gone);
             }
             "fuori-sequenza" => {
                 writer.write(&event(id, unit(1, "carta")))?;
@@ -195,7 +216,7 @@ fn serve(input: impl io::Read, output: impl Write) -> Result<(), ProtocolError> 
                 writer.write(&event(id, start()))?;
                 if stem == "lucchetto-occupato" {
                     writer.flush()?;
-                    spin_forever();
+                    spin_until_orphaned(parent_gone);
                 }
                 finish(&mut writer, id)?;
             }
@@ -246,7 +267,7 @@ fn serve(input: impl io::Read, output: impl Write) -> Result<(), ProtocolError> 
                     writer.write(&event(id, unit(line, &format!("riga {line} carta"))))?;
                 }
                 writer.flush()?;
-                std::thread::sleep(FOREVER);
+                idle_until_orphaned(parent_gone);
             }
             "molti" => {
                 for n in 0..MANY_DOCUMENTS {
@@ -274,14 +295,6 @@ fn finish<W: Write>(writer: &mut FrameWriter<W>, id: RequestId) -> Result<(), Pr
     writer.write(&event(id, ExtractEvent::DocumentEnd))?;
     writer.write(&Response::Done { id })?;
     writer.flush()
-}
-
-/// Un ciclo che occupa la CPU e non finisce mai.
-fn spin_forever() -> ! {
-    let mut counter = 0_u64;
-    loop {
-        counter = std::hint::black_box(counter.wrapping_add(1));
-    }
 }
 
 /// I descrittori aperti, in ordine e separati da spazi, senza quello della cartella che si

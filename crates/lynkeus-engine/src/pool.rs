@@ -13,8 +13,8 @@
 //!
 //! Il **thread del pool** (uno per pool, atteso da [`ExtractorPool::shutdown`]) avvia i
 //! processi e raccoglie quelli tolti dal pool: chi chiama non aspetta mai la loro uscita.
-//! Avviarli da un thread che vive quanto il pool serve su Linux, dove il figlio chiede al
-//! kernel di morire con il thread che l'ha creato (`PR_SET_PDEATHSIG`).
+//! Su Linux il figlio sorveglia il processo padre (`lynkeus_extract::worker::watch_parent`),
+//! non il thread che l'ha avviato: la sua vita non dipende da quale thread lo avvia.
 //!
 //! Regole (il padre non si fida del figlio):
 //!

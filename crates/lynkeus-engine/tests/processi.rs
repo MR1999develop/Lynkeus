@@ -179,9 +179,9 @@ fn an_orphaned_worker_exits_when_its_parent_dies() {
 }
 
 /// Come sopra, ma il figlio è occupato (un ciclo sulla CPU) e non legge stdin: non vede la
-/// fine del flusso, quindi lo ferma solo il kernel alla morte del padre (`PR_SET_PDEATHSIG`,
-/// chiesto dal figlio all'avvio). Il pool avvia i processi da un suo thread che vive quanto
-/// il pool, così il segnale non parte alla fine del thread che ha chiesto il file.
+/// fine del flusso, quindi lo ferma solo la sorveglianza del padre
+/// (`lynkeus_extract::worker::watch_parent`, la stessa del processo estrattore vero), che il
+/// ciclo controlla come il processo vero la controlla a ogni evento.
 #[cfg(target_os = "linux")]
 #[test]
 fn busy_orphan_exits_with_its_parent() {

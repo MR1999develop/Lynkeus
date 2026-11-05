@@ -55,7 +55,7 @@ use lynkeus_core::ByteSize;
 use lynkeus_extract::protocol::{FrameReader, PROTOCOL_VERSION, encode_frame};
 use lynkeus_extract::{EventSink, ExtractEvent, ExtractOptions, SequenceCheck, Stopped};
 
-use crate::platform::{self, PrivateFs};
+use crate::platform::PrivateFs;
 
 /// Versione del formato delle voci.
 pub const CACHE_FORMAT_VERSION: u16 = 1;
@@ -273,7 +273,9 @@ static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 impl TextCache {
     /// Una cache nella cartella `dir` (creata al primo salvataggio con `private_fs`, privata),
-    /// con limite `max`. Non tocca il disco finché non serve.
+    /// con limite `max`. Non tocca il disco finché non serve. Su Windows `private_fs` è
+    /// quello dell'app (descrittore esplicito); con [`RefusingFs`](crate::RefusingFs) la
+    /// cache non scrive nulla.
     pub fn at(dir: PathBuf, max: ByteSize, private_fs: Arc<dyn PrivateFs>) -> TextCache {
         TextCache {
             dir,
@@ -283,22 +285,6 @@ impl TextCache {
             failed_writes: AtomicU64::new(0),
             first_failure: OnceLock::new(),
         }
-    }
-
-    /// Come [`TextCache::at`] con le cartelle private di questo crate: fuori da Windows
-    /// `PortablePrivateFs`; su Windows nessuna ([`RefusingFs`](crate::RefusingFs)), quindi
-    /// la cache non scrive finché non riceve quelle dell'app con
-    /// [`TextCache::with_private_fs`]. Per compatibilità: usare [`TextCache::at`].
-    pub fn new(dir: PathBuf, max: ByteSize) -> TextCache {
-        TextCache::at(dir, max, platform::default_private_fs())
-    }
-
-    /// La stessa cache, con cartella e file creati da `private_fs`. Per compatibilità:
-    /// usare [`TextCache::at`].
-    #[must_use]
-    pub fn with_private_fs(mut self, private_fs: Arc<dyn PrivateFs>) -> TextCache {
-        self.private_fs = private_fs;
-        self
     }
 
     /// La cartella della cache.
@@ -899,15 +885,20 @@ mod tests {
         assert_eq!(cache.get(&key(2)), None);
     }
 
-    /// Su Windows la cache creata senza le cartelle private dell'app non scrive nulla:
-    /// nessuna cartella con i permessi ereditati dal padre (default sicuro).
-    #[cfg(windows)]
+    /// Con [`RefusingFs`](crate::RefusingFs) (il default sicuro dove mancano le cartelle
+    /// private dell'app) la cache non scrive nulla: nessuna cartella con i permessi
+    /// ereditati dal padre; la scrittura rifiutata si conta.
     #[test]
-    fn without_the_private_fs_nothing_is_written_on_windows() {
+    fn with_the_refusing_fs_nothing_is_written() {
         let dir = tempfile::tempdir().expect("cartella");
-        let cache = TextCache::new(dir.path().join("cache"), DEFAULT_CACHE_SIZE);
+        let cache = TextCache::at(
+            dir.path().join("cache"),
+            DEFAULT_CACHE_SIZE,
+            Arc::new(crate::RefusingFs),
+        );
         assert!(cache.put(&key(1), &events("carta")).is_err());
         assert!(!dir.path().join("cache").exists());
+        assert_eq!(cache.write_failures().map(|f| f.count), Some(1));
     }
 
     /// Una scrittura fallita (la cartella della cache è un file) si conta, con il primo

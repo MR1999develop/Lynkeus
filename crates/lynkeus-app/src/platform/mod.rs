@@ -12,7 +12,8 @@
 //! - Apertura di un file con il programma predefinito e "Mostra nella cartella"; i tipi di
 //!   file che il sistema considera pericolosi ([`is_dangerous_file_type`]); la zona
 //!   d'origine (Mark-of-the-Web) copiata sulle voci estratte ([`copy_mark_of_the_web`]).
-//! - Ordine dei bottoni nei dialoghi; contrasto elevato attivo ([`high_contrast_active`]).
+//! - Ordine dei bottoni nei dialoghi; colori del tema a contrasto elevato
+//!   ([`high_contrast`]).
 //! - Ricerca delle DLL caricate dopo l'avvio ristretta alla cartella di sistema (Windows;
 //!   per le DLL importate dall'eseguibile vale `/DEPENDENTLOADFLAG` in `.cargo/config.toml`).
 //! - Avvio del processo estrattore: su Windows nel Job Object con `CreateProcessW`
@@ -37,7 +38,7 @@ use egui::{FontData, FontDefinitions, FontFamily};
 use lynkeus_core::ByteSize;
 use lynkeus_engine::{PrivateFs, WorkerLauncher};
 
-use crate::theme::SEMIBOLD;
+use crate::theme::{SEMIBOLD, SystemContrast};
 
 /// Limita la ricerca delle DLL caricate da qui in poi alla cartella di sistema (Windows,
 /// `SetDefaultDllDirectories`): va chiamata come prima istruzione di `main`, prima che una
@@ -87,17 +88,32 @@ pub fn copy_mark_of_the_web(_source: &Path, _target: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Vero se è attivo un tema a contrasto elevato del sistema (Windows,
-/// `SPI_GETHIGHCONTRAST`); falso se non si sa o altrove.
+/// I colori del tema a contrasto elevato del sistema, se è attivo (Windows:
+/// `SPI_GETHIGHCONTRAST` e `GetSysColor`); `None` se non è attivo, se non si sa o altrove.
+/// Una lettura costa qualche microsecondo: si può ripetere quando la finestra torna in primo
+/// piano.
 #[cfg(windows)]
-pub fn high_contrast_active() -> bool {
-    windows_ffi::high_contrast_active()
+pub fn high_contrast() -> Option<SystemContrast> {
+    windows_ffi::high_contrast_colors().map(|colors| SystemContrast {
+        window: from_colorref(colors.window),
+        window_text: from_colorref(colors.window_text),
+        highlight: from_colorref(colors.highlight),
+        highlight_text: from_colorref(colors.highlight_text),
+        button_face: from_colorref(colors.button_face),
+    })
 }
 
-/// Vedi la versione per Windows.
+/// Un `COLORREF` di Windows (`0x00BBGGRR`) come colore opaco.
+#[cfg(windows)]
+fn from_colorref(color: u32) -> egui::Color32 {
+    let [red, green, blue, _] = color.to_le_bytes();
+    egui::Color32::from_rgb(red, green, blue)
+}
+
+/// Vedi la versione per Windows: altrove il tema a contrasto del sistema non si legge.
 #[cfg(not(windows))]
-pub fn high_contrast_active() -> bool {
-    false
+pub fn high_contrast() -> Option<SystemContrast> {
+    None
 }
 
 /// Il lanciatore del processo estrattore `exe` (percorso assoluto) con limite di memoria
@@ -1349,5 +1365,25 @@ mod context_menu_nautilus {
             menu.remove(&entry).expect("tolto");
             assert_eq!(menu.state(&entry).expect("stato"), MenuState::Missing);
         }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    /// Un `COLORREF` ha il rosso nel byte basso (`0x00BBGGRR`); il byte alto non è un
+    /// canale alfa, il colore resta opaco.
+    #[test]
+    fn colorrefs_become_opaque_colors() {
+        assert_eq!(
+            from_colorref(0x0000_00FF),
+            egui::Color32::from_rgb(0xFF, 0, 0)
+        );
+        assert_eq!(
+            from_colorref(0x0012_3456),
+            egui::Color32::from_rgb(0x56, 0x34, 0x12)
+        );
+        assert_eq!(from_colorref(0xFF00_0000), egui::Color32::BLACK);
     }
 }

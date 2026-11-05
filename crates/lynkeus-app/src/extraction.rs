@@ -81,8 +81,11 @@ pub fn document_source(
     let launcher = platform::worker_launcher(setup.worker_exe.clone(), WORKER_MEMORY_LIMIT)?;
     let pool = ExtractorPool::new(launcher, default_pool_size());
     let text_cache = setup.cache_dir.clone().map(|dir| {
-        TextCache::new(dir, ByteSize::from_mib(cache.max_size_mib))
-            .with_private_fs(Arc::clone(private_fs))
+        TextCache::at(
+            dir,
+            ByteSize::from_mib(cache.max_size_mib),
+            Arc::clone(private_fs),
+        )
     });
     let source = DocumentSource::new(pool, text_cache);
     source.set_cache_enabled(cache.enabled);
@@ -542,6 +545,12 @@ mod tests {
     /// codice dell'estrattore vero, senza l'eseguibile dell'app.
     struct ThreadLauncher;
 
+    /// Il limite di memoria del "processo" di [`ThreadLauncher`]: nessun limite effettivo.
+    /// `worker::run` lo vuole sempre, ma qui varrebbe per tutto il processo dei test
+    /// (`RLIMIT_AS` su Linux); `u64::MAX` è `RLIM_INFINITY`, il valore che quel limite ha
+    /// già. Su Windows il limite lo impone il Job Object, qui assente.
+    const THREAD_WORKER_MEMORY: ByteSize = ByteSize::from_bytes(u64::MAX);
+
     /// Il "processo" di [`ThreadLauncher`]: esce quando lo stdin si chiude.
     struct ThreadWorker {
         done: std::sync::mpsc::Receiver<bool>,
@@ -578,7 +587,9 @@ mod tests {
             std::thread::Builder::new()
                 .name("estrattore-di-prova".to_owned())
                 .spawn(move || {
-                    let config = lynkeus_extract::worker::WorkerConfig::default();
+                    let config = lynkeus_extract::worker::WorkerConfig {
+                        memory_limit: Some(THREAD_WORKER_MEMORY),
+                    };
                     let ended = lynkeus_extract::worker::run(child_stdin, child_stdout, &config);
                     let _sent = done_tx.send(ended.is_ok());
                 })?;

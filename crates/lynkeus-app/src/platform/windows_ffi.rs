@@ -25,7 +25,7 @@
 //!   con il solo utente e I/O sovrapposto con tempi limite ([`PipeServer`], [`PipeClient`],
 //!   aperto con SQoS Identification); [`allow_set_foreground`].
 //! - Shell e accessibilità: [`assoc_is_dangerous`] (`AssocIsDangerous`) e
-//!   [`high_contrast_active`] (`SPI_GETHIGHCONTRAST`).
+//!   [`high_contrast_colors`] (`SPI_GETHIGHCONTRAST`, poi `GetSysColor`).
 //!
 //! Ogni blocco `unsafe` ha il suo `// SAFETY:`; gli handle sono posseduti da `OwnedHandle`
 //! (chiusi una volta sola) e i puntatori passati vivono fino al ritorno della chiamata. Le
@@ -52,6 +52,10 @@ use windows_sys::Win32::Foundation::{
     ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, ERROR_PIPE_NOT_CONNECTED, GENERIC_ALL, GENERIC_WRITE,
     HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, LocalFree, SetHandleInformation,
     WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+};
+use windows_sys::Win32::Graphics::Gdi::{
+    COLOR_BTNFACE, COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT, COLOR_WINDOW, COLOR_WINDOWTEXT,
+    GetSysColor, SYS_COLOR_INDEX,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
@@ -151,9 +155,46 @@ pub fn assoc_is_dangerous(extension: &str) -> bool {
     unsafe { AssocIsDangerous(dotted.as_ptr()) != 0 }
 }
 
+/// I colori di sistema di un tema a contrasto elevato, come `COLORREF` (`0x00BBGGRR`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HighContrastColors {
+    /// `COLOR_WINDOW`: fondo delle finestre.
+    pub window: u32,
+    /// `COLOR_WINDOWTEXT`: testo delle finestre.
+    pub window_text: u32,
+    /// `COLOR_HIGHLIGHT`: fondo degli elementi selezionati.
+    pub highlight: u32,
+    /// `COLOR_HIGHLIGHTTEXT`: testo degli elementi selezionati.
+    pub highlight_text: u32,
+    /// `COLOR_BTNFACE`: fondo dei bottoni.
+    pub button_face: u32,
+}
+
+/// I colori del tema a contrasto elevato, se è attivo (`SPI_GETHIGHCONTRAST`, poi
+/// `GetSysColor`); `None` se non è attivo o se la domanda non riesce.
+pub fn high_contrast_colors() -> Option<HighContrastColors> {
+    if !high_contrast_active() {
+        return None;
+    }
+    Some(HighContrastColors {
+        window: system_color(COLOR_WINDOW),
+        window_text: system_color(COLOR_WINDOWTEXT),
+        highlight: system_color(COLOR_HIGHLIGHT),
+        highlight_text: system_color(COLOR_HIGHLIGHTTEXT),
+        button_face: system_color(COLOR_BTNFACE),
+    })
+}
+
+/// Il colore di sistema `index` (`GetSysColor`), come `COLORREF`.
+fn system_color(index: SYS_COLOR_INDEX) -> u32 {
+    // SAFETY: nessun puntatore; per un indice valido (le costanti `COLOR_*` di Windows) la
+    // funzione restituisce il colore, per uno non valido zero.
+    unsafe { GetSysColor(index) }
+}
+
 /// Vero se è attivo un tema a contrasto elevato (`SPI_GETHIGHCONTRAST`, flag
 /// `HCF_HIGHCONTRASTON`); falso se la domanda non riesce.
-pub fn high_contrast_active() -> bool {
+fn high_contrast_active() -> bool {
     // SAFETY: struttura C di interi e un puntatore, lo zero è un valore valido.
     let mut info: HIGHCONTRASTW = unsafe { std::mem::zeroed() };
     info.cbSize = struct_len::<HIGHCONTRASTW>();
@@ -1882,10 +1923,13 @@ mod tests {
     }
 
     /// La domanda sul contrasto elevato risponde senza errori (il valore dipende dal
-    /// sistema): due domande di fila danno la stessa risposta.
+    /// sistema): i colori ci sono se e solo se il tema è attivo, e due domande di fila danno
+    /// la stessa risposta.
     #[test]
     fn the_high_contrast_query_answers() {
-        assert_eq!(high_contrast_active(), high_contrast_active());
+        let colors = high_contrast_colors();
+        assert_eq!(colors.is_some(), high_contrast_active());
+        assert_eq!(colors, high_contrast_colors());
     }
 
     #[test]

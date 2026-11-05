@@ -13,11 +13,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use common::{documents, documents_with, file_name, fixtures, launcher, request, run, run_with};
+use common::{
+    TIMEOUT, documents, documents_with, drain, file_name, fixtures, launcher, request, run,
+    run_with, start_with,
+};
 use lynkeus_core::{Combine, Location};
 use lynkeus_engine::{
-    DocPath, EntryEnd, ExtractEnd, LaunchedWorker, LimitKind, Limits, Origin, Outcome, WarningKind,
-    WorkerLauncher,
+    DocPath, EntryEnd, ExtractEnd, LaunchedWorker, LimitKind, Limits, Origin, Outcome, Received,
+    SearchEvent, WarningKind, WorkerLauncher,
 };
 use lynkeus_extract::{ExtractEvent, ExtractOptions};
 
@@ -285,6 +288,55 @@ fn misbehaving_workers_are_replaced_and_reported() {
         source.pool().launches()
     );
     // I processi che non leggono stdin si chiudono prima della fine del test.
+    source.pool().shutdown();
+}
+
+/// C-06: il totale dei file è noto appena finisce la scansione delle cartelle, mentre un
+/// documento è ancora nel processo estrattore (`finestra.pdf` manda cinque righe e poi non
+/// risponde più): da lì l'interfaccia mostra una frazione invece della barra indeterminata.
+#[test]
+fn the_total_is_known_while_a_document_is_still_read() {
+    /// Attesa massima di un segnale prima di riguardare l'avanzamento.
+    const POLL: Duration = Duration::from_millis(20);
+    let dir = tempfile::tempdir().expect("cartella temporanea");
+    std::fs::write(
+        dir.path().join("finestra.pdf"),
+        b"%PDF-1.4
+",
+    )
+    .expect("file");
+    std::fs::write(dir.path().join("uno.txt"), b"carta").expect("file");
+    std::fs::write(dir.path().join("due.txt"), b"carta").expect("file");
+    let source = documents_with(launcher(), 1, None);
+    let mut req = request(vec![dir.path().to_owned()], &["carta"], Combine::Any);
+    req.limits = Limits {
+        extract_timeout: TIMEOUT,
+        ..Limits::default()
+    };
+    let (mut handle, wake) = start_with(req, Some(Arc::clone(&source)));
+    let deadline = Instant::now() + TIMEOUT;
+    while handle.progress().snapshot().files_total.is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "totale mai noto entro {TIMEOUT:?}"
+        );
+        match handle.try_recv() {
+            Received::Event(SearchEvent::Finished(summary)) => {
+                panic!("ricerca finita prima del totale: {summary:?}")
+            }
+            Received::Event(_) => {}
+            Received::Empty => {
+                // Il totale non manda segnali: si riguarda dopo un'attesa breve.
+                if wake.recv_timeout(POLL).is_err() {}
+            }
+            Received::Ended | Received::WorkerLost => panic!("worker finito senza riepilogo"),
+        }
+    }
+    assert_eq!(handle.progress().snapshot().files_total, Some(3));
+    handle.cancel();
+    let found = drain(&mut handle, &wake);
+    assert_eq!(found.summary.outcome, Outcome::Cancelled);
+    assert_eq!(found.summary.counts.files_total, Some(3));
     source.pool().shutdown();
 }
 

@@ -70,7 +70,8 @@ pub(crate) enum Action {
     ClearCache,
     ResetFilters,
     UndoFiltersReset,
-    DismissNotice,
+    /// Chiude il messaggio in quella posizione di [`Application::notices`].
+    DismissNotice(usize),
     Reveal(Arc<DocPath>),
     /// Chiude il dialogo delle impostazioni di esportazione; con `true` le applica ed
     /// esporta.
@@ -118,6 +119,7 @@ impl eframe::App for Application {
     }
 
     fn ui(&mut self, ui: &mut Ui, frame: &mut eframe::Frame) {
+        follow_system_contrast(self, ui.ctx());
         if let Some(text) = self.take_clipboard_text() {
             ui.ctx().copy_text(text);
         }
@@ -131,7 +133,7 @@ impl eframe::App for Application {
         if self.limit_reached() {
             egui::Panel::top("limit_banner").show(ui, |ui| limit_banner(self, ui));
         }
-        if self.notice().is_some() {
+        if !self.notices().is_empty() {
             egui::Panel::top("notice").show(ui, |ui| notice::bar(self, ui, &mut actions));
         }
         egui::Panel::bottom("status").show(ui, |ui| status::bar(self, ui));
@@ -165,13 +167,34 @@ impl eframe::App for Application {
         if let Err(error) = self.save_settings() {
             tracing::warn!(%error, "impostazioni non salvate");
         }
-        self.cancel_search();
+        // Nessun thread di ricerca usa più i processi estrattori mentre si chiudono.
+        self.cancel_search_and_wait();
         self.shutdown_extraction();
         self.shutdown_instance();
     }
 
     fn persist_egui_memory(&self) -> bool {
         false
+    }
+}
+
+/// Quando la finestra torna in primo piano (evento `WindowFocused(true)`) rilegge il tema
+/// a contrasto elevato del sistema (l'utente può averlo acceso, spento o cambiato nel
+/// frattempo) e, se è cambiato, applica i nuovi colori. Negli altri frame non legge nulla.
+fn follow_system_contrast(app: &mut Application, ctx: &egui::Context) {
+    let regained = ctx.input(|input| {
+        input
+            .events
+            .iter()
+            .any(|event| matches!(event, egui::Event::WindowFocused(true)))
+    });
+    if !regained {
+        return;
+    }
+    let contrast = crate::platform::high_contrast();
+    if contrast != app.system_contrast() {
+        app.set_system_contrast(contrast);
+        theme::apply(ctx, app.theme(), contrast);
     }
 }
 
@@ -395,11 +418,8 @@ fn apply(app: &mut Application, ctx: &egui::Context, frame: &eframe::Frame, acti
         Action::SetLogLevel(level) => app.set_log_level(level),
         Action::ResetFilters => app.reset_filters(),
         Action::UndoFiltersReset => app.undo_filters_reset(),
-        Action::DismissNotice => app.dismiss_notice(),
-        Action::Reveal(doc) => {
-            app.dismiss_notice();
-            app.reveal(&doc, &repaint(ctx));
-        }
+        Action::DismissNotice(index) => app.dismiss_notice(index),
+        Action::Reveal(doc) => app.reveal(&doc, &repaint(ctx)),
         Action::CloseExportDialog(confirmed) => {
             let draft = app.view_state.export_dialog.take();
             if let (true, Some(settings)) = (confirmed, draft) {

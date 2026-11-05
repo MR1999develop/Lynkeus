@@ -65,7 +65,7 @@ I documenti (PDF, Office, archivi) sono letti da processi separati con memoria e
 
 ## Clic destro (facoltativo)
 
-Dal menu Strumenti si può accendere "Cerca con Lynkeus" nel clic destro su file e cartelle (spento per impostazione predefinita). La voce apre il programma con l'elemento scelto tra i luoghi in cui cercare; con più elementi selezionati si usa un'unica finestra. Su Windows 11 compare in "Mostra altre opzioni". Non servono diritti di amministratore. Il programma non crea la voce se il programma o la sua cartella appartengono a un altro utente o sono modificabili da altri utenti o se esiste già una voce con lo stesso nome di un altro programma, e lo dice con un messaggio.
+Dal menu Strumenti si può accendere "Cerca con Lynkeus" nel clic destro su file e cartelle (spento per impostazione predefinita). La voce apre il programma con l'elemento scelto tra i luoghi in cui cercare; con più elementi selezionati si usa un'unica finestra. Su Windows 11 compare in "Mostra altre opzioni". Non servono diritti di amministratore. Il programma non crea la voce se il programma o la sua cartella appartengono a un altro utente o sono modificabili da altri utenti o se esiste già una voce con lo stesso nome di un altro programma, e lo dice con un messaggio; se succede dopo, la voce già creata si toglie all'avvio e l'opzione si spegne.
 
 La voce si toglie spegnendo l'opzione. Se hai cancellato il programma senza spegnerla, togli a mano le voci rimaste:
 

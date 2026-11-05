@@ -254,6 +254,12 @@ status-worker-lost = La ricerca si è interrotta per un errore interno. Riprova;
 status-current-file = In lettura: { $file }
 # $done (numero): file già esaminati; $seen (numero): file trovati finora (il totale non è noto).
 status-progress = { $done } di { $seen } file trovati finora
+# $done (numero): file già esaminati; $total (numero): file da esaminare in tutto (la scansione delle cartelle è finita).
+status-progress-total = { $done } di { $total } file
+# $done e $total come in status-progress-total; $seconds (numero): secondi che restano, stimati.
+status-progress-seconds-left = { $done } di { $total } file, ancora circa { $seconds } s
+# $done e $total come in status-progress-total; $minutes (numero): minuti che restano, stimati.
+status-progress-minutes-left = { $done } di { $total } file, ancora circa { $minutes } min
 # $count (numero): righe selezionate.
 status-selected = { $count ->
         [one] 1 riga selezionata
@@ -349,6 +355,7 @@ reason-cache-clearing = La cache si sta svuotando.
 # $mib (numero): megabyte liberati.
 notice-cache-cleared = Cache svuotata: { $mib } MB liberati.
 notice-cache-clear-failed = Errore: la cache non si è svuotata del tutto. Chiudi le altre finestre di Lynkeus Searcher e riprova.
+notice-cache-not-written = Attenzione: la cache dei documenti non si riesce a scrivere. Le ricerche funzionano, ma rileggono ogni volta PDF, documenti e archivi. Controlla lo spazio libero e i permessi della cartella dell'app, oppure spegni la cache in Strumenti › Cache dei documenti.
 
 ## Voci d'archivio che non si aprono
 
@@ -371,7 +378,7 @@ reason-no-context-menu = La voce del clic destro non è disponibile su questo si
 reason-context-menu-updating = La voce del clic destro si sta aggiornando.
 notice-context-menu-exe-path = Errore: la voce del clic destro non è stata aggiunta perché il percorso del programma contiene caratteri non ammessi. Sposta Lynkeus Searcher in una cartella con un nome semplice e riprova.
 notice-context-menu-too-long = Errore: la voce del clic destro non è stata aggiunta perché il percorso del programma è troppo lungo. Sposta Lynkeus Searcher in una cartella più vicina alla radice del disco e riprova.
-notice-context-menu-exe-dir = Errore: la voce del clic destro non è stata aggiunta perché altri utenti possono modificare il programma o la sua cartella. Sposta Lynkeus Searcher nella tua cartella utente o in Programmi e riprova.
+notice-context-menu-exe-dir-off = Errore: la voce del clic destro è stata tolta (o non aggiunta) e l'opzione è spenta, perché altri utenti possono modificare il programma o la sua cartella. Sposta Lynkeus Searcher nella tua cartella utente o in Programmi e riaccendi l'opzione.
 notice-context-menu-foreign = Errore: nel clic destro c'è già una voce con lo stesso nome di un altro programma; non è stata modificata.
 notice-context-menu-io = Errore: la voce del clic destro non è stata aggiornata. Riprova; se succede ancora, controlla i permessi del tuo profilo.
 # $max (numero): numero massimo di luoghi nell'elenco.

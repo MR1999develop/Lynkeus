@@ -254,6 +254,12 @@ status-worker-lost = The search stopped because of an internal error. Try again;
 status-current-file = Reading: { $file }
 # $done (number): files already examined; $seen (number): files found so far (the total is not known).
 status-progress = { $done } of { $seen } files found so far
+# $done (number): files already examined; $total (number): files to examine in all (the folder scan has finished).
+status-progress-total = { $done } of { $total } files
+# $done and $total as in status-progress-total; $seconds (number): estimated seconds left.
+status-progress-seconds-left = { $done } of { $total } files, about { $seconds } s left
+# $done and $total as in status-progress-total; $minutes (number): estimated minutes left.
+status-progress-minutes-left = { $done } of { $total } files, about { $minutes } min left
 # $count (number): selected rows.
 status-selected = { $count ->
         [one] 1 row selected
@@ -349,6 +355,7 @@ reason-cache-clearing = The cache is being cleared.
 # $mib (number): megabytes freed.
 notice-cache-cleared = Cache cleared: { $mib } MB freed.
 notice-cache-clear-failed = Error: the cache was not fully cleared. Close the other Lynkeus Searcher windows and try again.
+notice-cache-not-written = Warning: the document cache cannot be written. Searches still work, but they read PDFs, documents and archives again every time. Check the free space and the permissions of the app folder, or turn the cache off in Tools › Document cache.
 
 ## Archive entries that do not open
 
@@ -371,7 +378,7 @@ reason-no-context-menu = The right-click item is not available on this system.
 reason-context-menu-updating = The right-click item is being updated.
 notice-context-menu-exe-path = Error: the right-click item was not added because the program path contains characters that are not allowed. Move Lynkeus Searcher to a folder with a simple name and try again.
 notice-context-menu-too-long = Error: the right-click item was not added because the program path is too long. Move Lynkeus Searcher to a folder closer to the root of the drive and try again.
-notice-context-menu-exe-dir = Error: the right-click item was not added because other users can change the program or its folder. Move Lynkeus Searcher to your user folder or to Program Files and try again.
+notice-context-menu-exe-dir-off = Error: the right-click item was removed (or not added) and the option is off, because other users can change the program or its folder. Move Lynkeus Searcher to your user folder or to Program Files and turn the option on again.
 notice-context-menu-foreign = Error: the right-click menu already has an item with the same name from another program; it was not changed.
 notice-context-menu-io = Error: the right-click item was not updated. Try again; if it happens again, check the permissions of your profile.
 # $max (number): maximum number of search locations in the list.

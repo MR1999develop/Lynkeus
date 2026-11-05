@@ -150,6 +150,7 @@ fn run(
             count = dirs.refused.len(),
             "cartelle non private: funzioni spente"
         );
+        // Resta visibile insieme a un eventuale avviso sulle impostazioni (messaggi duraturi).
         app.set_notice(Notice::PrivateDirsRefused {
             count: dirs.refused.len(),
         });
@@ -167,6 +168,8 @@ fn run(
         tracing::warn!(%error, "documenti non disponibili");
     }
     connect_context_menu(&mut app);
+    // Il tema a contrasto elevato del sistema, se attivo: i suoi colori al posto dei token.
+    app.set_system_contrast(platform::high_contrast());
 
     let title = app.i18n().tr("app-title");
     let mut viewport = egui::ViewportBuilder::default()
