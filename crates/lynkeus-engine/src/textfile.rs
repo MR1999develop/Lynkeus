@@ -3,10 +3,9 @@
 
 //! Ricerca in un file di testo, blocco per blocco.
 //!
-//! I blocchi di [`TextReader`] (circa 8 MB, tagliati a fine riga) si dividono in passi di
-//! al massimo [`STEP_MAX_LINES`] righe e [`STEP_MAX_BYTES`] byte: a ogni passo si controlla
-//! l'annullamento e si cercano le parole con [`find_words`]. I numeri di riga si
-//! ricostruiscono contando gli a capo con `memchr`.
+//! I blocchi di [`TextReader`] (circa 8 MB, tagliati a fine riga) si dividono in passi
+//! ([`steps`]): a ogni passo si controlla l'annullamento e si cercano le parole con
+//! [`find_words`]. I numeri di riga si ricostruiscono contando gli a capo.
 //!
 //! OR, AND, lotti e limite li decide [`HitBatcher`]: se dice che il file va riletto
 //! ([`Verdict::Reread`]), chi chiama lo riapre e cerca di nuovo con un batcher già sicuro.
@@ -14,17 +13,11 @@
 use std::io::Read;
 
 use lynkeus_core::{Location, find_words};
-use lynkeus_extract::text::soft_cut;
 use lynkeus_extract::{ExtractError, TextReader};
 
 use crate::batch::{HitBatcher, HitLabel, HitSink, Verdict};
 use crate::halt::Stop;
-
-/// Righe massime di un passo, tra due controlli dell'annullamento.
-pub(crate) const STEP_MAX_LINES: usize = 10_000;
-
-/// Byte massimi di un passo: limita anche la memoria dei risultati di [`find_words`].
-pub(crate) const STEP_MAX_BYTES: usize = 1024 * 1024;
+use crate::step::steps;
 
 /// Perché la ricerca in un file si è interrotta.
 #[derive(Debug)]
@@ -59,18 +52,15 @@ pub(crate) fn search_text<R: Read>(
     sink: &mut impl HitSink,
 ) -> Result<TextEnd, FileError> {
     while let Some(chunk) = reader.next_chunk().map_err(FileError::Read)? {
-        let mut offset = 0;
-        let mut line = chunk.first_line;
-        while offset < chunk.text.len() {
+        for step in steps(chunk.text) {
             sink.check()?;
-            let rest = &chunk.text[offset..];
-            let step = &rest[..step_len(rest)];
+            let line = chunk.first_line.saturating_add(step.lines_before);
             let room = sink.remaining();
-            for found in find_words(label.query, step) {
+            for found in find_words(label.query, step.text) {
                 let make = || {
                     let number = line.saturating_add(u64::from(found.line)).saturating_add(1);
                     let location = Location::Line(u32::try_from(number).unwrap_or(u32::MAX));
-                    label.hit(step, &found, location)
+                    label.hit(step.text, &found, location)
                 };
                 if let Some(batch) = batcher.push(found.terms, room, make) {
                     sink.deliver(batch)?;
@@ -79,8 +69,6 @@ pub(crate) fn search_text<R: Read>(
             if batcher.is_settled() {
                 return Ok(TextEnd::Reread);
             }
-            line = line.saturating_add(count_newlines(step));
-            offset += step.len();
         }
     }
     match batcher.finish() {
@@ -92,29 +80,6 @@ pub(crate) fn search_text<R: Read>(
         }
         Verdict::Reread => Ok(TextEnd::Reread),
     }
-}
-
-/// Lunghezza del prossimo passo di `rest`: fino alla fine della riga numero
-/// [`STEP_MAX_LINES`], entro [`STEP_MAX_BYTES`]; una riga più lunga si taglia dopo uno
-/// spazio. Sempre almeno un carattere se `rest` non è vuoto.
-pub(crate) fn step_len(rest: &str) -> usize {
-    let bytes = rest.as_bytes();
-    let window = &bytes[..bytes.len().min(STEP_MAX_BYTES)];
-    if let Some(newline) = memchr::memchr_iter(b'\n', window).nth(STEP_MAX_LINES - 1) {
-        return newline + 1;
-    }
-    if window.len() == bytes.len() {
-        return bytes.len();
-    }
-    match memchr::memrchr(b'\n', window) {
-        Some(newline) => newline + 1,
-        None => soft_cut(rest, STEP_MAX_BYTES),
-    }
-}
-
-fn count_newlines(text: &str) -> u64 {
-    let count = memchr::memchr_iter(b'\n', text.as_bytes()).count();
-    u64::try_from(count).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]
@@ -346,18 +311,6 @@ zetabc
         assert_eq!(end, TextEnd::Searched);
         let delivered: usize = sink.batches.iter().map(Vec::len).sum();
         assert_eq!(delivered, 3 * BATCH_HITS + 51);
-    }
-
-    #[test]
-    fn step_len_partitions() {
-        assert_eq!(step_len(""), 0);
-        assert_eq!(step_len("abc"), 3);
-        let lines = "x\n".repeat(STEP_MAX_LINES + 5);
-        assert_eq!(step_len(&lines), STEP_MAX_LINES * 2);
-        let long = format!("{} fine\naltro", "a".repeat(STEP_MAX_BYTES));
-        assert_eq!(step_len(&long), STEP_MAX_BYTES);
-        let spaced = format!("{} {}", "a".repeat(10), "b".repeat(STEP_MAX_BYTES));
-        assert_eq!(step_len(&spaced), 11);
     }
 
     proptest! {

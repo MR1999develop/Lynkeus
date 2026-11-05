@@ -36,6 +36,7 @@ mod pool;
 mod progress;
 mod request;
 mod roots;
+mod step;
 mod textfile;
 mod worker;
 
