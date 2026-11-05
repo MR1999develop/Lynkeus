@@ -468,6 +468,35 @@ fn sevenz_huge_dictionary_is_not_allocated_up_front() {
     assert_eq!(locations_of(&events, "aragosta"), [Location::Line(1)]);
 }
 
+/// A-P4: un nome lungo GNU e un'estensione PAX di 128 KiB, che la libreria tar terrebbe per
+/// intero in memoria, superano il tetto di 64 KiB: avviso di limite (memoria) per la loro
+/// voce, che non si legge. Le voci seguenti si leggono, anche quelle con un nome lungo GNU
+/// o un percorso PAX entro il tetto, con il loro nome.
+#[test]
+fn oversized_tar_names_are_a_limit_and_later_entries_are_read() {
+    let events = extract("malevoli/nomi-lunghi.tar.gz");
+    let found = warnings(&events);
+    let kinds: Vec<WarningKind> = found.iter().map(|(_, kind)| *kind).collect();
+    let memory = WarningKind::LimitExceeded(LimitKind::Memory);
+    assert_eq!(kinds, [memory, memory], "{found:?}");
+    let first = found[0].0.concat();
+    assert!(
+        first.starts_with("g/n") && first.len() <= 100,
+        "il nome breve dell'intestazione: {first}"
+    );
+    assert_eq!(found[1].0, names(&["pax-enorme.txt"]));
+    let long = format!("lungo/{}.txt", "l".repeat(300));
+    let pax = format!("pax/{}.txt", "p".repeat(300));
+    assert_eq!(
+        located(&events, "aragosta"),
+        [
+            (vec![long], Location::Line(1)),
+            (vec![pax], Location::Line(1)),
+            (names(&["dopo.txt"]), Location::Line(1)),
+        ]
+    );
+}
+
 /// La stessa diapositiva elencata 10.000 volte nella presentazione si legge una volta sola.
 #[test]
 fn pptx_repeated_slide_ids_read_once() {

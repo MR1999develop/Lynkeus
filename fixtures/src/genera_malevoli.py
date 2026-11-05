@@ -16,11 +16,18 @@ byte per byte deterministico): solo la libreria standard di Python.
   dizionario dichiarato portato a 2 GiB: un decodificatore che lo allocasse subito
   supererebbe il limite di memoria dell'estrattore. Richiede 7-Zip
   (C:\\Program Files\\7-Zip\\7z.exe); senza, il file non si rigenera.
+- nomi-lunghi.tar.gz: un tar con un nome lungo GNU (`L`) di 128 KiB e un'estensione PAX
+  (`x`) di 128 KiB, ognuno davanti a una voce con `aragosta`, poi un nome lungo GNU e un
+  percorso PAX di 300 caratteri (entro il tetto) e `dopo.txt`: le due intestazioni enormi
+  superano il tetto di 64 KiB del lettore (avviso per la loro voce), le voci seguenti si
+  leggono.
 """
 
+import gzip
 import io
 import struct
 import subprocess
+import tarfile
 import tempfile
 import zipfile
 import zlib
@@ -199,7 +206,42 @@ def repeated_text_ods():
     return buf.getvalue()
 
 
+def tar_member(name, data, fmt, pax_headers=None):
+    """Un membro tar (intestazioni, dati e riempimento a 512 byte) nel formato `fmt`, con
+    data, proprietario e permessi fissi."""
+    info = tarfile.TarInfo(name)
+    info.size = len(data)
+    info.mtime = 0
+    info.mode = 0o644
+    info.uname = info.gname = ""
+    if pax_headers:
+        info.pax_headers = pax_headers
+    header = info.tobuf(fmt, "utf-8", "surrogateescape")
+    padding = b"\0" * (-len(data) % tarfile.BLOCKSIZE)
+    return header + data + padding
+
+
+def long_names_tar_gz():
+    """nomi-lunghi.tar.gz: i membri nell'ordine della descrizione in testa, compressi con
+    gzip (mtime 0, nessun nome interno)."""
+    huge = 128 * 1024
+    members = [
+        tar_member("g/" + "n" * huge + ".txt", b"aragosta nel nome enorme\n", tarfile.GNU_FORMAT),
+        tar_member("pax-enorme.txt", b"aragosta nella voce pax enorme\n", tarfile.PAX_FORMAT,
+                   {"comment": "c" * huge}),
+        tar_member("lungo/" + "l" * 300 + ".txt", b"aragosta nel nome lungo\n", tarfile.GNU_FORMAT),
+        tar_member("pax/" + "p" * 300 + ".txt", b"aragosta nel percorso pax\n", tarfile.PAX_FORMAT),
+        tar_member("dopo.txt", b"aragosta dopo\n", tarfile.GNU_FORMAT),
+    ]
+    tar = b"".join(members) + b"\0" * (2 * tarfile.BLOCKSIZE)
+    buf = io.BytesIO()
+    with gzip.GzipFile(filename="", mode="wb", fileobj=buf, mtime=0) as gz:
+        gz.write(tar)
+    return buf.getvalue()
+
+
 def main():
+    write("nomi-lunghi.tar.gz", long_names_tar_gz())
     write("testo-ripetuto.ods", repeated_text_ods())
     xlsx = sparse_xlsx()
     write("sparso.xlsx", xlsx)

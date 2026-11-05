@@ -8,7 +8,8 @@
 //!   controllata prima di leggerla e i byte contati sul flusso ([`LimitedReader`]). Solo i
 //!   file regolari sono documenti: cartelle e intestazioni PAX globali si ignorano,
 //!   collegamenti, dispositivi e file sparsi sono "saltati". I nomi (anche quelli lunghi
-//!   PAX e GNU) sono solo etichette.
+//!   PAX e GNU) sono solo etichette; un nome lungo o un'estensione PAX oltre
+//!   [`MAX_TAR_EXTENSION_BYTES`] non si tiene in memoria: la sua voce ha un avviso.
 //! - **gzip** (anche con più membri concatenati): il contenuto è un documento interno con
 //!   il nome del file senza `.gz` (`appunti.txt.gz` → `appunti.txt`), un livello più in
 //!   profondità; il suo formato viene dal nome. Il rapporto di compressione si controlla sui
@@ -18,6 +19,7 @@
 //!   limita al massimo per archivio e al rapporto di compressione; i byte li contano le
 //!   voci.
 
+use std::cell::RefCell;
 use std::io::{self, BufReader, Read};
 
 use flate2::read::MultiGzDecoder;
@@ -28,9 +30,15 @@ use crate::extract::archive::{UniqueLabels, check_depth, entry_label, read_entry
 use crate::extract::budget::{LimitedReader, check_declared, classify_io};
 use crate::extract::{Ctx, Fail, Input};
 use crate::format::{Format, SNIFF_BYTES, Signature};
+use crate::limits::LimitKind;
 
 /// Nome del contenuto di un `.gz` che non si ricava dal nome del file.
 const UNNAMED_CONTENT: &str = "contenuto";
+
+/// Byte massimi letti dei dati di un nome lungo GNU (`L`) o di un'estensione PAX locale
+/// (`x`): oltre, la voce che descrivono ha un avviso di limite (memoria) e non si legge; le
+/// voci seguenti sì. I nomi veri sono di qualche centinaio di byte.
+const MAX_TAR_EXTENSION_BYTES: usize = 64 * 1024;
 
 /// Estrae ogni voce di un archivio tar come documento a sé.
 pub(crate) fn extract_tar(ctx: &mut Ctx<'_>, input: Input<'_>) -> Result<(), Fail> {
@@ -90,24 +98,67 @@ fn content_name(name: &str) -> String {
 }
 
 /// Le voci di un tar letto da `reader`.
+///
+/// La libreria tar si usa in lettura grezza: da sola terrebbe in memoria per intero i nomi
+/// lunghi GNU e le estensioni PAX, qualunque sia la loro dimensione, e le voci di un file
+/// sparso esteso. Qui i nomi lunghi (`L`) e le estensioni PAX locali (`x`) si leggono fino a
+/// [`MAX_TAR_EXTENSION_BYTES`] ([`Extensions`]); i nomi lunghi dei collegamenti (`K`) e le
+/// estensioni globali (`g`) non servono e si saltano; le intestazioni sparse estese le salta
+/// [`skip_sparse_extensions`]. Un tar con una dimensione PAX diversa da quella
+/// dell'intestazione non si segue oltre (avviso "danneggiato"): succede con voci oltre
+/// 8 GiB, già oltre i limiti, o con archivi fatti per confondere i lettori.
 fn read_tar(ctx: &mut Ctx<'_>, reader: impl Read) -> Result<(), Fail> {
-    let mut archive = tar::Archive::new(reader);
-    let entries = archive.entries().map_err(tar_error)?;
+    let stream = SharedStream(RefCell::new(reader));
+    let mut archive = tar::Archive::new(&stream);
+    let entries = archive.entries().map_err(tar_error)?.raw(true);
     let mut labels = UniqueLabels::default();
+    let mut pending = Extensions::default();
     for entry in entries {
         let mut entry = entry.map_err(tar_error)?;
-        let kind = entry.header().entry_type();
+        let header = entry.header();
+        let kind = header.entry_type();
+        let recognized = header.as_gnu().is_some() || header.as_ustar().is_some();
+        let sparse_extended =
+            kind.is_gnu_sparse() && header.as_gnu().is_some_and(tar::GnuHeader::is_extended);
+        if recognized && kind.is_gnu_longname() {
+            pending.long_name = read_extension(&mut entry, &mut pending.oversized)?;
+            continue;
+        }
+        if recognized && kind.is_pax_local_extensions() {
+            pending.pax = read_extension(&mut entry, &mut pending.oversized)?;
+            continue;
+        }
+        if recognized && kind.is_gnu_longlink() {
+            continue;
+        }
+        // Le estensioni lette descrivono questa voce, qualunque sia.
+        let extensions = std::mem::take(&mut pending);
+        if sparse_extended {
+            skip_sparse_extensions(&stream)?;
+        }
         if kind.is_dir() || kind.is_pax_global_extensions() {
             continue;
+        }
+        let size = entry.size();
+        if extensions
+            .pax_size()
+            .is_some_and(|pax_size| pax_size != size)
+        {
+            return Err(ExtractError::Corrupt {
+                reason: "tar con dimensione PAX diversa dall'intestazione".to_owned(),
+            }
+            .into());
         }
         ctx.budget()
             .add_entries(1)
             .map_err(ExtractError::LimitExceeded)?;
-        let label = labels.unique(entry_label(&String::from_utf8_lossy(&entry.path_bytes())));
+        let name = extensions.path_bytes(entry.header());
+        let label = labels.unique(entry_label(&String::from_utf8_lossy(&name)));
         let regular = kind.is_file() || kind.is_contiguous();
-        let size = entry.size();
         ctx.within(label, |ctx| {
-            if regular {
+            if extensions.oversized {
+                ctx.warn(WarningKind::LimitExceeded(LimitKind::Memory))
+            } else if regular {
                 read_tar_entry(ctx, &mut entry, size)
             } else {
                 ctx.skip(SkipReason::SpecialEntry)
@@ -118,6 +169,93 @@ fn read_tar(ctx: &mut Ctx<'_>, reader: impl Read) -> Result<(), Fail> {
         }
     }
     Ok(())
+}
+
+/// Le intestazioni di estensione lette prima di una voce, che la descrivono.
+#[derive(Debug, Default)]
+struct Extensions {
+    /// Il nome lungo GNU (`L`), se c'era ed entro il tetto.
+    long_name: Option<Vec<u8>>,
+    /// I record PAX locali (`x`), se c'erano ed entro il tetto.
+    pax: Option<Vec<u8>>,
+    /// Vero se un'estensione superava [`MAX_TAR_EXTENSION_BYTES`]: la voce ha un avviso.
+    oversized: bool,
+}
+
+impl Extensions {
+    /// Il nome della voce come lo dà la libreria tar: il nome lungo GNU (senza lo zero
+    /// finale), poi il `path` PAX, poi il nome dell'intestazione.
+    fn path_bytes(&self, header: &tar::Header) -> Vec<u8> {
+        if let Some(name) = &self.long_name {
+            return name.strip_suffix(&[0]).unwrap_or(name).to_vec();
+        }
+        let pax_path = self.pax.as_deref().and_then(|records| {
+            tar::PaxExtensions::new(records)
+                .filter_map(Result::ok)
+                .find(|record| record.key_bytes() == b"path")
+                .map(|record| record.value_bytes().to_vec())
+        });
+        pax_path.unwrap_or_else(|| header.path_bytes().into_owned())
+    }
+
+    /// La dimensione PAX (`size`), letta come la libreria tar: ci si ferma al primo record
+    /// non valido.
+    fn pax_size(&self) -> Option<u64> {
+        for record in tar::PaxExtensions::new(self.pax.as_deref()?) {
+            let record = record.ok()?;
+            if record.key_bytes() == b"size" {
+                return record.value().ok()?.parse().ok();
+            }
+        }
+        None
+    }
+}
+
+/// I dati di un'intestazione di estensione, se non superano [`MAX_TAR_EXTENSION_BYTES`];
+/// altrimenti `None` e `oversized` diventa vero (il resto lo salta la libreria).
+fn read_extension(entry: &mut impl Read, oversized: &mut bool) -> Result<Option<Vec<u8>>, Fail> {
+    let limit = u64::try_from(MAX_TAR_EXTENSION_BYTES)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    let mut bytes = Vec::new();
+    entry
+        .take(limit)
+        .read_to_end(&mut bytes)
+        .map_err(tar_error)?;
+    if bytes.len() > MAX_TAR_EXTENSION_BYTES {
+        *oversized = true;
+        return Ok(None);
+    }
+    Ok(Some(bytes))
+}
+
+/// Salta le intestazioni sparse estese di un file sparso GNU, un blocco alla volta, leggendo
+/// il flusso fuori dalla libreria: in lettura grezza la libreria non le conosce e
+/// cercherebbe la voce seguente 512 byte per intestazione troppo presto; così il flusso
+/// avanza di quanto le manca. Il file sparso poi si salta.
+fn skip_sparse_extensions(stream: &SharedStream<impl Read>) -> Result<(), Fail> {
+    let mut block = tar::GnuExtSparseHeader::new();
+    let mut reader = stream;
+    loop {
+        reader.read_exact(block.as_mut_bytes()).map_err(tar_error)?;
+        if !block.is_extended() {
+            return Ok(());
+        }
+    }
+}
+
+/// Il flusso di un tar, letto dalla libreria e, per le intestazioni sparse estese, da
+/// [`skip_sparse_extensions`].
+struct SharedStream<R>(RefCell<R>);
+
+impl<R: Read> Read for &SharedStream<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        // Le due letture non si sovrappongono mai: un prestito fallito è un errore di I/O.
+        self.0
+            .try_borrow_mut()
+            .map_err(|_| io::Error::other("flusso del tar già in lettura"))?
+            .read(buf)
+    }
 }
 
 /// Legge una voce regolare già "entrata" nel contesto; `size` è la dimensione dichiarata.
@@ -205,6 +343,111 @@ mod tests {
                 [vec!["nota.txt".to_owned()], vec!["nota (2).txt".to_owned()]]
             );
         }
+    }
+
+    /// Le voci di un tar letto da `bytes`: (voci, testo) dei documenti e (voci, motivo)
+    /// degli avvisi e dei saltati, nell'ordine.
+    fn read_events(bytes: Vec<u8>) -> (Result<(), Stopped>, Vec<String>) {
+        let mut events = Vec::new();
+        let result = crate::extract::extract_bytes(
+            "prova.tar",
+            bytes,
+            &crate::extract::ExtractOptions::default(),
+            &mut events,
+        );
+        let mut seen = Vec::new();
+        let mut inner = Vec::new();
+        for event in events {
+            use crate::event::ExtractEvent as E;
+            match event {
+                E::DocumentStart { inner: i, .. } => inner = i,
+                E::Unit(unit) => seen.push(format!("{}: {}", inner.join("/"), unit.text.trim())),
+                E::Skipped { inner, reason } => {
+                    seen.push(format!("{}: {reason:?}", inner.join("/")));
+                }
+                E::Warning { inner, kind } => seen.push(format!("{}: {kind:?}", inner.join("/"))),
+                E::DocumentEnd => {}
+            }
+        }
+        (result, seen)
+    }
+
+    /// Un membro GNU semplice (intestazione e dati con il riempimento).
+    fn gnu_member(name: &str, data: &[u8]) -> Vec<u8> {
+        let mut header = tar::Header::new_gnu();
+        assert!(header.set_path(name).is_ok());
+        header.set_size(u64::try_from(data.len()).unwrap_or(0));
+        header.set_mode(0o644);
+        header.set_cksum();
+        let mut bytes = header.as_bytes().to_vec();
+        bytes.extend_from_slice(data);
+        bytes.resize(bytes.len().next_multiple_of(512), 0);
+        bytes
+    }
+
+    /// Un file sparso GNU con un'intestazione sparsa estesa (più di quattro tratti nei tar
+    /// veri) prima dei dati, poi `dopo.txt`: il file sparso si salta, `dopo.txt` si legge.
+    #[test]
+    fn sparse_files_with_extended_headers_are_skipped() {
+        let mut header = tar::Header::new_gnu();
+        assert!(header.set_path("sparso.bin").is_ok());
+        header.set_entry_type(tar::EntryType::GNUSparse);
+        header.set_size(1024);
+        header.set_mode(0o644);
+        if let Some(gnu) = header.as_gnu_mut() {
+            gnu.sparse[0].set_offset(0);
+            gnu.sparse[0].set_length(512);
+            gnu.set_real_size(2560);
+            gnu.set_is_extended(true);
+        }
+        header.set_cksum();
+        let mut extension = tar::GnuExtSparseHeader::new();
+        extension.sparse_mut()[0].set_offset(2048);
+        extension.sparse_mut()[0].set_length(512);
+        let mut bytes = header.as_bytes().to_vec();
+        bytes.extend_from_slice(extension.as_bytes());
+        bytes.extend_from_slice(&[b'x'; 1024]);
+        bytes.extend(gnu_member("dopo.txt", b"aragosta dopo\n"));
+        bytes.extend_from_slice(&[0; 1024]);
+        let (result, seen) = read_events(bytes);
+        assert_eq!(result, Ok(()));
+        assert_eq!(
+            seen,
+            ["sparso.bin: SpecialEntry", "dopo.txt: aragosta dopo"]
+        );
+    }
+
+    /// Una dimensione PAX diversa da quella dell'intestazione: la lettura grezza non saprebbe
+    /// dove comincia la voce seguente, il tar si ferma con un avviso "danneggiato". Uguale:
+    /// la voce si legge.
+    #[test]
+    fn a_pax_size_different_from_the_header_stops_the_tar() {
+        let pax_member = |size: &str| {
+            let record = format!("{} size={size}\n", 7 + size.len() + 2);
+            assert_eq!(record.len(), 7 + size.len() + 2, "lunghezza del record");
+            let mut header = tar::Header::new_ustar();
+            assert!(header.set_path("PaxHeader/voce.txt").is_ok());
+            header.set_entry_type(tar::EntryType::XHeader);
+            header.set_size(u64::try_from(record.len()).unwrap_or(0));
+            header.set_cksum();
+            let mut bytes = header.as_bytes().to_vec();
+            bytes.extend_from_slice(record.as_bytes());
+            bytes.resize(bytes.len().next_multiple_of(512), 0);
+            bytes
+        };
+        let archive = |size: &str| {
+            let mut bytes = pax_member(size);
+            bytes.extend(gnu_member("voce.txt", b"carta"));
+            bytes.extend(gnu_member("dopo.txt", b"aragosta dopo\n"));
+            bytes.extend_from_slice(&[0; 1024]);
+            bytes
+        };
+        let (result, seen) = read_events(archive("999"));
+        assert_eq!(result, Ok(()));
+        assert_eq!(seen, [": Corrupt"]);
+        let (result, seen) = read_events(archive("5"));
+        assert_eq!(result, Ok(()));
+        assert_eq!(seen, ["voce.txt: carta", "dopo.txt: aragosta dopo"]);
     }
 
     #[test]

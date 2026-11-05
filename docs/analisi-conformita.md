@@ -23,15 +23,15 @@
 
 ### Stato dopo le correzioni
 
-Stato al commit `2552454`. Le correzioni sono nei commit tra `75a334e` e `2552454`. Ogni riga delle tabelle ha una colonna "Stato" con il commit che la corregge. Le due revisioni delle correzioni (interfaccia, librerie) sono nella sezione "Seconda revisione".
+Stato al commit `2552454`, salvo B-02 e A-P4, aggiornati dopo (vedi le loro righe). Le correzioni sono nei commit tra `75a334e` e `2552454`. Ogni riga delle tabelle ha una colonna "Stato" con il commit che la corregge. Le due revisioni delle correzioni (interfaccia, librerie) sono nella sezione "Seconda revisione".
 
 | Area | Corretti | Corretti in parte | Rimandati | Aperti | Totale (verificati + plausibili) |
 |---|---|---|---|---|---|
-| A ricerca ed estrattori | 14 | 1 (A-P4) | 0 | 0 | 15 |
+| A ricerca ed estrattori | 15 | 0 | 0 | 0 | 15 |
 | B motore, pool, cache | 17 | 0 | 1 (B-12) | 0 | 18 |
 | C interfaccia | 24 | 0 | 0 | 0 | 24 |
 | D integrazione e rilascio | 12 | 0 | 0 | 0 | 12 |
-| Totale | 67 | 1 | 1 | 0 | 69 |
+| Totale | 68 | 0 | 1 | 0 | 69 |
 
 Seconda revisione: 17 punti (sezione dedicata), 15 corretti, 1 da provare su Linux (R-13), 1 rischio aperto accettato (R-17).
 
@@ -108,7 +108,7 @@ Percorsi: `core` = `crates/lynkeus-core/src`, `extract` = `crates/lynkeus-extrac
 | A-P1 | crates/lynkeus-extract/src/extract/archive.rs:178 | Il rapporto di compressione usa la dimensione compressa dichiarata: uno zip imbottito aggira il 200:1 (restano i limiti di 512 MiB per voce e 4 GB totali) | corretto (8ae3935) |
 | A-P2 | crates/lynkeus-extract/src/extract/ooxml.rs:181 | Lo stesso `sldId` ripetuto fa decomprimere N volte la stessa diapositiva fino al budget o al timeout | corretto (8ae3935) |
 | A-P3 | crates/lynkeus-extract/src/extract/ppt.rs, `read_persist_directory` | 4096 modifiche che puntano alla stessa directory moltiplicano il lavoro | corretto (8ae3935) |
-| A-P4 | sevenz.rs:46, sheet.rs:58 (xls), nomi lunghi PAX/GNU in tarball.rs (tutti sotto crates/lynkeus-extract/src/extract/) | Le librerie allocano prima dei nostri limiti; ferma solo il limite di memoria del processo | corretto in parte (8ae3935): xls coperto da A-01, 7z verificato; per i nomi lunghi PAX/GNU del tar non c'è un tetto nostro e resta il limite di memoria del processo |
+| A-P4 | sevenz.rs:46, sheet.rs:58 (xls), nomi lunghi PAX/GNU in tarball.rs (tutti sotto crates/lynkeus-extract/src/extract/) | Le librerie allocano prima dei nostri limiti; ferma solo il limite di memoria del processo | corretto (8ae3935, poi i nomi del tar): xls coperto da A-01, 7z verificato. Il crate `tar` (0.4.46) legge per intero in memoria i nomi lunghi GNU (`L`, `K`) e le estensioni PAX (`x`) con `read_all`: ora il tar si legge in modo grezzo e i nomi lunghi e le estensioni PAX si leggono al più 64 KiB (`MAX_TAR_EXTENSION_BYTES`, `tarball.rs`); oltre, avviso di limite (memoria) per la voce e le seguenti si leggono. Test `oversized_tar_names_are_a_limit_and_later_entries_are_read` con `malevoli/nomi-lunghi.tar.gz` |
 | A-P5 | fuzz/ | Gli obiettivi non hanno oracoli oltre il crash (FZB); nessun esito di sessione nel threat model | corretto (8ae3935, 69c92c8): oracoli in tutti i target; il fuzzing non è ancora stato eseguito, nessun esito |
 
 ### Punti di forza (area A)

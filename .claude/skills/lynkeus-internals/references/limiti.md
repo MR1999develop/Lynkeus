@@ -32,7 +32,7 @@
 | RTF: profondità dei gruppi | 256 (`MAX_GROUP_DEPTH`); oltre, documento "danneggiato" |
 | EML: allegati | contano come voci (100.000), un livello di profondità in più, 512 MB per allegato decodificato e totali; il messaggio si legge in memoria entro il massimo per voce |
 | 7z | voci contate sull'elenco; dimensione dichiarata controllata prima di leggere; in un blocco solido, superato un limite il resto del blocco ha lo stesso avviso; AES: "protetto da password" |
-| tar | voci contate man mano (non c'è elenco in testa); dimensione dichiarata controllata prima; link, dispositivi e file sparsi saltati |
+| tar | voci contate man mano (non c'è elenco in testa); dimensione dichiarata controllata prima; link, dispositivi e file sparsi saltati. Lettura grezza: nomi lunghi GNU (`L`) ed estensioni PAX locali (`x`) letti al più 64 KiB (`MAX_TAR_EXTENSION_BYTES`, `tarball.rs`); oltre, avviso "memoria" per la voce che descrivono, le seguenti si leggono. Nomi lunghi dei collegamenti (`K`) ed estensioni globali (`g`) saltati senza leggerli. Dimensione PAX diversa da quella dell'intestazione: il tar si ferma lì ("danneggiato") |
 | gz / tgz | stessi limiti degli zip; rapporto di compressione sui byte del file compresso; più membri concatenati letti; contenuto = un documento, o le voci di un tar |
 | Cache | LRU, 500 MB predefiniti (`[cache] max_size_mib`, da 16 a 65.536 MiB; menu: 100, 250, 500, 1000, 2000) |
 | Voce di cache | al più 64 MiB di frame decompressi; oltre, il documento non si salva |

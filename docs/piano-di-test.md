@@ -289,7 +289,7 @@ Per ogni sessione: un file di note con data, commit, ambiente, persona (sigla an
 | A-P1 | T-A14 |
 | A-P2 | T-A12 |
 | A-P3 | T-A13 (fuzzing `ppt_records` con oracolo di tempo) |
-| A-P4 | T-A08, limite di memoria del processo (M-19) |
+| A-P4 | T-A08, `oversized_tar_names_are_a_limit_and_later_entries_are_read` (`malevoli/nomi-lunghi.tar.gz`), limite di memoria del processo (M-19) |
 | A-P5 | T-A13 |
 | B-01 | T-B01, P-02, M-03 |
 | B-02 | P-03 |
