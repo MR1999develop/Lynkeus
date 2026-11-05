@@ -63,6 +63,25 @@ Per non rileggere i documenti a ogni ricerca, il programma conserva su disco il 
 
 I documenti (PDF, Office, archivi) sono letti da processi separati con memoria e tempo limitati: un file danneggiato o ostile non blocca il programma, ma compare negli avvisi.
 
+## Clic destro (facoltativo)
+
+Dal menu Strumenti si può accendere "Cerca con Lynkeus" nel clic destro su file e cartelle (spento per impostazione predefinita). La voce apre il programma con l'elemento scelto tra i luoghi in cui cercare; con più elementi selezionati si usa un'unica finestra. Su Windows 11 compare in "Mostra altre opzioni". Non servono diritti di amministratore. Il programma non crea la voce se la sua cartella è modificabile da altri utenti o se esiste già una voce con lo stesso nome di un altro programma, e lo dice con un messaggio.
+
+La voce si toglie spegnendo l'opzione. Se hai cancellato il programma senza spegnerla, togli a mano le voci rimaste:
+
+- Windows (Editor del Registro di sistema, solo sotto `HKEY_CURRENT_USER`): elimina le tre chiavi `LynkeusSearcher` in `Software\Classes\*\shell`, `Software\Classes\Directory\shell` e `Software\Classes\Directory\Background\shell`. In PowerShell: `Remove-Item -Recurse 'HKCU:\Software\Classes\Directory\shell\LynkeusSearcher'` e lo stesso per le altre due (per `*` usa `-LiteralPath 'HKCU:\Software\Classes\*\shell\LynkeusSearcher'`).
+- Linux (Nautilus): elimina da `~/.local/share/nautilus/scripts` il file "Cerca con Lynkeus" o "Search with Lynkeus".
+
+La voce segue la lingua del programma e si aggiorna al riavvio.
+
+## Log e rapporti di crash
+
+Il programma scrive un log (un file al giorno, gli ultimi 7) e, se si blocca per un errore interno, un rapporto di crash (gli ultimi 10). Il log è nella cartella `logs` e i rapporti in `crash-reports`, dentro la cartella dati locale dell'utente (Windows: `%LOCALAPPDATA%\Lynkeus Searcher\data`; Linux: `~/.local/share/lynkeus-searcher`). Il livello del log si cambia da Strumenti > Dettaglio del log (predefinito: errori e avvisi). Log e rapporti contengono motivi, percorsi e contatori, non il testo dei tuoi documenti; non vengono inviati da nessuna parte: se segnali un problema puoi allegarli, dopo averli riletti.
+
+## Cartelle private
+
+Impostazioni, cache, log, rapporti e file temporanei stanno in cartelle accessibili solo al tuo utente (su Windows anche a SYSTEM). Se una di queste cartelle esiste già ed è aperta ad altri utenti, per sicurezza il programma non la usa in quella sessione (cache, log o impostazioni potrebbero non essere salvati) e te lo segnala: controlla i permessi della cartella.
+
 ## Firma dell'eseguibile e verifica
 
 L'eseguibile **non è firmato** con un certificato di firma del codice (è un progetto personale). Su Windows, SmartScreen può quindi mostrare l'avviso "Windows ha protetto il PC": per avviare il programma si sceglie "Ulteriori informazioni" e poi "Esegui comunque", dopo aver verificato l'integrità del file.
