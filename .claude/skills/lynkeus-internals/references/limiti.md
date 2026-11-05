@@ -9,6 +9,7 @@
 | Rilevamento binari | NUL nei primi 8 KB (senza schema UTF-16) o firma nota |
 | Lettura dei file di testo | blocchi di circa 8 MB tagliati a fine riga; la codifica si decide sul primo blocco; una riga più lunga di un blocco si taglia dopo l'ultimo spazio (file con soli CR = una riga); passi di ricerca di 10.000 righe e 1 MiB |
 | Dimensione massima di un file | 200 MiB (modificabile o senza limite); vale anche per le radici; in `settings.toml` da 1 a 1.048.576 MiB |
+| Luoghi di ricerca | al più 256 (`MAX_ROOTS`, `form.rs`); vale per l'elenco, per i percorsi dell'istanza unica e per `roots` di `settings.toml` (oltre, scartati); il 257° non entra e compare l'avviso `notice-roots-limit` |
 | Termini | 32 per ricerca, 256 caratteri ciascuno (spazi esterni esclusi) |
 | Estensioni nei filtri | 32 caratteri, senza punti interni |
 | Recenti | 10 radici, 10 termini |
@@ -32,7 +33,8 @@
 | Cache | LRU, 500 MB predefiniti (`[cache] max_size_mib`, da 16 a 65.536 MiB; menu: 100, 250, 500, 1000, 2000) |
 | Voce di cache | al più 64 MiB di frame decompressi; oltre, il documento non si salva |
 | Temporanei di cache | più vecchi di 1 ora: cancellati |
-| Voce d'archivio aperta | al più 64 MiB di testo ricomposto; solo voci di testo |
+| Errori di fila nell'attesa di un client (istanza unica) | 20 (`MAX_ACCEPT_ERRORS`): poi il server si ferma, registrandolo |
+| Voce d'archivio aperta | byte originali della voce (qualsiasi formato), al più il limite per voce degli archivi (512 MiB), in pezzi da 1 MiB |
 | Barra di avanzamento | compare dopo 1 s |
 | Token dell'istanza unica | 128 bit casuali |
 
