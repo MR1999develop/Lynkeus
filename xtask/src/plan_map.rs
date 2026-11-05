@@ -539,21 +539,6 @@ pub enum Threshold {
     },
 }
 
-/// Come si leggono i valori di una misura nell'uscita del suo test.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Output {
-    /// La riga `MISURA <id> chiave=valore …` (`crates/lynkeus-engine/tests/misura`).
-    Line,
-    /// Le righe `<id> <etichetta>: p50 <durata>, p95 <durata>, massimo <durata>` di un test
-    /// scritto prima della riga `MISURA`, con le durate nel formato `Debug` di `Duration`:
-    /// `main` dà p50, p95 e massimo, `baseline` il valore `baseline_p50_ms`. Memoria non
-    /// misurata.
-    Labeled {
-        main: &'static str,
-        baseline: &'static str,
-    },
-}
-
 /// Stato condiviso della macchina che un test modifica: il comando non lo tocca senza
 /// l'opzione esplicita, e il rapporto dice quale serve.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -603,8 +588,6 @@ pub struct Measure {
     pub title: &'static str,
     /// Il test `#[ignore]` della misura.
     pub test: TestRef,
-    /// Come si leggono i valori nell'uscita del test.
-    pub output: Output,
     pub thresholds: &'static [Threshold],
     pub length: Length,
     /// Lo stato condiviso che il test modifica, se c'è.
@@ -627,7 +610,6 @@ pub const MEASURES: &[Measure] = &[
         id: "P-01",
         title: "scansione di 100.000 file di testo",
         test: engine_measure("p01_scan_100k_text_files"),
-        output: Output::Line,
         thresholds: &[Threshold::AtMost {
             key: "p95_ms",
             limit: 1_500.0,
@@ -641,7 +623,6 @@ pub const MEASURES: &[Measure] = &[
         id: "P-02",
         title: "Annulla sotto carico (4 processi, CPU satura)",
         test: engine_measure("p02_cancel_under_load"),
-        output: Output::Line,
         thresholds: &[Threshold::Below {
             key: "max_ms",
             limit: 1_000.0,
@@ -654,7 +635,6 @@ pub const MEASURES: &[Measure] = &[
         id: "P-03",
         title: "AND con 16 file da 300.000 \"il\": memoria",
         test: engine_measure("p03_and_retained_hits_memory"),
-        output: Output::Line,
         thresholds: &[Threshold::Below {
             key: "mem_mb",
             limit: 256.0,
@@ -667,12 +647,8 @@ pub const MEASURES: &[Measure] = &[
         id: "P-04",
         title: "filtro di 32 estensioni su 100.000 nomi",
         // Il filtro preparato della scansione è interno al crate: la misura è il suo test di
-        // libreria, che stampa le righe prima del formato `MISURA`.
+        // libreria, con la stessa riga `MISURA` delle altre.
         test: lib(ENGINE, "prepared_filter_timing"),
-        output: Output::Labeled {
-            main: "filtro preparato",
-            baseline: "confronto con to_lowercase",
-        },
         thresholds: &[Threshold::BelowKey {
             key: "p95_ms",
             other: "baseline_p50_ms",
@@ -686,7 +662,6 @@ pub const MEASURES: &[Measure] = &[
         id: "P-05",
         title: "cache contro estrazione (documenti demo)",
         test: engine_measure("p05_cache_against_extraction"),
-        output: Output::Line,
         thresholds: &[Threshold::BelowKey {
             key: "p50_ms",
             other: "baseline_p50_ms",
@@ -699,7 +674,6 @@ pub const MEASURES: &[Measure] = &[
         id: "P-06",
         title: "ordinamento di 200.000 righe per colonna",
         test: app_measure("p06_sort_200k"),
-        output: Output::Line,
         thresholds: &[
             Threshold::Below {
                 key: "p95_ms",
@@ -718,7 +692,6 @@ pub const MEASURES: &[Measure] = &[
         id: "P-07",
         title: "step_target con 200.000 righe",
         test: app_measure("p07_step_target_200k"),
-        output: Output::Line,
         thresholds: &[Threshold::Below {
             key: "max_ms",
             limit: 1.0,
@@ -731,7 +704,6 @@ pub const MEASURES: &[Measure] = &[
         id: "P-08",
         title: "copia negli appunti al limite di 8 MiB e rifiuto con 200.000 righe",
         test: app_measure("p08_copy_200k"),
-        output: Output::Line,
         thresholds: &[
             Threshold::AtMost {
                 key: "max_ms",
@@ -757,7 +729,6 @@ pub const MEASURES: &[Measure] = &[
         id: "P-09",
         title: "risposta a un tasto con 200.000 risultati",
         test: app_measure("p09_key_response_200k"),
-        output: Output::Line,
         thresholds: &[Threshold::Below {
             key: "max_ms",
             limit: 100.0,
@@ -1068,12 +1039,17 @@ mod tests {
         );
     }
 
+    /// Ogni misura ha soglie e il suo test sta in un file di misure; solo P-04 è un test di
+    /// libreria (usa il filtro interno al motore).
     #[test]
-    fn measures_are_ignored_tests_in_their_files() {
+    fn measures_have_thresholds_and_their_own_test_files() {
         for measure in MEASURES {
-            let own_file = matches!(measure.test.target, Target::Test(_));
-            assert_eq!(own_file, measure.output == Output::Line, "{}", measure.id);
             assert!(!measure.thresholds.is_empty(), "{}", measure.id);
+            let own_file = matches!(
+                measure.test.target,
+                Target::Test("prestazioni" | "prestazioni_interfaccia")
+            );
+            assert_eq!(own_file, measure.id != "P-04", "{}", measure.id);
         }
     }
 

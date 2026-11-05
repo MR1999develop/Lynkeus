@@ -5,10 +5,9 @@
 //! release; lettura della riga `MISURA` e confronto con le soglie del piano
 //! ([`crate::plan_map::MEASURES`]).
 //!
-//! Formato della riga (scritta da `crates/lynkeus-engine/tests/misura`):
-//! `MISURA <ID> chiave=valore …`, con almeno `samples`, `p50_ms`, `p95_ms`, `max_ms`,
-//! `mem_mb` e `mem_kind`. Un test scritto prima di questo formato si legge dalle sue righe
-//! con le durate ([`crate::plan_map::Output::Labeled`]).
+//! Formato della riga (scritta da `crates/lynkeus-engine/tests/misura/formato.rs`, anche
+//! per P-04, test di libreria del motore): `MISURA <ID> chiave=valore …`, con almeno
+//! `samples`, `p50_ms`, `p95_ms`, `max_ms`, `mem_mb` e `mem_kind`.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -16,7 +15,7 @@ use std::time::Duration;
 
 use super::capture::{self, Echo};
 use super::{Entry, Level, Verdict};
-use crate::plan_map::{Length, MEASURES, Measure, Output, SharedState, TestRef, Threshold};
+use crate::plan_map::{Length, MEASURES, Measure, SharedState, TestRef, Threshold};
 use crate::process::cargo;
 
 /// Tempo massimo di una misura (P-01 crea e cancella 100.000 file).
@@ -74,91 +73,6 @@ pub fn find_line(output: &str, id: &str) -> Option<MeasureLine> {
             .collect();
         Some(MeasureLine { values })
     })
-}
-
-/// I valori di `measure` nell'uscita del suo test, nel formato dichiarato dalla mappa.
-pub fn read_values(output: &str, measure: &Measure) -> Option<MeasureLine> {
-    match measure.output {
-        Output::Line => find_line(output, measure.id),
-        Output::Labeled { main, baseline } => {
-            let main = labeled(output, measure.id, main)?;
-            let baseline = labeled(output, measure.id, baseline)?;
-            let mut values = BTreeMap::new();
-            let mut put = |key: &str, value: String| {
-                values.insert(key.to_owned(), value);
-            };
-            if let Some(samples) = main.samples {
-                put("samples", samples.to_string());
-            }
-            put("p50_ms", main.p50_ms.to_string());
-            put("p95_ms", main.p95_ms.to_string());
-            put("max_ms", main.max_ms.to_string());
-            put("mem_mb", "not_measured".to_owned());
-            put("mem_kind", "none".to_owned());
-            put("baseline_p50_ms", baseline.p50_ms.to_string());
-            Some(MeasureLine { values })
-        }
-    }
-}
-
-/// Una riga `<id> <etichetta>: p50 …, p95 …, massimo … (N ripetizioni)`.
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct Labeled {
-    p50_ms: f64,
-    p95_ms: f64,
-    max_ms: f64,
-    samples: Option<u32>,
-}
-
-/// La riga di `id` con `label`, se c'è e si legge tutta.
-fn labeled(output: &str, id: &str, label: &str) -> Option<Labeled> {
-    let prefix = format!("{id} {label}: ");
-    let rest = output
-        .lines()
-        .rev()
-        .find_map(|line| from_word(line.trim_end(), &prefix)?.strip_prefix(prefix.as_str()))?;
-    let (durations, samples) = match rest.split_once(" (") {
-        Some((durations, tail)) => (
-            durations,
-            tail.split_whitespace().next().and_then(|n| n.parse().ok()),
-        ),
-        None => (rest, None),
-    };
-    let mut parts = durations.split(", ");
-    let mut take = |word: &str| -> Option<f64> {
-        let value = parts.next()?.trim().strip_prefix(word)?;
-        debug_duration_ms(value)
-    };
-    Some(Labeled {
-        p50_ms: take("p50 ")?,
-        p95_ms: take("p95 ")?,
-        max_ms: take("massimo ")?,
-        samples,
-    })
-}
-
-/// Le unità del formato `Debug` di `Duration` con il loro valore in millisecondi come
-/// frazione (numeratore, denominatore); `s` per ultima, perché chiude anche le altre.
-const DEBUG_UNITS: [(&str, f64, f64); 5] = [
-    ("ms", 1.0, 1.0),
-    ("µs", 1.0, 1e3),
-    ("us", 1.0, 1e3),
-    ("ns", 1.0, 1e6),
-    ("s", 1e3, 1.0),
-];
-
-/// Una durata nel formato `Debug` di `Duration` (`1.5s`, `12.3ms`, `850µs`, `40ns`) in
-/// millisecondi.
-fn debug_duration_ms(text: &str) -> Option<f64> {
-    let text = text.trim();
-    let (number, numerator, denominator) = DEBUG_UNITS
-        .iter()
-        .find_map(|&(unit, num, den)| Some((text.strip_suffix(unit)?, num, den)))?;
-    number
-        .parse::<f64>()
-        .ok()
-        .filter(|v| v.is_finite() && *v >= 0.0)
-        .map(|v| v * numerator / denominator)
 }
 
 /// Esito del confronto con le soglie.
@@ -278,7 +192,7 @@ fn run_one(root: &Path, measure: &Measure) -> Entry {
         Err(error) => entry.verdict = Verdict::Failed(format!("{error:#}")),
         Ok(captured) => {
             entry.duration = Some(captured.elapsed);
-            let line = read_values(&captured.output, measure);
+            let line = find_line(&captured.output, measure.id);
             entry.verdict = match (&line, captured.success()) {
                 (_, false) => {
                     entry.excerpt = Some(captured.tail(40));
@@ -384,39 +298,6 @@ test p04 ... ok
             other: "assente",
         };
         assert!(matches!(judge(&line, &[missing]), Judgement::Missing(_)));
-    }
-
-    #[test]
-    fn debug_durations_partitions() {
-        assert_eq!(debug_duration_ms("1.5s"), Some(1500.0));
-        assert_eq!(debug_duration_ms("12.25ms"), Some(12.25));
-        assert_eq!(debug_duration_ms("850µs"), Some(0.85));
-        assert_eq!(debug_duration_ms("40ns"), Some(0.000_04));
-        assert_eq!(debug_duration_ms("3 min"), None);
-        assert_eq!(debug_duration_ms("-1ms"), None);
-        assert_eq!(debug_duration_ms("ms"), None);
-    }
-
-    /// P-04 dal test di libreria scritto prima della riga `MISURA`.
-    #[test]
-    fn labeled_lines_become_measure_values() {
-        let output = "\
-test filter::tests::prepared_filter_timing ... P-04 confronto con to_lowercase: p50 9.51ms, p95 10.2ms, massimo 11ms (15 ripetizioni)
-P-04 filtro preparato: p50 850µs, p95 1.1ms, massimo 1.5ms (15 ripetizioni)
-test filter::tests::prepared_filter_timing ... ok
-";
-        let p04 = MEASURES.iter().find(|m| m.id == "P-04").expect("P-04");
-        let line = read_values(output, p04).expect("valori");
-        assert_eq!(line.number("p50_ms"), Some(0.85));
-        assert_eq!(line.number("max_ms"), Some(1.5));
-        assert_eq!(line.number("baseline_p50_ms"), Some(9.51));
-        assert_eq!(line.number("samples"), Some(15.0));
-        assert_eq!(line.number("mem_mb"), None);
-        assert_eq!(judge(&line, p04.thresholds), Judgement::Within);
-        assert!(
-            read_values("P-04 filtro preparato: p50 1ms", p04).is_none(),
-            "incompleta"
-        );
     }
 
     #[test]

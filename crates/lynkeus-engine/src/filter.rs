@@ -316,18 +316,23 @@ mod tests {
     }
 
     /// Misura P-04 (piano di test): 32 estensioni su 100.000 nomi, filtro preparato contro
-    /// il confronto con `to_lowercase` per voce. `cargo test --release -p lynkeus-engine
-    /// --lib prepared_filter_timing -- --ignored --nocapture`.
+    /// il confronto con `to_lowercase` per voce (`baseline_*`). Stampa la riga `MISURA`
+    /// delle misure di `tests/`, senza la memoria. La lancia `cargo xtask test-plan`, o a
+    /// mano: `cargo test --release -p lynkeus-engine --lib prepared_filter_timing --
+    /// --ignored --exact --nocapture` (nome completo: `filter::tests::prepared_filter_timing`).
     #[test]
-    #[ignore = "misura di prestazioni (P-04), da lanciare a mano in release"]
+    #[ignore = "misura P-04 del piano di test, lanciata da cargo xtask test-plan"]
     fn prepared_filter_timing() {
         use std::hint::black_box;
-        use std::time::{Duration, Instant};
 
+        use crate::measure_line::{Distribution, line, ms, repeat, timed};
+
+        const REPETITIONS: usize = 15;
+        const NAMES: usize = 100_000;
         let list: Vec<Extension> = (0..32)
             .map(|n| Extension::parse(&format!("e{n:02}x")).expect("valida"))
             .collect();
-        let names: Vec<String> = (0..100_000)
+        let names: Vec<String> = (0..NAMES)
             .map(|n| format!("file{n}.E{:02}X", n % 40))
             .collect();
         let filters = Filters {
@@ -335,42 +340,36 @@ mod tests {
             ..Filters::default()
         };
         let prepared = FileFilter::new(&filters);
-        let measure = |run: &dyn Fn() -> usize| -> Vec<Duration> {
-            let mut times: Vec<Duration> = (0..16)
-                .map(|_| {
-                    let started = Instant::now();
-                    black_box(run());
-                    started.elapsed()
-                })
-                .skip(1)
-                .collect();
-            times.sort_unstable();
-            times
-        };
-        let naive = measure(&|| {
-            names
-                .iter()
-                .filter(|n| {
-                    let path = Path::new(black_box(n.as_str()));
-                    list.iter().any(|e| naive_extension_is(path, e.as_str()))
-                })
-                .count()
+        let naive = repeat(REPETITIONS, || {
+            let (accepted, took) = timed(|| {
+                names
+                    .iter()
+                    .filter(|n| {
+                        let path = Path::new(black_box(n.as_str()));
+                        list.iter().any(|e| naive_extension_is(path, e.as_str()))
+                    })
+                    .count()
+            });
+            black_box(accepted);
+            took
         });
-        let fast = measure(&|| {
-            names
-                .iter()
-                .filter(|n| prepared.accepts_extension(Path::new(black_box(n.as_str()))))
-                .count()
+        let fast = repeat(REPETITIONS, || {
+            let (accepted, took) = timed(|| {
+                names
+                    .iter()
+                    .filter(|n| prepared.accepts_extension(Path::new(black_box(n.as_str()))))
+                    .count()
+            });
+            black_box(accepted);
+            took
         });
-        let report = |label: &str, t: &[Duration]| {
-            println!(
-                "P-04 {label}: p50 {:?}, p95 {:?}, massimo {:?} (15 ripetizioni)",
-                t[t.len() / 2],
-                t[(t.len() - 1) * 95 / 100],
-                t[t.len() - 1]
-            );
-        };
-        report("confronto con to_lowercase", &naive);
-        report("filtro preparato", &fast);
+        let baseline = Distribution::new(&naive);
+        let extras = [
+            ("names", NAMES.to_string()),
+            ("extensions", list.len().to_string()),
+            ("baseline_p50_ms", ms(baseline.p50_ms())),
+            ("baseline_p95_ms", ms(baseline.p95_ms())),
+        ];
+        println!("{}", line("P-04", &Distribution::new(&fast), None, &extras));
     }
 }

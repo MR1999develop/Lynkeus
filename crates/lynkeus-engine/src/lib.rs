@@ -40,6 +40,12 @@ mod step;
 mod textfile;
 mod worker;
 
+/// La riga `MISURA` del piano di test, per la misura P-04 (`prepared_filter_timing`), che
+/// usa il filtro interno al crate: lo stesso formato delle misure di `tests/`.
+#[cfg(test)]
+#[path = "../tests/misura/formato.rs"]
+mod measure_line;
+
 pub use cache::{
     CACHE_FORMAT_VERSION, CacheKey, DEFAULT_CACHE_SIZE, MAX_ENTRY_BYTES, TextCache, WriteFailure,
     WriteFailures,
