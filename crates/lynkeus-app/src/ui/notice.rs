@@ -12,7 +12,7 @@
 use egui::accesskit::Live;
 use egui::{Label, RichText, Ui};
 
-use super::Action;
+use super::{Action, Command};
 use crate::app::{Application, Notice};
 use crate::context_menu::MenuError;
 use crate::i18n::I18n;
@@ -44,6 +44,10 @@ fn text(i18n: &I18n, notice: &Notice) -> (String, bool) {
         ),
         Notice::Copied { rows } => (
             i18n.tr_args("notice-copied", &[("count", (*rows).into())]),
+            false,
+        ),
+        Notice::CopyTooLarge { rows } => (
+            i18n.tr_args("notice-copy-too-large", &[("count", (*rows).into())]),
             false,
         ),
         Notice::Exported { rows, file } => (
@@ -126,6 +130,12 @@ fn row(app: &Application, notice: &Notice, index: usize, ui: &mut Ui, actions: &
         {
             actions.push(Action::UndoFiltersReset);
         }
+        if let Notice::CopyTooLarge { .. } = notice
+            && export_button(app, ui).clicked()
+        {
+            actions.push(Action::DismissNotice(index));
+            actions.push(Action::ExportSelection);
+        }
         let text = if is_error {
             RichText::new(text).color(tokens.error)
         } else {
@@ -137,4 +147,19 @@ fn row(app: &Application, notice: &Notice, index: usize, ui: &mut Ui, actions: &
                 .accesskit_node_builder(response.id, |node| node.set_live(Live::Polite));
         });
     });
+}
+
+/// "Esporta…" per le righe che non stanno negli appunti: apre le impostazioni di
+/// esportazione con le sole righe selezionate. Spento, con il motivo, quando Esporta lo è.
+fn export_button(app: &Application, ui: &mut Ui) -> egui::Response {
+    let i18n = app.i18n();
+    let availability = Command::ExportSettings.availability(app);
+    let response = ui.add_enabled(
+        availability.is_ok(),
+        egui::Button::new(i18n.tr(Command::Export.label_id())),
+    );
+    match availability {
+        Ok(()) => response,
+        Err(reason) => response.on_disabled_hover_text(i18n.tr(reason)),
+    }
 }

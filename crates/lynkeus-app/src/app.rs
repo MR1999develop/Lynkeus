@@ -11,8 +11,8 @@
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError};
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::{Arc, Mutex, TryLockError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -44,7 +44,7 @@ use crate::results::{ResultsView, SortColumn, SortSpec, Step};
 use crate::root_check::{RootCheck, RootChecks};
 use crate::settings::{
     CACHE_SIZE_MIB_RANGE, CacheSettings, LayoutSettings, Settings, SettingsError, SettingsFile,
-    push_recent,
+    SettingsProblem, push_recent,
 };
 use crate::theme::{SystemContrast, ThemeChoice};
 
@@ -329,7 +329,31 @@ struct ContextMenuSetup {
 struct CopyJob {
     rows: usize,
     started: Instant,
-    done: Receiver<String>,
+    done: Receiver<CopyOutcome>,
+}
+
+/// Il testo più lungo che si copia negli appunti, in byte. eframe lo scrive negli appunti
+/// del sistema sul thread dell'interfaccia, che si ferma circa 1–2 ms per MB (la sola
+/// conversione in UTF-16 costa 1 ms per MB; misura in `copy_200k`): oltre questa soglia la
+/// finestra resterebbe ferma per più di un frame, quindi si propone Esporta. Sono circa
+/// 30.000–40.000 righe di risultato.
+pub const MAX_CLIPBOARD_BYTES: usize = 8 << 20;
+
+/// Che cosa prepara il thread di copia per la vista.
+enum CopyOutcome {
+    /// Il testo da consegnare agli appunti.
+    Text(String),
+    /// Il testo supera [`MAX_CLIPBOARD_BYTES`]: non si copia.
+    TooLarge,
+}
+
+/// Il testo delle righe copiate, se non supera [`MAX_CLIPBOARD_BYTES`].
+fn clipboard_outcome(text: String) -> CopyOutcome {
+    if text.len() <= MAX_CLIPBOARD_BYTES {
+        CopyOutcome::Text(text)
+    } else {
+        CopyOutcome::TooLarge
+    }
 }
 
 /// Un salvataggio delle impostazioni in corso: le impostazioni scritte e l'esito.
@@ -1141,8 +1165,9 @@ impl Application {
 
     /// Copia negli appunti le righe selezionate, come TSV: il testo si costruisce in un
     /// thread; quando è pronto [`Application::take_clipboard_text`] lo consegna alla vista
-    /// e un messaggio dice quante righe. Senza selezione o con una copia in corso non fa
-    /// nulla.
+    /// e un messaggio dice quante righe. Oltre [`MAX_CLIPBOARD_BYTES`] il testo non arriva
+    /// alla vista e il messaggio propone Esporta ([`Notice::CopyTooLarge`]). Senza
+    /// selezione o con una copia in corso non fa nulla.
     pub fn copy_selection(&mut self, notify: &Notify) {
         if self.copy_job.is_some() {
             return;
@@ -1162,7 +1187,8 @@ impl Application {
             .spawn(move || {
                 let table = export::results_table(&i18n, &hits, &terms, indices);
                 drop(hits);
-                if tx.send(export::to_tsv(&table.rows)).is_ok() {
+                let outcome = clipboard_outcome(export::to_tsv(&table.rows));
+                if tx.send(outcome).is_ok() {
                     notify();
                 }
             });
@@ -1198,9 +1224,12 @@ impl Application {
             return;
         };
         match job.done.try_recv() {
-            Ok(text) => {
+            Ok(CopyOutcome::Text(text)) => {
                 self.clipboard = Some(text);
                 self.notices.push(Notice::Copied { rows: job.rows });
+            }
+            Ok(CopyOutcome::TooLarge) => {
+                self.notices.push(Notice::CopyTooLarge { rows: job.rows });
             }
             Err(TryRecvError::Empty) => return,
             Err(TryRecvError::Disconnected) => {
@@ -1788,10 +1817,17 @@ impl Application {
     }
 
     /// Registra l'esito di un salvataggio: le impostazioni scritte, o l'errore (nel log e,
-    /// la prima volta, in un messaggio).
+    /// la prima volta, in un messaggio). Un salvataggio riuscito toglie il messaggio di un
+    /// errore precedente, così un errore successivo si dice di nuovo.
     fn record_save(&mut self, (written, saved): (Settings, Result<(), SettingsError>)) {
         match saved {
-            Ok(()) => self.saved = Some(written),
+            Ok(()) => {
+                self.saved = Some(written);
+                self.save_failure_reported = false;
+                self.notices.withdraw(|notice| {
+                    *notice == Notice::SettingsNotSaved(SettingsProblem::WriteFailed)
+                });
+            }
             Err(error) => {
                 tracing::warn!(%error, "impostazioni non salvate");
                 if !std::mem::replace(&mut self.save_failure_reported, true) {
@@ -1802,15 +1838,14 @@ impl Application {
     }
 
     /// Salva le impostazioni subito, nel thread che chiama (all'uscita), dopo aver atteso
-    /// per un tempo limitato un salvataggio in corso. Senza file (test) non fa nulla.
+    /// al più `SETTINGS_SAVE_WAIT` un salvataggio in corso. Se il thread di quel
+    /// salvataggio scrive ancora il file, rinuncia con un errore invece di aspettarlo: in
+    /// tutto non attende più del limite. Senza file (test) non fa nulla.
     pub fn save_settings(&mut self) -> Result<(), SettingsError> {
-        if let Some(job) = self.save_job.take() {
-            match job.done.recv_timeout(SETTINGS_SAVE_WAIT) {
-                Ok(outcome) => self.record_save(outcome),
-                Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {
-                    tracing::warn!("salvataggio delle impostazioni in corso non concluso");
-                }
-            }
+        if let Some(job) = self.save_job.take()
+            && let Ok(outcome) = job.done.recv_timeout(SETTINGS_SAVE_WAIT)
+        {
+            self.record_save(outcome);
         }
         let current = self.settings();
         let Some(file) = &self.settings_file else {
@@ -1819,7 +1854,7 @@ impl Application {
         if self.saved.as_ref() == Some(&current) {
             return Ok(());
         }
-        save_to(file, &current)?;
+        save_without_waiting(file, &current)?;
         self.saved = Some(current);
         Ok(())
     }
@@ -1852,10 +1887,32 @@ fn empty_state(has_hits: bool, has_roots: bool, job: &JobState) -> EmptyState {
 /// Scrive `settings` nel file condiviso; un altro thread che lo scriveva e si è fermato a
 /// metà (lock avvelenato) rende il file inutilizzabile per la sessione.
 fn save_to(file: &Mutex<SettingsFile>, settings: &Settings) -> Result<(), SettingsError> {
-    let mut file = file
-        .lock()
-        .map_err(|_| SettingsError::Io(io::Error::other("scrittura precedente interrotta")))?;
+    let mut file = file.lock().map_err(|_| previous_write_interrupted())?;
     file.save(settings)
+}
+
+/// Come [`save_to`], senza aspettare: se un altro thread sta ancora scrivendo il file,
+/// errore subito.
+fn save_without_waiting(
+    file: &Mutex<SettingsFile>,
+    settings: &Settings,
+) -> Result<(), SettingsError> {
+    let mut file = match file.try_lock() {
+        Ok(file) => file,
+        Err(TryLockError::WouldBlock) => {
+            return Err(SettingsError::Io(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "settings.toml ancora in scrittura in un altro thread",
+            )));
+        }
+        Err(TryLockError::Poisoned(_)) => return Err(previous_write_interrupted()),
+    };
+    file.save(settings)
+}
+
+/// Il thread che scriveva il file si è fermato a metà (lock avvelenato).
+fn previous_write_interrupted() -> SettingsError {
+    SettingsError::Io(io::Error::other("scrittura precedente interrotta"))
 }
 
 #[cfg(test)]
@@ -1863,7 +1920,6 @@ mod tests {
     use lynkeus_engine::Outcome;
 
     use super::*;
-    use crate::settings::SettingsProblem;
 
     fn finished(outcome: Outcome) -> JobState {
         JobState::Finished(Summary {
@@ -2243,10 +2299,107 @@ mod tests {
         assert!(!app.is_saving_settings());
     }
 
+    /// Salva in un thread e raccoglie l'esito, come farebbe la vista.
+    fn save_in_background_and_wait(app: &mut Application) {
+        app.save_settings_in_background();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.is_saving_settings() {
+            assert!(Instant::now() < deadline, "salvataggio non finito");
+            app.pump_actions();
+            thread::yield_now();
+        }
+    }
+
+    /// R-04: dopo un salvataggio fallito, il primo che riesce toglie il messaggio; un nuovo
+    /// errore lo mostra di nuovo.
+    #[test]
+    fn a_successful_save_withdraws_the_failure_notice() {
+        let dir = tempfile::tempdir().expect("cartella");
+        let path = dir.path().join(crate::settings::FILE_NAME);
+        let (file, settings, _) = SettingsFile::load(path.clone());
+        let mut app = Application::build_persistent(settings, file).expect("app");
+        let not_saved = Notice::SettingsNotSaved(SettingsProblem::WriteFailed);
+        // Una cartella al posto del file: la rinomina finale non riesce.
+        std::fs::create_dir(&path).expect("cartella al posto del file");
+
+        app.set_theme(ThemeChoice::Dark);
+        save_in_background_and_wait(&mut app);
+        assert_eq!(
+            app.notices(),
+            std::slice::from_ref(&not_saved),
+            "non salvato"
+        );
+
+        std::fs::remove_dir(&path).expect("cartella tolta");
+        app.set_theme(ThemeChoice::Light);
+        save_in_background_and_wait(&mut app);
+        assert!(app.notices().is_empty(), "salvato: il messaggio sparisce");
+
+        std::fs::remove_file(&path).expect("file tolto");
+        std::fs::create_dir(&path).expect("cartella al posto del file");
+        app.set_theme(ThemeChoice::Dark);
+        save_in_background_and_wait(&mut app);
+        assert_eq!(
+            app.notices(),
+            [not_saved],
+            "fallito di nuovo: lo dice di nuovo"
+        );
+    }
+
+    /// R-03: all'uscita, con il thread di scrittura ancora fermo sul file, il salvataggio
+    /// rinuncia dopo il limite invece di aspettare il file senza fine.
+    #[test]
+    fn exit_save_gives_up_while_the_writer_still_holds_the_file() {
+        let dir = tempfile::tempdir().expect("cartella");
+        let path = dir.path().join(crate::settings::FILE_NAME);
+        let (file, settings, _) = SettingsFile::load(path);
+        let mut app = Application::build_persistent(settings, file).expect("app");
+        app.set_theme(ThemeChoice::Dark);
+        // Un salvataggio in corso, fermo con il file in mano finché il test non lo libera.
+        let shared = Arc::clone(app.settings_file.as_ref().expect("file"));
+        let (release, released) = mpsc::channel::<()>();
+        let (held, is_held) = mpsc::channel();
+        let writer = thread::spawn(move || {
+            let guard = shared.lock();
+            held.send(()).ok();
+            released.recv_timeout(Duration::from_secs(20)).ok();
+            drop(guard);
+        });
+        is_held.recv().expect("file preso dal thread di scrittura");
+        let (_still_writing, done) = mpsc::channel();
+        app.save_job = Some(SaveJob { done });
+
+        let started = Instant::now();
+        let saved = app.save_settings();
+        let waited = started.elapsed();
+        release.send(()).ok();
+        writer.join().ok();
+        assert!(
+            waited < SETTINGS_SAVE_WAIT + Duration::from_secs(1),
+            "{waited:?}"
+        );
+        assert!(saved.is_err(), "non salvato: {saved:?}");
+    }
+
     /// Un file con `lines` righe "ar": tante parole trovate in un file solo.
     fn many_words_file(dir: &Path, lines: usize) -> PathBuf {
         let path = dir.join("parole.txt");
         std::fs::write(&path, "ar\n".repeat(lines)).expect("scritto");
+        path
+    }
+
+    /// Un file con `lines` righe di prova, ognuna con la parola "aragosta" a metà di circa
+    /// 120 caratteri di contesto, in cartelle dal nome lungo: righe copiate lunghe come
+    /// quelle vere (circa 200 byte).
+    fn realistic_rows_file(dir: &Path, lines: usize) -> PathBuf {
+        let folder = dir
+            .join("Cartella dei documenti")
+            .join("Sotto cartella di prova");
+        std::fs::create_dir_all(&folder).expect("cartelle");
+        let path = folder.join("Documento di prova.txt");
+        let line = "Lorem ipsum dolor sit amet consectetur adipiscing elit sed do \
+                    aragosta eiusmod tempor incididunt ut labore et dolore magna aliqua\n";
+        std::fs::write(&path, line.repeat(lines)).expect("scritto");
         path
     }
 
@@ -2277,16 +2430,56 @@ mod tests {
         assert!(!app.is_copying());
     }
 
-    /// Misura P-08 (C-07): `cargo test --release -p lynkeus-app --lib copy_200k --
+    /// R-05: il testo va negli appunti fino a [`MAX_CLIPBOARD_BYTES`] compresi; oltre, no.
+    #[test]
+    fn clipboard_text_up_to_the_limit() {
+        let at_limit = "a".repeat(MAX_CLIPBOARD_BYTES);
+        assert!(
+            matches!(clipboard_outcome(at_limit), CopyOutcome::Text(text) if text.len() == MAX_CLIPBOARD_BYTES)
+        );
+        let over = "a".repeat(MAX_CLIPBOARD_BYTES + 1);
+        assert!(matches!(clipboard_outcome(over), CopyOutcome::TooLarge));
+        assert!(
+            matches!(clipboard_outcome(String::new()), CopyOutcome::Text(text) if text.is_empty())
+        );
+    }
+
+    /// R-05: una selezione troppo grande per gli appunti non arriva alla vista (che la
+    /// scriverebbe negli appunti sul thread dell'interfaccia): un messaggio propone Esporta.
+    #[test]
+    fn a_copy_over_the_clipboard_limit_offers_export() {
+        let dir = tempfile::tempdir().expect("cartella");
+        realistic_rows_file(dir.path(), 45_000);
+        let mut app = Application::build(Settings::default()).expect("app");
+        app.form.add_root(dir.path().to_owned(), RootKind::Folder);
+        app.set_term("ar");
+        run_to_end(&mut app);
+        app.view_mut().select_all();
+        app.copy_selection(&(Arc::new(|| {}) as Notify));
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while app.is_copying() {
+            assert!(Instant::now() < deadline, "copia non finita");
+            app.pump_actions();
+            thread::yield_now();
+        }
+        let copied = app.take_clipboard_text().map(|text| text.len());
+        assert_eq!(copied, None, "niente negli appunti");
+        assert_eq!(app.notice(), Some(&Notice::CopyTooLarge { rows: 45_000 }));
+    }
+
+    /// Misura P-08 (C-07, R-05): `cargo test --release -p lynkeus-app --lib copy_200k --
     /// --ignored --nocapture`. Con 200 000 righe selezionate, la copia occupa il thread
-    /// dell'interfaccia per meno di 50 ms (il resto è nel thread di copia).
+    /// dell'interfaccia per meno di 50 ms (il resto è nel thread di copia) e finisce con il
+    /// messaggio che propone Esporta; il testo più lungo ammesso negli appunti
+    /// ([`MAX_CLIPBOARD_BYTES`]) ferma il thread dell'interfaccia meno di 16 ms, dalla
+    /// consegna a egui alla scrittura negli appunti del sistema.
     #[test]
     #[ignore = "misura di prestazioni, da eseguire in release"]
     fn copy_200k() {
         let dir = tempfile::tempdir().expect("cartella");
-        let file = many_words_file(dir.path(), 200_000);
+        realistic_rows_file(dir.path(), 200_000);
         let mut app = Application::build(Settings::default()).expect("app");
-        app.form.add_root(file, RootKind::File);
+        app.form.add_root(dir.path().to_owned(), RootKind::Folder);
         app.set_term("ar");
         run_to_end(&mut app);
         assert_eq!(app.results().hits.len(), 200_000);
@@ -2296,28 +2489,69 @@ mod tests {
         app.copy_selection(&notify);
         let on_ui_thread = started.elapsed();
         let mut longest_pump = Duration::ZERO;
-        let text = loop {
+        while app.is_copying() {
             let pump = Instant::now();
             app.pump_actions();
-            let taken = app.take_clipboard_text();
             longest_pump = longest_pump.max(pump.elapsed());
-            if let Some(text) = taken {
-                break text;
-            }
             assert!(
                 started.elapsed() < Duration::from_secs(60),
                 "copia non finita"
             );
             thread::sleep(Duration::from_millis(1));
-        };
+        }
         println!(
             "copy_200k: thread dell'interfaccia {on_ui_thread:?} all'avvio, \
-             {longest_pump:?} al massimo per frame, totale {:?}, {} byte",
-            started.elapsed(),
-            text.len()
+             {longest_pump:?} al massimo per frame, totale {:?}",
+            started.elapsed()
         );
         assert!(on_ui_thread < Duration::from_millis(50), "{on_ui_thread:?}");
         assert!(longest_pump < Duration::from_millis(50), "{longest_pump:?}");
+        assert!(
+            app.take_clipboard_text().is_none(),
+            "troppo per gli appunti"
+        );
+        assert_eq!(app.notice(), Some(&Notice::CopyTooLarge { rows: 200_000 }));
+
+        // Il resto del percorso, sul thread dell'interfaccia, per testi di righe vere fino a
+        // tutte le 200 000: la vista consegna il testo a egui, eframe lo scrive negli
+        // appunti del sistema con arboard (scrive davvero negli appunti di chi esegue la
+        // misura, se sono accessibili).
+        let table = export::results_table(app.i18n(), &app.results().hits, &[], 0..200_000);
+        let all = export::to_tsv(&table.rows);
+        for limit in [1 << 20, 4 << 20, MAX_CLIPBOARD_BYTES, 16 << 20, all.len()] {
+            let text = &all[..all.floor_char_boundary(limit)];
+            let ctx = egui::Context::default();
+            let handed_text = text.to_owned();
+            let handed = Instant::now();
+            ctx.copy_text(handed_text);
+            let to_egui = handed.elapsed();
+            let (utf16, system) = clipboard_write(text);
+            println!(
+                "copy_200k: {} byte, copy_text {to_egui:?}, UTF-16 {utf16:?}, \
+                 appunti {system:?}",
+                text.len()
+            );
+            if limit == MAX_CLIPBOARD_BYTES {
+                let on_ui_thread = to_egui + system.unwrap_or(utf16);
+                assert!(on_ui_thread < Duration::from_millis(16), "{on_ui_thread:?}");
+            }
+        }
+    }
+
+    /// Il costo di scrivere `text` negli appunti del sistema sul thread dell'interfaccia,
+    /// come fa eframe: la conversione in UTF-16 che arboard fa sempre (un limite inferiore)
+    /// e la scrittura vera, se gli appunti sono accessibili (in un ambiente isolato no).
+    fn clipboard_write(text: &str) -> (Duration, Option<Duration>) {
+        let started = Instant::now();
+        let utf16: Vec<u16> = std::hint::black_box(text).encode_utf16().collect();
+        std::hint::black_box(&utf16);
+        let utf16 = started.elapsed();
+        let Ok(mut clipboard) = arboard::Clipboard::new() else {
+            return (utf16, None);
+        };
+        let started = Instant::now();
+        let system = clipboard.set_text(text).ok().map(|()| started.elapsed());
+        (utf16, system)
     }
 
     /// Una radice che non esiste: la ricerca finisce subito con un avviso.

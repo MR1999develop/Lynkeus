@@ -174,6 +174,8 @@ column-sort-tooltip = Sort by this column; click again to reverse the order.
 # Name of a result row for screen readers.
 # $word (text): word found; $file (text): file; $location (text): location, e.g. "line 12".
 table-row-name = { $word }, { $file }, { $location }
+# Name of the results table for screen readers.
+table-results-name = Search results
 empty-add-root-title = Where shall we start?
 empty-add-root-text = Add a folder or a file to search in: drop them here or use the buttons.
 empty-write-term-title = Type what to find
@@ -344,6 +346,13 @@ notice-reveal-failed = Error: { $file } could not be shown in its folder. Check 
 notice-copied = { $count ->
         [one] 1 row copied to the clipboard.
        *[other] { $count } rows copied to the clipboard.
+    }
+# Instead of the copy, when the text exceeds the clipboard limit; next to it there is the
+# Export… button (menu-export).
+# $count (number): selected rows.
+notice-copy-too-large = { $count ->
+        [one] The selected row is too long for the clipboard: save it to a file with Export.
+       *[other] The { $count } selected rows are too many for the clipboard: save them to a file with Export.
     }
 # $count (number): rows written; $file (text): exported file.
 notice-exported = { $count ->

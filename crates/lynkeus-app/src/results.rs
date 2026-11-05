@@ -12,6 +12,11 @@
 //! File → Posizione; con un ordinamento scelto ogni riga entra subito al suo posto (a
 //! parità resta l'ordine d'arrivo, come nell'ordinamento completo).
 //!
+//! Inerzia del display: i clic arrivano per risultato, non per posizione
+//! ([`ResultsView::click_hit`]), e le righe che entrano sopra la riga da tenere ferma (il
+//! cursore se è in vista, altrimenti la prima riga visibile) diventano uno scorrimento
+//! della tabella ([`ResultsView::take_scroll_shift`]): nulla si sposta sotto il puntatore.
+//!
 //! Gli indici per documento e per gruppo di righe consecutive dello stesso documento si
 //! aggiornano a ogni cambio dell'ordine: posizione del cursore e passi tra i risultati
 //! ([`ResultsView::step_target`]) costano O(1), anche con 200 000 righe.
@@ -131,6 +136,19 @@ pub struct ResultsView {
     /// Vero se la riga del cursore deve prendere il focus della tastiera (dopo un clic o
     /// una freccia), finché la tabella non la disegna.
     focus_pending: bool,
+    /// Le posizioni della prima e dell'ultima riga dell'ultimo disegno della tabella.
+    visible: Option<(usize, usize)>,
+    /// La riga da tenere ferma sullo schermo quando entrano righe sopra di lei.
+    pinned: Option<Pinned>,
+}
+
+/// La riga da tenere ferma sullo schermo e dov'era quando la tabella l'ha disegnata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Pinned {
+    /// Il risultato.
+    hit: usize,
+    /// La sua posizione in quel disegno.
+    position: usize,
 }
 
 impl ResultsView {
@@ -182,6 +200,7 @@ impl ResultsView {
             let spec = SortSpec::ascending(SortColumn::File);
             sort_order(&mut self.order, spec, hits, &self.docs);
             self.reindex();
+            self.forget_visible_rows();
             self.scroll_pending = self.cursor.is_some();
         }
     }
@@ -192,6 +211,7 @@ impl ResultsView {
         self.sort = Some(spec);
         sort_order(&mut self.order, spec, hits, &self.docs);
         self.reindex();
+        self.forget_visible_rows();
         self.scroll_pending = self.cursor.is_some();
     }
 
@@ -233,12 +253,66 @@ impl ResultsView {
             .filter(|&hit| self.is_selected(hit))
     }
 
-    /// Clic sulla riga in posizione `position`: cambia la selezione, porta lì il cursore e
-    /// chiede il focus della tastiera per quella riga.
-    pub fn click(&mut self, position: usize, kind: ClickKind) {
-        if self.place_cursor(position, kind) {
-            self.focus_pending = true;
+    /// Clic sulla riga del risultato `hit`: cambia la selezione, porta lì il cursore e
+    /// chiede il focus della tastiera per quella riga. Il risultato, non la posizione: con
+    /// un ordinamento scelto le righe nuove entrano sopra durante la ricerca e la posizione
+    /// cliccata può mostrare ormai un altro risultato. Un risultato non mostrato non cambia
+    /// nulla.
+    pub fn click_hit(&mut self, hit: usize, kind: ClickKind) {
+        if let Some(position) = self.position(hit) {
+            self.click_at(position, kind);
         }
+    }
+
+    /// Doppio clic sulla riga del risultato `hit`: vero se va aperto, cioè se il primo clic
+    /// era sullo stesso risultato (il cursore è lì). Se tra i due clic le righe si sono
+    /// spostate e il secondo è caduto su un altro risultato, vale come clic semplice su
+    /// quello e non apre nulla.
+    pub fn double_click_hit(&mut self, hit: usize) -> bool {
+        if self.cursor == Some(hit) && self.position(hit).is_some() {
+            return true;
+        }
+        self.click_hit(hit, ClickKind::Replace);
+        false
+    }
+
+    /// Il focus della tastiera è arrivato con Tab o F6 sulla riga del risultato `hit`: il
+    /// cursore va lì e la selezione resta com'è, come nella ListView di Windows (Ctrl+C
+    /// copia ancora le righe scelte, Invio apre la riga con il focus). Un risultato non
+    /// mostrato non cambia nulla.
+    pub fn focus_hit(&mut self, hit: usize) {
+        if self.position(hit).is_some() {
+            self.cursor = Some(hit);
+            self.pin();
+        }
+    }
+
+    /// La tabella ha appena disegnato le righe dalla posizione `first` a `last` comprese.
+    /// Se poi entrano righe ordinate sopra, resta ferma sullo schermo la riga del cursore,
+    /// se è tra queste, altrimenti la prima: ciò che l'utente guarda o sta per cliccare non
+    /// si sposta, e la riga selezionata resta in vista ([`ResultsView::take_scroll_shift`]).
+    pub fn set_visible_rows(&mut self, first: usize, last: usize) {
+        self.visible = Some((first, last));
+        self.pin();
+    }
+
+    /// Di quante righe è scesa la riga ferma ([`ResultsView::set_visible_rows`]) per le
+    /// righe entrate sopra di lei: la tabella scorre di altrettante righe, una volta sola.
+    /// Zero se non si è spostata; zero anche dopo un riordino (ordinamento scelto, fine
+    /// della ricerca), che porta in vista il cursore ([`ResultsView::take_scroll_target`]).
+    pub fn take_scroll_shift(&mut self) -> usize {
+        let Some(pinned) = self.pinned else {
+            return 0;
+        };
+        let Some(now) = self.position(pinned.hit) else {
+            self.pinned = None;
+            return 0;
+        };
+        self.pinned = Some(Pinned {
+            position: now,
+            ..pinned
+        });
+        now.saturating_sub(pinned.position)
     }
 
     /// Sposta il cursore di `delta` righe (frecce); con `extend` allarga la selezione
@@ -258,7 +332,7 @@ impl ResultsView {
         } else {
             ClickKind::Replace
         };
-        self.click(target, kind);
+        self.click_at(target, kind);
         self.scroll_pending = true;
     }
 
@@ -341,6 +415,34 @@ impl ResultsView {
         self.selected_count = 0;
     }
 
+    /// Come un clic sulla riga in posizione `position`, più la richiesta del focus.
+    fn click_at(&mut self, position: usize, kind: ClickKind) {
+        if self.place_cursor(position, kind) {
+            self.focus_pending = true;
+        }
+    }
+
+    /// Ferma sullo schermo la riga del cursore se era tra quelle disegnate, altrimenti la
+    /// prima disegnata; nulla prima del primo disegno o dopo un riordino.
+    fn pin(&mut self) {
+        let Some((first, last)) = self.visible else {
+            self.pinned = None;
+            return;
+        };
+        let position = self
+            .cursor_position()
+            .filter(|position| (first..=last).contains(position))
+            .unwrap_or(first);
+        self.pinned = self.hit_at(position).map(|hit| Pinned { hit, position });
+    }
+
+    /// Dopo un riordino le posizioni disegnate non valgono più: niente riga ferma finché la
+    /// tabella non ridisegna.
+    fn forget_visible_rows(&mut self) {
+        self.visible = None;
+        self.pinned = None;
+    }
+
     /// Cambia selezione e cursore come un clic su `position`; falso fuori dai limiti.
     fn place_cursor(&mut self, position: usize, kind: ClickKind) -> bool {
         let Some(hit) = self.hit_at(position) else {
@@ -360,6 +462,7 @@ impl ResultsView {
             ClickKind::Range => self.select_range_to(position),
         }
         self.cursor = Some(hit);
+        self.pin();
         true
     }
 
@@ -748,6 +851,13 @@ mod tests {
         assert_eq!(view.sort(), Some(SortSpec::ascending(SortColumn::Word)));
     }
 
+    /// Clic sulla riga in posizione `position`, come la tabella: sul risultato che mostra
+    /// (nessuno fuori dai limiti).
+    fn click_row(view: &mut ResultsView, position: usize, kind: ClickKind) {
+        let hit = view.hit_at(position).unwrap_or(usize::MAX);
+        view.click_hit(hit, kind);
+    }
+
     #[test]
     fn clicking_the_same_header_reverses() {
         let first = SortSpec::after_click(None, SortColumn::Word);
@@ -785,18 +895,18 @@ mod tests {
         let mut view = ResultsView::new(None);
         view.finish(&hits, &roots());
         // Clic semplice: una riga.
-        view.click(1, ClickKind::Replace);
+        click_row(&mut view, 1, ClickKind::Replace);
         assert_eq!(view.selected_count(), 1);
         // Ctrl+clic: aggiunge, poi toglie.
-        view.click(3, ClickKind::Toggle);
+        click_row(&mut view, 3, ClickKind::Toggle);
         assert_eq!(view.selected_count(), 2);
-        view.click(3, ClickKind::Toggle);
+        click_row(&mut view, 3, ClickKind::Toggle);
         assert_eq!(view.selected_count(), 1);
         // Maiusc+clic: dall'ancora (posizione 3, l'ultimo Ctrl+clic) alla 0.
-        view.click(0, ClickKind::Range);
+        click_row(&mut view, 0, ClickKind::Range);
         assert_eq!(view.selected_count(), 4);
         // Fuori dai limiti: nulla cambia.
-        view.click(99, ClickKind::Replace);
+        click_row(&mut view, 99, ClickKind::Replace);
         assert_eq!(view.selected_count(), 4);
         view.clear_selection();
         assert_eq!(view.selected_count(), 0);
@@ -809,7 +919,7 @@ mod tests {
         let hits = sample();
         let mut view = ResultsView::new(None);
         view.finish(&hits, &roots());
-        view.click(0, ClickKind::Replace);
+        click_row(&mut view, 0, ClickKind::Replace);
         let chosen: Vec<usize> = view.selected_hits().collect();
         view.set_sort(SortSpec::ascending(SortColumn::Word), &hits, &roots());
         assert_eq!(view.selected_hits().collect::<Vec<_>>(), chosen);
@@ -909,7 +1019,7 @@ mod tests {
         view.finish(&hits, &roots());
         view.jump_to(1);
         assert_eq!(view.focus_request(), None);
-        view.click(2, ClickKind::Replace);
+        click_row(&mut view, 2, ClickKind::Replace);
         assert_eq!(view.focus_request(), view.hit_at(2));
         view.focus_done();
         assert_eq!(view.focus_request(), None);
@@ -1053,13 +1163,149 @@ mod tests {
         );
     }
 
+    /// Righe in arrivo durante una ricerca ordinata per parola: `early` arrivano prima,
+    /// `late` dopo.
+    fn sorted_by_word(early: &[&str], late: &[&str]) -> (ResultsView, Vec<Hit>) {
+        let hits: Vec<Hit> = early
+            .iter()
+            .chain(late)
+            .enumerate()
+            .map(|(line, word)| hit("a.txt", u32::try_from(line).unwrap_or(0), word))
+            .collect();
+        let mut view = ResultsView::new(Some(SortSpec::ascending(SortColumn::Word)));
+        view.extend_to(&hits[..early.len()], &roots());
+        (view, hits)
+    }
+
+    /// R-01: righe inserite sopra la prima riga visibile (nessun cursore in vista): la
+    /// tabella scorre di altrettante righe e la prima riga visibile resta la stessa.
+    #[test]
+    fn rows_inserted_above_the_first_visible_row_keep_it_in_place() {
+        let (mut view, hits) = sorted_by_word(&["d", "e", "f", "g", "h"], &["a", "b", "z"]);
+        view.set_visible_rows(2, 4);
+        let first_visible = view.hit_at(2);
+        assert_eq!(view.take_scroll_shift(), 0, "nulla di inserito");
+        view.extend_to(&hits, &roots());
+        // "a" e "b" entrano sopra, "z" sotto.
+        assert_eq!(view.take_scroll_shift(), 2);
+        assert_eq!(view.hit_at(4), first_visible);
+        assert_eq!(view.take_scroll_shift(), 0, "una volta sola");
+    }
+
+    /// R-01: righe inserite sotto la riga ferma non fanno scorrere.
+    #[test]
+    fn rows_inserted_below_do_not_scroll() {
+        let (mut view, hits) = sorted_by_word(&["a", "b", "c"], &["x", "y"]);
+        view.set_visible_rows(0, 2);
+        view.extend_to(&hits, &roots());
+        assert_eq!(view.take_scroll_shift(), 0);
+    }
+
+    /// R-01: con la riga del cursore in vista resta ferma lei, anche per le righe inserite
+    /// tra la prima visibile e il cursore: la riga selezionata resta in vista e sotto il
+    /// puntatore.
+    #[test]
+    fn the_visible_cursor_row_stays_in_place() {
+        let (mut view, hits) = sorted_by_word(&["a", "c", "e", "g"], &["b", "d", "f0"]);
+        let g = view.hit_at(3).expect("g");
+        view.click_hit(g, ClickKind::Replace);
+        view.take_scroll_target();
+        view.set_visible_rows(1, 3);
+        view.extend_to(&hits, &roots());
+        // "b", "d" e "f0" entrano tutte sopra "g".
+        assert_eq!(view.take_scroll_shift(), 3);
+        assert_eq!(view.cursor_position(), Some(6));
+        assert_eq!(view.cursor_hit(), Some(g));
+
+        // Cursore fuori dalle righe visibili: ferma la prima visibile.
+        let (mut view, hits) = sorted_by_word(&["a", "c", "e", "g"], &["b", "d"]);
+        view.click_hit(view.hit_at(3).expect("g"), ClickKind::Replace);
+        view.set_visible_rows(0, 1);
+        view.extend_to(&hits, &roots());
+        assert_eq!(view.take_scroll_shift(), 0, "\"a\" resta la prima");
+    }
+
+    /// R-01: un riordino (ordinamento scelto, fine della ricerca) non fa scorrere della
+    /// differenza: porta in vista il cursore.
+    #[test]
+    fn a_resort_brings_the_cursor_into_view_instead_of_scrolling() {
+        let (mut view, hits) = sorted_by_word(&["d", "e", "f"], &["a", "b"]);
+        view.click_hit(view.hit_at(2).expect("f"), ClickKind::Replace);
+        view.take_scroll_target();
+        view.set_visible_rows(0, 2);
+        view.extend_to(&hits, &roots());
+        view.set_sort(SortSpec::ascending(SortColumn::Position), &hits, &roots());
+        assert_eq!(view.take_scroll_shift(), 0);
+        assert_eq!(view.take_scroll_target(), view.cursor_position());
+    }
+
+    /// R-01: il clic agisce sul risultato identificato, non sulla posizione: dopo un
+    /// inserimento sopra, la stessa posizione mostra un altro risultato.
+    #[test]
+    fn a_click_acts_on_the_identified_result() {
+        let (mut view, hits) = sorted_by_word(&["c", "d"], &["a"]);
+        let d = view.hit_at(1).expect("d");
+        view.extend_to(&hits, &roots());
+        assert_ne!(view.hit_at(1), Some(d), "\"d\" si è spostata");
+        view.click_hit(d, ClickKind::Replace);
+        assert_eq!(view.cursor_hit(), Some(d));
+        assert_eq!(view.selected_hits().collect::<Vec<_>>(), [d]);
+        assert_eq!(view.focus_request(), Some(d));
+        // Un risultato che non c'è non cambia nulla.
+        view.click_hit(99, ClickKind::Replace);
+        assert_eq!(view.cursor_hit(), Some(d));
+    }
+
+    /// R-01: doppio clic dopo un inserimento: si apre il risultato del primo clic; se il
+    /// secondo clic cade su un altro risultato, lo seleziona e non apre nulla.
+    #[test]
+    fn a_double_click_after_an_insertion_opens_the_clicked_result() {
+        let (mut view, hits) = sorted_by_word(&["c", "d", "e"], &["a", "b"]);
+        let d = view.hit_at(1).expect("d");
+        // Come nella finestra: la tabella disegna, poi arriva il primo clic, poi le righe.
+        view.set_visible_rows(0, 2);
+        view.click_hit(d, ClickKind::Replace);
+        view.extend_to(&hits, &roots());
+        assert_eq!(
+            view.take_scroll_shift(),
+            2,
+            "\"d\" resta sotto il puntatore"
+        );
+        assert!(view.double_click_hit(d), "si apre \"d\"");
+        assert_eq!(view.cursor_hit(), Some(d));
+
+        let other = view.hit_at(0).expect("a");
+        assert!(
+            !view.double_click_hit(other),
+            "secondo clic su un'altra riga"
+        );
+        assert_eq!(view.cursor_hit(), Some(other));
+        assert_eq!(view.selected_hits().collect::<Vec<_>>(), [other]);
+    }
+
+    /// R-02: il focus arrivato con Tab o F6 porta lì il cursore e lascia la selezione.
+    #[test]
+    fn focus_moves_the_cursor_and_keeps_the_selection() {
+        let hits = sample();
+        let mut view = ResultsView::new(None);
+        view.finish(&hits, &roots());
+        view.select_all();
+        let second = view.hit_at(1).expect("riga");
+        view.focus_hit(second);
+        assert_eq!(view.cursor_hit(), Some(second));
+        assert_eq!(view.selected_count(), 4);
+        assert_eq!(view.focus_request(), None, "il focus ce l'ha già");
+        view.focus_hit(99);
+        assert_eq!(view.cursor_hit(), Some(second));
+    }
+
     /// C-17: il riordino di fine ricerca riporta in vista la riga del cursore.
     #[test]
     fn finish_brings_the_cursor_row_back_into_view() {
         let hits = sample();
         let mut view = ResultsView::new(None);
         view.extend_to(&hits, &roots());
-        view.click(0, ClickKind::Replace);
+        click_row(&mut view, 0, ClickKind::Replace);
         view.take_scroll_target();
         view.finish(&hits, &roots());
         assert_eq!(

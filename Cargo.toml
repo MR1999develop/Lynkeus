@@ -43,6 +43,9 @@ lynkeus-engine = { path = "crates/lynkeus-engine" }
 
 # Esterne.
 anyhow = "1.0.104"
+# Solo per misurare la copia negli appunti (dev-dependency, test ignorato): la libreria con
+# cui eframe scrive negli appunti, già nell'albero tramite egui-winit.
+arboard = { version = "3.7.0", default-features = false }
 # Chiave della cache del testo estratto. `pure`: niente C né assembly da compilare (anche il
 # controllo per Linux da Windows funziona senza compilatore C del target).
 blake3 = { version = "1.8.7", default-features = false, features = ["std", "pure"] }
