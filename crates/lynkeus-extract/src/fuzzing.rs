@@ -4,9 +4,10 @@
 //! Punti d'ingresso per i target di `fuzz/` (feature `fuzzing`, fuori dall'API normale):
 //! i parser propri sui loro byte, senza il file composto né il contesto d'estrazione.
 //!
-//! Ogni funzione accetta byte qualsiasi e scarta il risultato: l'unica proprietà cercata è
-//! che non vada mai in panic né in ciclo. Il frame del protocollo si prova con l'API
-//! pubblica di [`protocol`](crate::protocol).
+//! Ogni funzione accetta byte qualsiasi e non deve mai andare in panic né in ciclo; dove c'è
+//! un oracolo oltre al crash lo controlla con un'asserzione (che il fuzzer vede come
+//! fallimento). Il frame del protocollo, la ricerca e il testo si provano con l'API
+//! pubblica dei crate.
 
 /// Piece table di un .doc: i primi 4 byte (little-endian) sono la lunghezza del flusso
 /// `WordDocument`, il resto è la tabella (`0Table`/`1Table`).
@@ -23,4 +24,10 @@ pub fn ppt_records(data: &[u8]) {
 /// Tokenizer RTF.
 pub fn rtf(data: &[u8]) {
     crate::extract::rtf::fuzz(data);
+}
+
+/// Lettore XML (dialetto dei pacchetti e dei capitoli XHTML). Oracoli: ogni chiusura
+/// corrisponde all'ultima apertura, due letture danno gli stessi eventi.
+pub fn xml_reader(data: &[u8]) {
+    crate::extract::xml::fuzz(data);
 }

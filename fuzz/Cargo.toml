@@ -15,7 +15,10 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4.13"
+lynkeus-core = { path = "../crates/lynkeus-core" }
 lynkeus-extract = { path = "../crates/lynkeus-extract", features = ["fuzzing"] }
+# Solo per i vincoli generici dell'andata e ritorno del protocollo (già nell'albero).
+serde = "1.0.229"
 
 # Un workspace a sé: niente eredità dal workspace del progetto.
 [workspace]
@@ -48,6 +51,27 @@ bench = false
 [[bin]]
 name = "protocol_frame"
 path = "fuzz_targets/protocol_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "find_words"
+path = "fuzz_targets/find_words.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "xml_reader"
+path = "fuzz_targets/xml_reader.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "text_sniff"
+path = "fuzz_targets/text_sniff.rs"
 test = false
 doc = false
 bench = false

@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc f3beec63d113cb27159f1d7d6a745ef6e46e9909de270bf94fdef54285924421 # shrinks to chars = ['가']
+cc 8f5aaa5e285e7ad6982ba7060b374b430b321476af371666a4de3d669c09e615 # shrinks to text = "한국ệ", terms = ["한"], options = MatchOptions { case: Sensitive, accents: Ignored, wildcards: Literal }
+cc 33b8987f9f85253ae10f3b1018087b163d983e722be97f79575d109508a56d61 # shrinks to text = "한국", terms = ["구"], options = MatchOptions { case: Sensitive, accents: Distinct, wildcards: Literal }

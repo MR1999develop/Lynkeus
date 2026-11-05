@@ -8,9 +8,10 @@
 //! # Dalla corrispondenza alla parola
 //!
 //! 1. **Corrispondenza.** Ogni termine trova le sue corrispondenze (non sovrapposte, da
-//!    sinistra). Con gli accenti distinti una corrispondenza non è mai seguita da un segno
-//!    combinante `Mn`: nel testo NFD `citta` + `◌̀` è "città", che "citta" non deve trovare
-//!    (la regola sta nel pattern, vedi `pattern.rs`).
+//!    sinistra). Una corrispondenza non è mai seguita da ciò che continuerebbe il suo ultimo
+//!    carattere: un segno combinante `Mn` con gli accenti distinti (nel testo NFD `citta` +
+//!    `◌̀` è "città", che "citta" non deve trovare), un jamo hangul con qualunque opzione
+//!    ("구" non trova il "국" decomposto). La regola sta nel pattern, vedi `pattern.rs`.
 //! 2. **Jolly di bordo.** Se il termine inizia (finisce) con `*`, dalla parte catturata da
 //!    quel `*` si tolgono i segni di punteggiatura iniziali (finali): "c?rt*" su "carta,"
 //!    evidenzia "carta", e "*arta" su "«carta" evidenzia "carta". La punteggiatura che il
@@ -520,6 +521,8 @@ fn window(s: &str, focus: &Range<usize>, max_chars: usize) -> Range<usize> {
 
 #[cfg(test)]
 mod tests {
+    use unicode_normalization::UnicodeNormalization;
+
     use super::*;
     use crate::query::{AccentMode, CaseMode, Combine, MatchOptions, Term, WildcardMode};
 
@@ -687,6 +690,32 @@ mod tests {
             highlights(&["citt?"], opts, nfd),
             [["citta\u{300}"], ["citta"]]
         );
+    }
+
+    /// Hangul NFC e NFD (jamo) con ogni opzione degli accenti: "한국" si trova in entrambe le
+    /// forme; "구" non è una parte del "국" decomposto, come non lo è di quello precomposto;
+    /// `?` prende la sillaba intera.
+    #[test]
+    fn hangul_in_nfc_and_nfd_text() {
+        let nfd: String = "한국 사람".nfd().collect();
+        for mode in [AccentMode::Distinct, AccentMode::Ignored] {
+            let opts = accents(mode);
+            assert_eq!(
+                words_with(&["한국"], opts, "한국 사람"),
+                ["한국"],
+                "{mode:?}"
+            );
+            assert_eq!(words_with(&["한국"], opts, &nfd).len(), 1, "{mode:?}");
+            assert!(words_with(&["구"], opts, "국").is_empty(), "{mode:?}");
+            assert!(words_with(&["구"], opts, &nfd).is_empty(), "{mode:?}");
+            let nfd_highlights = highlights(&["한?"], opts, &nfd);
+            let shown: Vec<String> = nfd_highlights
+                .iter()
+                .flatten()
+                .map(|h| h.nfc().collect())
+                .collect();
+            assert_eq!(shown, ["한국"], "{mode:?}");
+        }
     }
 
     #[test]

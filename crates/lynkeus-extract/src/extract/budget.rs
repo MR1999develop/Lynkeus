@@ -10,13 +10,14 @@
 //!   uno (oltre non si decomprime nulla), poi a ogni lettura controlla voce, rapporto di
 //!   compressione e totale. Un limite superato è un `io::Error` che porta [`LimitHit`]:
 //!   attraversa le librerie (zip, quick-xml, lettore di testo) e
-//!   [`classify_io`] lo riconosce.
+//!   [`classify_io`] lo riconosce. Per le voci zip il rapporto usa i byte compressi davvero
+//!   letti dal contenitore ([`CountingSource`]), non quelli dichiarati.
 //! - [`check_declared`] rifiuta subito le voci che già nell'intestazione dichiarano dimensioni
 //!   oltre i limiti; le dimensioni dichiarate non bastano mai da sole, perché possono mentire.
 
 use std::cell::Cell;
 use std::fmt;
-use std::io::{self, Read};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::rc::Rc;
 
 use crate::error::ExtractError;
@@ -169,13 +170,92 @@ fn ratio_exceeded(decompressed: u64, compressed: u64, limits: &ArchiveLimits) ->
         && decompressed > compressed.saturating_mul(u64::from(limits.max_compression_ratio))
 }
 
+/// Conta i byte letti da un contenitore (lo zip in memoria o su disco), condiviso con le
+/// voci che se ne leggono: il rapporto di compressione di una voce si calcola sui byte
+/// compressi che la libreria ha davvero consumato, non su quelli dichiarati.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ReadCounter(Rc<Cell<u64>>);
+
+impl ReadCounter {
+    /// Byte letti finora dal contenitore.
+    pub fn total(&self) -> u64 {
+        self.0.get()
+    }
+
+    fn add(&self, n: usize) {
+        let n = u64::try_from(n).unwrap_or(u64::MAX);
+        self.0.set(self.0.get().saturating_add(n));
+    }
+}
+
+/// Una sorgente (lettura e posizionamento) che conta i byte letti in un [`ReadCounter`].
+pub(crate) struct CountingSource<R> {
+    inner: R,
+    counter: ReadCounter,
+}
+
+impl<R> CountingSource<R> {
+    /// Avvolge `inner`; il contatore parte da zero.
+    pub fn new(inner: R) -> CountingSource<R> {
+        CountingSource {
+            inner,
+            counter: ReadCounter::default(),
+        }
+    }
+
+    /// Il contatore dei byte letti.
+    pub fn counter(&self) -> ReadCounter {
+        self.counter.clone()
+    }
+
+    /// La sorgente avvolta.
+    pub fn into_inner(self) -> R {
+        self.inner
+    }
+}
+
+impl<R: Read> Read for CountingSource<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.counter.add(n);
+        Ok(n)
+    }
+}
+
+impl<R: Seek> Seek for CountingSource<R> {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        self.inner.seek(pos)
+    }
+}
+
+/// I byte compressi da cui viene un flusso, per il rapporto di compressione.
+#[derive(Debug, Clone)]
+enum Compressed {
+    /// Noti in anticipo: l'intero file gzip, l'intero archivio 7z.
+    Known(u64),
+    /// Letti dal contenitore da quando il flusso è cominciato (`start` è il totale del
+    /// contatore in quel momento). Una voce zip che dichiara più byte compressi di quelli
+    /// che il suo flusso usa (riempimento dopo la fine del flusso deflate) non abbassa così
+    /// il rapporto.
+    Counted { counter: ReadCounter, start: u64 },
+}
+
+impl Compressed {
+    fn bytes(&self) -> u64 {
+        match self {
+            Compressed::Known(bytes) => *bytes,
+            Compressed::Counted { counter, start } => counter.total().saturating_sub(*start),
+        }
+    }
+}
+
 /// Un flusso decompresso con i limiti del [`Budget`].
 pub(crate) struct LimitedReader<R> {
     inner: io::Take<R>,
     read: u64,
     max_entry: u64,
-    /// Byte compressi della voce, per il rapporto; `None` se il flusso non è compresso.
-    compressed: Option<u64>,
+    /// Byte compressi del flusso, per il rapporto; `None` se il flusso non è compresso.
+    compressed: Option<Compressed>,
     budget: Rc<Budget>,
     /// Falso per il flusso di un archivio intero (il tar dentro un `.tar.gz`): i suoi byte li
     /// contano già le voci.
@@ -185,9 +265,20 @@ pub(crate) struct LimitedReader<R> {
 }
 
 impl<R: Read> LimitedReader<R> {
-    /// Avvolge `inner`; `compressed` sono i byte della voce nell'archivio (limitati dalla
-    /// dimensione del contenitore), `None` per un file non compresso.
+    /// Avvolge `inner`; `compressed` sono i byte compressi da cui viene (limitati dalla
+    /// dimensione del contenitore), `None` per un flusso non compresso.
     pub fn new(inner: R, budget: Rc<Budget>, compressed: Option<u64>) -> LimitedReader<R> {
+        LimitedReader::entry(inner, budget, compressed.map(Compressed::Known))
+    }
+
+    /// Avvolge la voce `inner` di uno zip: i byte compressi sono quelli che `counter` (il
+    /// contatore della sorgente dello zip) conta da adesso.
+    pub fn counted(inner: R, budget: Rc<Budget>, counter: ReadCounter) -> LimitedReader<R> {
+        let start = counter.total();
+        LimitedReader::entry(inner, budget, Some(Compressed::Counted { counter, start }))
+    }
+
+    fn entry(inner: R, budget: Rc<Budget>, compressed: Option<Compressed>) -> LimitedReader<R> {
         let max_entry = budget.limits().max_entry_size.bytes();
         LimitedReader {
             inner: inner.take(max_entry.saturating_add(1)),
@@ -209,7 +300,7 @@ impl<R: Read> LimitedReader<R> {
             inner: inner.take(max.saturating_add(1)),
             read: 0,
             max_entry: max,
-            compressed: Some(compressed),
+            compressed: Some(Compressed::Known(compressed)),
             budget,
             counted: false,
             over_max: LimitKind::ArchiveSize,
@@ -225,8 +316,8 @@ impl<R: Read> Read for LimitedReader<R> {
         if self.read > self.max_entry {
             return Err(limit_error(self.over_max));
         }
-        if let Some(compressed) = self.compressed
-            && ratio_exceeded(self.read, compressed, self.budget.limits())
+        if let Some(compressed) = &self.compressed
+            && ratio_exceeded(self.read, compressed.bytes(), self.budget.limits())
         {
             return Err(limit_error(LimitKind::CompressionRatio));
         }

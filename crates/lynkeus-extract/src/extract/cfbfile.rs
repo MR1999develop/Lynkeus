@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Copyright (C) 2026 MR
 
-//! File composti OLE (CFB) dei formati Office 97-2003 (.doc, .ppt): apertura con `cfb` e
-//! lettura dei flussi entro i limiti.
+//! File composti OLE (CFB) dei formati Office 97-2003 (.doc, .ppt, .xls): apertura con `cfb`
+//! e lettura dei flussi entro i limiti.
 //!
 //! Il file si legge in memoria entro il massimo per voce; ogni flusso si copia in memoria con
 //! un [`LimitedReader`] (massimo per voce e totale del file radice), mai fidandosi della
@@ -46,6 +46,23 @@ impl Compound {
     }
 }
 
+/// Un file composto nuovo, in memoria, con il solo flusso `name` (dalla radice) di contenuto
+/// `data`: a una libreria che rilegge il file composto per conto suo si dà così proprio il
+/// flusso che si è già esaminato, qualunque cosa contenesse la directory originale.
+pub(crate) fn single_stream(name: &str, data: &[u8]) -> Result<Vec<u8>, ExtractError> {
+    let written = (|| -> std::io::Result<Vec<u8>> {
+        let mut file = CompoundFile::create(Cursor::new(Vec::new()))?;
+        {
+            let mut stream = file.create_stream(name)?;
+            std::io::Write::write_all(&mut stream, data)?;
+            std::io::Write::flush(&mut stream)?;
+        }
+        file.flush()?;
+        Ok(file.into_inner().into_inner())
+    })();
+    written.map_err(ExtractError::from_io)
+}
+
 /// L'intero senza segno a 16 bit little-endian all'offset `at`, o `None` se i byte mancano.
 pub(crate) fn u16_at(bytes: &[u8], at: usize) -> Option<u16> {
     let end = at.checked_add(2)?;
@@ -68,6 +85,21 @@ pub(crate) fn to_usize(value: u32) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn single_stream_round_trip() {
+        let data = vec![7_u8; 10_000];
+        let bytes = single_stream("Workbook", &data).unwrap_or_default();
+        let file = CompoundFile::open(Cursor::new(bytes));
+        let Ok(mut file) = file else {
+            panic!("file composto non valido");
+        };
+        assert!(file.is_stream("Workbook"));
+        let mut read = Vec::new();
+        let opened = file.open_stream("Workbook");
+        assert!(opened.is_ok_and(|mut s| std::io::Read::read_to_end(&mut s, &mut read).is_ok()));
+        assert_eq!(read, data);
+    }
 
     #[test]
     fn little_endian_reads_are_bounded() {

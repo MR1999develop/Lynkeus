@@ -14,9 +14,10 @@
 //!   Unicode (negativo = N + 65536, coppie surrogate unite) seguito da `\ucN` caratteri di
 //!   ripiego saltati (1 se non dichiarato). I byte non ASCII fuori da `\'hh` usano la stessa
 //!   code page.
-//! - Paragrafi: `\par`, `\sect`, `\page`, `\cell`, `\row` e `\` seguito da un a capo;
-//!   `\line` è un a capo dentro il paragrafo, `\tab` una tabulazione. Gli a capo del
-//!   sorgente non contano.
+//! - Paragrafi: `\par`, `\sect`, `\page`, `\cell`, `\row` e `\` seguito da un a capo, fuori
+//!   dalle destinazioni saltate (quelli di una nota non spezzano il paragrafo che la
+//!   contiene); `\line` è un a capo dentro il paragrafo, `\tab` una tabulazione. Gli a capo
+//!   del sorgente non contano.
 //!
 //! Il tokenizer è lineare nei byte e non alloca da numeri del file: un parametro numerico è
 //! letto con saturazione, una parola di controllo oltre [`MAX_WORD_BYTES`] è ignorata.
@@ -227,6 +228,15 @@ impl Parser<'_, '_> {
         Ok(())
     }
 
+    /// Un segno di fine paragrafo del documento: dentro una destinazione saltata (nota,
+    /// commento, intestazione) appartiene al testo saltato e non chiude il paragrafo intorno.
+    fn paragraph_mark(&mut self) -> Result<(), Fail> {
+        if self.group.skip {
+            return Ok(());
+        }
+        self.end_paragraph()
+    }
+
     /// Dopo una barra rovesciata: simbolo, `\'hh` o parola di controllo.
     fn control(&mut self) -> Result<(), Fail> {
         let Some(&next) = self.bytes.get(self.at) else {
@@ -254,7 +264,7 @@ impl Parser<'_, '_> {
                 self.flush_pending();
                 self.group.skip = true;
             }
-            b'\r' | b'\n' => self.end_paragraph()?,
+            b'\r' | b'\n' => self.paragraph_mark()?,
             _ if self.consume_fallback() => {}
             b'\\' | b'{' | b'}' => self.byte(next),
             b'~' => self.text_char('\u{A0}'),
@@ -324,7 +334,7 @@ impl Parser<'_, '_> {
             return Ok(());
         }
         match word {
-            "par" | "sect" | "page" | "cell" | "row" => self.end_paragraph()?,
+            "par" | "sect" | "page" | "cell" | "row" => self.paragraph_mark()?,
             "line" => self.text_char('\n'),
             "tab" => self.text_char('\t'),
             "emdash" => self.text_char('\u{2014}'),
@@ -438,6 +448,20 @@ Stasera si mangia l'aragosta.\\par\r\n}";
 {\\*\\generator Writer;}{\\pict\\pngblip 89504e47}{\\field{\\*\\fldinst HYPERLINK x}{\\fldrslt link}}\
 testo\\par}";
         assert_eq!(paragraphs_of(rtf), Ok(vec!["linktesto".to_owned()]));
+    }
+
+    /// I segni di fine paragrafo dentro una destinazione saltata (nota, commento,
+    /// intestazione) non chiudono il paragrafo del testo intorno.
+    #[test]
+    fn paragraph_marks_inside_skipped_destinations() {
+        let one = Ok(vec!["La cena di aragosta".to_owned(), "Poi".to_owned()]);
+        for rtf in [
+            &b"{\\rtf1 La cena{\\footnote\\pard nota\\par} di aragosta\\par Poi\\par}"[..],
+            b"{\\rtf1 La cena{\\*\\annotation commento\\par altro\\cell\\row} di aragosta\\par Poi}",
+            b"{\\rtf1 La cena{\\header\\pard testata\\sect\\page\\\n} di aragosta\\par Poi}",
+        ] {
+            assert_eq!(paragraphs_of(rtf), one, "{}", String::from_utf8_lossy(rtf));
+        }
     }
 
     #[test]

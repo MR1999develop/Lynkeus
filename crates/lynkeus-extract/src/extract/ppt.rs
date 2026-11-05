@@ -172,13 +172,24 @@ fn current_edit(user: &[u8]) -> Result<Option<usize>, ExtractError> {
     Ok(u32_at(record.body, 8).map(to_usize))
 }
 
-/// Le diapositive nell'ordine della `SlideListWithText`, seguendo la catena delle modifiche
-/// da `edit`; `None` se la catena non porta a un `DocumentContainer`.
-fn slides_by_persist(stream: &[u8], edit: usize) -> Result<Option<Vec<SlideRef>>, ExtractError> {
-    let mut persist: HashMap<u32, usize> = HashMap::new();
+/// Ciò che si ricava dalla catena delle modifiche incrementali.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct EditChain {
+    /// Offset delle `PersistDirectoryAtom`, ognuno una volta, dalla modifica più recente.
+    directories: Vec<usize>,
+    /// `docPersistIdRef` della modifica più recente che lo ha.
+    document_ref: Option<u32>,
+}
+
+/// Segue la catena delle `UserEditAtom` da `edit` (al più [`MAX_EDITS`] anelli, ognuno una
+/// volta); `None` se un anello non è una `UserEditAtom`. Una directory a cui puntano più
+/// modifiche compare una volta sola: rileggerla non aggiungerebbe nulla, e migliaia di
+/// modifiche di pochi byte moltiplicherebbero il lavoro.
+fn edit_chain(stream: &[u8], edit: usize) -> Result<Option<EditChain>, ExtractError> {
+    let mut chain = EditChain::default();
     let mut visited = HashSet::new();
+    let mut directories = HashSet::new();
     let mut next = Some(edit);
-    let mut document_ref = None;
     while let Some(offset) = next {
         if visited.len() >= MAX_EDITS || !visited.insert(offset) {
             break;
@@ -193,13 +204,32 @@ fn slides_by_persist(stream: &[u8], edit: usize) -> Result<Option<Vec<SlideRef>>
         if body.len() >= USER_EDIT_WITH_CRYPT {
             return Err(ExtractError::Encrypted);
         }
-        if document_ref.is_none() {
-            document_ref = u32_at(body, 16);
+        if chain.document_ref.is_none() {
+            chain.document_ref = u32_at(body, 16);
         }
-        if let Some(directory) = u32_at(body, 12).map(to_usize) {
-            read_persist_directory(stream, directory, &mut persist);
+        if let Some(directory) = u32_at(body, 12).map(to_usize)
+            && directories.insert(directory)
+        {
+            chain.directories.push(directory);
         }
         next = u32_at(body, 8).map(to_usize).filter(|&last| last != 0);
+    }
+    Ok(Some(chain))
+}
+
+/// Le diapositive nell'ordine della `SlideListWithText`, seguendo la catena delle modifiche
+/// da `edit`; `None` se la catena non porta a un `DocumentContainer`.
+fn slides_by_persist(stream: &[u8], edit: usize) -> Result<Option<Vec<SlideRef>>, ExtractError> {
+    let Some(EditChain {
+        directories,
+        document_ref,
+    }) = edit_chain(stream, edit)?
+    else {
+        return Ok(None);
+    };
+    let mut persist: HashMap<u32, usize> = HashMap::new();
+    for directory in directories {
+        read_persist_directory(stream, directory, &mut persist);
     }
     let Some(document) = document_ref
         .and_then(|id| persist.get(&id).copied())
@@ -444,6 +474,34 @@ mod tests {
         let (stream, user) = presentation(&slides, &[0, 0, 0]);
         let texts = slide_texts(&stream, Some(&user)).ok();
         assert_eq!(texts, Some(vec![(1, "una volta".to_owned())]));
+    }
+
+    /// Molte modifiche che puntano alla stessa `PersistDirectoryAtom`: la directory si
+    /// legge una volta sola, quelle diverse una volta ciascuna, dalla più recente.
+    #[test]
+    fn repeated_persist_directory_is_read_once() {
+        let directory = record(0, 0, RT_PERSIST_DIRECTORY, &u32s(&[1 | (1 << 20), 0]));
+        let mut stream = directory.clone();
+        let other = u32::try_from(stream.len()).unwrap_or(0);
+        stream.extend_from_slice(&directory);
+        // Dieci modifiche in catena: la prima (la più vecchia) punta all'altra directory.
+        let mut previous = 0_u32;
+        for index in 0..10 {
+            let at = u32::try_from(stream.len()).unwrap_or(0);
+            let target = if index == 0 { other } else { 0 };
+            let mut body = u32s(&[0, 0, previous, target, 1, 0]);
+            body.extend_from_slice(&[0; 4]);
+            stream.extend_from_slice(&record(0, 0, RT_USER_EDIT, &body));
+            previous = at;
+        }
+        let chain = edit_chain(&stream, to_usize(previous)).ok().flatten();
+        assert_eq!(
+            chain,
+            Some(EditChain {
+                directories: vec![0, to_usize(other)],
+                document_ref: Some(1),
+            })
+        );
     }
 
     #[test]

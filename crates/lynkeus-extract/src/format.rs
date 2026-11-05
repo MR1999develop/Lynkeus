@@ -361,21 +361,19 @@ pub(crate) enum Verdict {
 
 impl Format {
     /// Il formato di un file dal suo percorso, o `None` se l'estensione non è nel registro.
+    ///
+    /// Conta solo l'estensione: il resto del nome può non essere UTF-8 valido (un nome
+    /// Linux con byte qualsiasi, un nome Windows con un surrogato spaiato).
     pub fn for_path(path: &Path) -> Option<Format> {
         path.file_name()
-            .and_then(|name| name.to_str())
-            .and_then(Format::for_name)
+            .and_then(|name| file_format(name.as_encoded_bytes()))
     }
 
     /// Il formato dal nome di un file o di una voce d'archivio ("cartella/doc.DOCX"), o
     /// `None` se l'estensione non è nel registro. Separatori `/` e `\` entrambi ammessi.
     pub fn for_name(name: &str) -> Option<Format> {
         let file = name.rsplit(['/', '\\']).next().unwrap_or(name);
-        let (stem, extension) = file.rsplit_once('.')?;
-        if stem.is_empty() || extension.is_empty() {
-            return None;
-        }
-        Format::for_extension(extension)
+        file_format(file.as_bytes())
     }
 
     /// Il formato di un'estensione senza punto ("pdf", "Docx"), o `None`.
@@ -399,6 +397,18 @@ impl Format {
     fn is_ooxml(self) -> bool {
         matches!(self, Format::Docx | Format::Xlsx | Format::Pptx)
     }
+}
+
+/// Il formato dall'ultimo componente di un nome, in byte: l'estensione dopo l'ultimo punto,
+/// se il nome prima del punto e l'estensione non sono vuoti. Il punto è ASCII, quindi il
+/// taglio vale anche per i byte di un nome non UTF-8.
+fn file_format(file: &[u8]) -> Option<Format> {
+    let dot = file.iter().rposition(|&b| b == b'.')?;
+    let (stem, extension) = (file.get(..dot)?, file.get(dot + 1..)?);
+    if stem.is_empty() || extension.is_empty() {
+        return None;
+    }
+    Format::for_extension(std::str::from_utf8(extension).ok()?)
 }
 
 /// La riga del registro di `format`.
@@ -427,7 +437,40 @@ pub(crate) fn verify(declared: Format, found: Signature) -> Verdict {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
+
     use super::*;
+
+    /// "rel?.docx" con un byte (Unix) o un'unità UTF-16 (Windows) che non è UTF-8 valido.
+    fn non_utf8_name(extension: &str) -> OsString {
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let mut bytes = b"rel\xff.".to_vec();
+            bytes.extend_from_slice(extension.as_bytes());
+            OsString::from_vec(bytes)
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStringExt;
+            let mut wide: Vec<u16> = "rel".encode_utf16().collect();
+            wide.push(0xD800);
+            wide.extend(".".encode_utf16());
+            wide.extend(extension.encode_utf16());
+            OsString::from_wide(&wide)
+        }
+    }
+
+    /// Un nome che non è UTF-8 tiene il formato della sua estensione.
+    #[test]
+    fn non_utf8_name_keeps_its_format() {
+        let name = non_utf8_name("docx");
+        assert!(name.to_str().is_none());
+        assert_eq!(Format::for_path(Path::new(&name)), Some(Format::Docx));
+        let dir = Path::new("cartella").join(non_utf8_name("PDF"));
+        assert_eq!(Format::for_path(&dir), Some(Format::Pdf));
+        assert_eq!(Format::for_path(Path::new(&non_utf8_name("ignota"))), None);
+    }
 
     #[test]
     fn every_format_has_exactly_one_spec() {

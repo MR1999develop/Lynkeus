@@ -166,6 +166,15 @@ impl Element {
             .find(|(n, l, _)| *n == ns && l == local)
             .map(|(_, _, v)| v.as_str())
     }
+
+    /// I valori degli attributi con nome locale `local`, in qualunque namespace: per chi
+    /// deve prevedere che cosa farà una libreria che riconosce i nomi dal prefisso.
+    pub fn attrs_named<'a>(&'a self, local: &'a str) -> impl Iterator<Item = &'a str> + 'a {
+        self.attrs
+            .iter()
+            .filter(move |(_, l, _)| l == local)
+            .map(|(_, _, v)| v.as_str())
+    }
 }
 
 /// Un evento XML semplificato.
@@ -310,6 +319,47 @@ impl<R: BufRead> XmlReader<R> {
     }
 }
 
+/// Punto d'ingresso per il fuzzing, con i due dialetti. Oltre all'assenza di panic, gli
+/// oracoli: ogni chiusura corrisponde all'ultima apertura ancora aperta (stesso namespace e
+/// nome locale) e due letture degli stessi byte danno gli stessi eventi.
+#[cfg(any(test, feature = "fuzzing"))]
+pub(crate) fn fuzz(data: &[u8]) {
+    /// Eventi letti al più: un input di pochi KB non ne produce di più.
+    const MAX_EVENTS: usize = 1 << 20;
+    let read = |xhtml: bool| {
+        let mut reader = if xhtml {
+            XmlReader::xhtml(data)
+        } else {
+            XmlReader::new(data)
+        };
+        let mut open: Vec<(Ns, String)> = Vec::new();
+        let mut events = Vec::new();
+        while events.len() < MAX_EVENTS {
+            let Ok(event) = reader.next() else {
+                break;
+            };
+            match &event {
+                XmlEvent::Open(e) => open.push((e.ns, e.local.clone())),
+                XmlEvent::Close(ns, local) => {
+                    let opened = open.pop();
+                    assert_eq!(
+                        opened.as_ref(),
+                        Some(&(*ns, local.clone())),
+                        "chiusura che non corrisponde all'apertura"
+                    );
+                }
+                XmlEvent::Eof => break,
+                XmlEvent::Empty(_) | XmlEvent::Text(_) => {}
+            }
+            events.push(event);
+        }
+        events
+    };
+    for xhtml in [false, true] {
+        assert_eq!(read(xhtml), read(xhtml), "due letture diverse");
+    }
+}
+
 /// Entità HTML comuni nei libri (XHTML 1.1 con il DTD standard): spazi e trattini,
 /// virgolette, simboli, lettere accentate delle lingue europee occidentali.
 const HTML_ENTITIES: &[(&str, char)] = &[
@@ -440,7 +490,27 @@ fn xml_error(error: quick_xml::Error) -> ExtractError {
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
+
+    proptest! {
+        /// Gli oracoli del fuzzing su pezzi di XML plausibili e su byte qualsiasi.
+        #[test]
+        fn fuzz_oracles_hold(pieces in proptest::collection::vec(
+            prop_oneof![
+                Just("<a>".to_owned()), Just("</a>".to_owned()), Just("<b/>".to_owned()),
+                Just("<x:c xmlns:x=\"http://www.w3.org/1999/xhtml\">".to_owned()),
+                Just("</x:c>".to_owned()), Just("&amp;".to_owned()), Just("&nbsp;".to_owned()),
+                Just("<!DOCTYPE html>".to_owned()), Just("<![CDATA[<z>]]>".to_owned()),
+                "[a-z ]{0,6}",
+            ],
+            0..40,
+        ), noise in proptest::collection::vec(any::<u8>(), 0..256)) {
+            fuzz(pieces.concat().as_bytes());
+            fuzz(&noise);
+        }
+    }
 
     fn events(xml: &str) -> Result<Vec<XmlEvent>, ExtractError> {
         let mut reader = XmlReader::new(xml.as_bytes());

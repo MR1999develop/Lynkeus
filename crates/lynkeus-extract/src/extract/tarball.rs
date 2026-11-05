@@ -43,30 +43,33 @@ pub(crate) fn extract_gz(ctx: &mut Ctx<'_>, input: Input<'_>) -> Result<(), Fail
     check_depth(ctx)?;
     let name = content_name(ctx.current_name());
     let (source, compressed) = input.into_seekable(ctx)?;
-    let decoder = GzipErrors(MultiGzDecoder::new(BufReader::new(source)));
-    if Format::for_name(&name) == Some(Format::Tar) {
-        let stream = LimitedReader::for_container(decoder, ctx.budget(), compressed);
-        return read_tar(ctx, stream);
-    }
-    let mut stream = LimitedReader::new(decoder, ctx.budget(), Some(compressed));
-    // Un .gz con un tar dentro ma senza ".tar" nel nome: lo si riconosce dal contenuto.
+    let mut decoder = GzipErrors(MultiGzDecoder::new(BufReader::new(source)));
+    // Un .gz con un tar dentro ma senza ".tar" nel nome si riconosce dal contenuto: si
+    // leggono i primi byte (pochi, quindi senza limiti), poi l'intero flusso, testa
+    // compresa, passa dal lettore limitato del caso giusto.
+    let tar_by_name = Format::for_name(&name) == Some(Format::Tar);
     let mut head = Vec::with_capacity(SNIFF_BYTES);
-    let limit = u64::try_from(SNIFF_BYTES).unwrap_or(u64::MAX);
-    (&mut stream)
-        .take(limit)
-        .read_to_end(&mut head)
-        .map_err(classify_io)?;
-    let signature = Signature::sniff(&head);
-    let mut whole = io::Cursor::new(head).chain(stream);
-    if signature == Signature::Tar {
-        return read_tar(ctx, whole);
+    if !tar_by_name {
+        let limit = u64::try_from(SNIFF_BYTES).unwrap_or(u64::MAX);
+        (&mut decoder)
+            .take(limit)
+            .read_to_end(&mut head)
+            .map_err(classify_io)?;
+    }
+    let whole = io::Cursor::new(head).chain(decoder);
+    if tar_by_name || Signature::sniff(whole.get_ref().0.get_ref()) == Signature::Tar {
+        // Un solo archivio: il flusso del tar ha i limiti di un archivio, i byte li
+        // contano le sue voci.
+        let stream = LimitedReader::for_container(whole, ctx.budget(), compressed);
+        return read_tar(ctx, stream);
     }
     ctx.budget()
         .add_entries(1)
         .map_err(ExtractError::LimitExceeded)?;
     let declared = Format::for_name(&name).unwrap_or(Format::Text);
+    let mut stream = LimitedReader::new(whole, ctx.budget(), Some(compressed));
     ctx.within(entry_label(&name), |ctx| {
-        read_entry_stream(ctx, declared, &mut whole)
+        read_entry_stream(ctx, declared, &mut stream)
     })?;
     Ok(())
 }

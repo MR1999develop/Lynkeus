@@ -78,3 +78,12 @@ da LibreOffice, senza autore. Le date interne dei PDF possono variare tra le gen
 | `entita.docx` | `relazione.docx` con `<!DOCTYPE>` e entità annidate (`lol3` = 1000 volte `aragosta `) nel primo `w:t` di `word/document.xml` | DTD rifiutato: avviso "danneggiato"/non valido, nessuna espansione delle entità, nessun blocco |
 | `immagine-finta.pdf` | PNG 8x8 copiato da `demo/binario/immagine.png` con estensione `.pdf` | avviso "contenuto diverso dall'estensione", nessun blocco |
 | `riga-lunga.txt` | script Python: riga 1 di 2.000.000 caratteri senza spazi (`abcdefghij` ripetuto), riga 2 `aragosta` | nessun blocco, memoria limitata: `aragosta` trovata a riga 2; la riga 1 non contiene parole con `ar` |
+
+I file seguenti si rigenerano con `python -I fixtures/src/genera_malevoli.py` (solo libreria standard, byte per byte uguali; `dizionario-enorme.7z` richiede 7-Zip in `C:\Program Files\7-Zip\7z.exe`).
+
+| File | Produzione | Comportamento atteso |
+|---|---|---|
+| `sparso.xlsx` | foglio `Sparso` con due sole celle: A1 `aragosta` e XFD1048576 `città lontana` (stringhe condivise), dimensione dichiarata `A1:XFD1048576` | le due celle lette a flusso, nessun avviso; mai il rettangolo intero in memoria |
+| `sparso.zip` | `sparso.xlsx` seguito da `nota.txt` (`aragosta in nota`) | il processo estrattore non termina, `nota.txt` letta |
+| `slide-ripetute.pptx` | presentazione con 10.000 `p:sldId` verso la stessa diapositiva (`Stasera aragosta`) | una sola diapositiva letta (diapositiva 1) |
+| `dizionario-enorme.7z` | 7z di 7-Zip (LZMA2, intestazione non compressa) con `nota.txt` (`aragosta nel dizionario enorme`), dizionario dichiarato riscritto a 2 GiB e CRC ricalcolati | voce letta; il dizionario non si alloca in anticipo |

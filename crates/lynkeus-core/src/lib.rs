@@ -17,6 +17,7 @@
 #![forbid(unsafe_code)]
 
 pub mod accumulate;
+pub mod label;
 pub mod location;
 pub mod matcher;
 mod pattern;
@@ -26,6 +27,7 @@ mod unicode;
 pub mod unit;
 
 pub use accumulate::FileAccumulator;
+pub use label::neutralize_char;
 pub use location::{Location, MailPart, column_name};
 pub use matcher::{Snippet, TermSet, WordMatch, WordText, find_words, snippet, word_text};
 pub use query::{

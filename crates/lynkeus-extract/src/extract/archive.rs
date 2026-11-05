@@ -10,8 +10,9 @@
 //!   [`LimitKind::ArchiveDepth`] e non si apre;
 //! - voci: contate sull'elenco prima di decomprimere, sommate su tutto il file radice;
 //! - ogni voce: dimensioni dichiarate controllate subito, poi byte contati sul flusso
-//!   ([`LimitedReader`]); le voci cifrate danno l'avviso "protetto da password", i
-//!   collegamenti simbolici sono saltati;
+//!   ([`LimitedReader`]), con il rapporto di compressione sui byte compressi davvero letti;
+//!   le voci cifrate danno l'avviso "protetto da password", i collegamenti simbolici sono
+//!   saltati;
 //! - i nomi delle voci diventano etichette ([`entry_label`]) e decidono solo il formato:
 //!   nulla si scrive su disco; due voci con la stessa etichetta si distinguono con un
 //!   numero ([`UniqueLabels`]);
@@ -21,13 +22,16 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
 
+use lynkeus_core::neutralize_char;
 use zip::ZipArchive;
 use zip::read::ZipFile;
 use zip::result::ZipError;
 
 use crate::error::ExtractError;
 use crate::event::{SkipReason, Stopped, WarningKind};
-use crate::extract::budget::{LimitedReader, check_declared, classify_io};
+use crate::extract::budget::{
+    CountingSource, LimitedReader, ReadCounter, check_declared, classify_io,
+};
 use crate::extract::{Ctx, EntryRole, Fail, Input, Seekable, read_document};
 use crate::format::Format;
 use crate::limits::LimitKind;
@@ -35,30 +39,18 @@ use crate::limits::LimitKind;
 /// Lunghezza massima di un'etichetta, in byte.
 pub(crate) const MAX_LABEL_BYTES: usize = 1024;
 
-/// Un nome che viene dal file (voce d'archivio, foglio) reso etichetta: caratteri di
-/// controllo e di direzione del testo sostituiti da U+FFFD, al più [`MAX_LABEL_BYTES`] byte.
+/// Un nome che viene dal file (voce d'archivio, foglio) reso etichetta: i caratteri che
+/// mostrati potrebbero ingannare ([`neutralize_char`]) diventano U+FFFD, al più
+/// [`MAX_LABEL_BYTES`] byte.
 pub(crate) fn entry_label(raw: &str) -> String {
     let mut label = String::with_capacity(raw.len().min(MAX_LABEL_BYTES));
-    for c in raw.chars().map(neutralize) {
+    for c in raw.chars().map(neutralize_char) {
         if label.len() + c.len_utf8() > MAX_LABEL_BYTES {
             break;
         }
         label.push(c);
     }
     label
-}
-
-/// Sostituisce i caratteri che, mostrati, potrebbero ingannare (controllo, bidi).
-fn neutralize(c: char) -> char {
-    let bidi = matches!(
-        c,
-        '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{200E}' | '\u{200F}' | '\u{061C}'
-    );
-    if c.is_control() || bidi {
-        char::REPLACEMENT_CHARACTER
-    } else {
-        c
-    }
 }
 
 /// Etichette uniche tra le voci di un contenitore, assegnate nell'ordine in cui le voci si
@@ -119,10 +111,15 @@ pub(crate) fn zip_error(error: ZipError) -> ExtractError {
     }
 }
 
-/// Un contenitore zip aperto (archivio o documento), con la sua lunghezza in byte.
+/// Il flusso limitato di una voce di un [`Container`].
+pub(crate) type Part<'a> = LimitedReader<ZipFile<'a, CountingSource<Seekable>>>;
+
+/// Un contenitore zip aperto (archivio o documento), con la sua lunghezza in byte e il
+/// contatore dei byte che la libreria ne legge.
 pub(crate) struct Container {
-    pub zip: ZipArchive<Seekable>,
+    pub zip: ZipArchive<CountingSource<Seekable>>,
     len: u64,
+    read: ReadCounter,
 }
 
 impl Container {
@@ -130,12 +127,14 @@ impl Container {
     /// dà [`LimitKind::ArchiveEntries`].
     pub fn open(ctx: &Ctx<'_>, input: Input<'_>) -> Result<Container, ExtractError> {
         let (source, len) = input.into_seekable(ctx)?;
+        let source = CountingSource::new(source);
+        let read = source.counter();
         let zip = ZipArchive::new(source).map_err(zip_error)?;
         let entries = u64::try_from(zip.len()).unwrap_or(u64::MAX);
         if entries > ctx.limits().max_entries {
             return Err(ExtractError::LimitExceeded(LimitKind::ArchiveEntries));
         }
-        Ok(Container { zip, len })
+        Ok(Container { zip, len, read })
     }
 
     /// Vero se il contenitore ha la voce `name`.
@@ -153,11 +152,7 @@ impl Container {
     }
 
     /// Il flusso limitato della voce `name`, o `None` se non c'è.
-    pub fn part(
-        &mut self,
-        ctx: &Ctx<'_>,
-        name: &str,
-    ) -> Result<Option<LimitedReader<ZipFile<'_, Seekable>>>, ExtractError> {
+    pub fn part(&mut self, ctx: &Ctx<'_>, name: &str) -> Result<Option<Part<'_>>, ExtractError> {
         match self.zip.index_for_name(name) {
             Some(index) => self.entry(ctx, index).map(Some),
             None => Ok(None),
@@ -165,11 +160,8 @@ impl Container {
     }
 
     /// Il flusso limitato della voce `index`, dopo i controlli sulle dimensioni dichiarate.
-    fn entry(
-        &mut self,
-        ctx: &Ctx<'_>,
-        index: usize,
-    ) -> Result<LimitedReader<ZipFile<'_, Seekable>>, ExtractError> {
+    /// Il rapporto di compressione si conta poi sui byte davvero letti dal contenitore.
+    fn entry(&mut self, ctx: &Ctx<'_>, index: usize) -> Result<Part<'_>, ExtractError> {
         let meta = self.zip.by_index_data(index).map_err(zip_error)?;
         if meta.encrypted() {
             return Err(ExtractError::Encrypted);
@@ -178,14 +170,16 @@ impl Container {
         let compressed = meta.compressed_size().min(self.len);
         check_declared(meta.size(), compressed, ctx.limits())
             .map_err(ExtractError::LimitExceeded)?;
+        let read = self.read.clone();
+        // L'intestazione locale della voce si legge qui: non conta tra i byte compressi.
         let file = self.zip.by_index(index).map_err(zip_error)?;
-        Ok(LimitedReader::new(file, ctx.budget(), Some(compressed)))
+        Ok(LimitedReader::counted(file, ctx.budget(), read))
     }
 
     /// Restituisce la sorgente riportata all'inizio (per chi la rilegge, come calamine).
     pub fn into_source(self) -> Result<Seekable, ExtractError> {
         use std::io::{Seek, SeekFrom};
-        let mut source = self.zip.into_inner();
+        let mut source = self.zip.into_inner().into_inner();
         source
             .seek(SeekFrom::Start(0))
             .map_err(ExtractError::from_io)?;
@@ -439,6 +433,10 @@ mod tests {
         assert_eq!(
             entry_label("fattura\u{202E}fdp.exe"),
             "fattura\u{FFFD}fdp.exe"
+        );
+        assert_eq!(
+            entry_label("a\u{2028}b\u{200B}c\u{FEFF}"),
+            "a\u{FFFD}b\u{FFFD}c\u{FFFD}"
         );
         let long = "è".repeat(MAX_LABEL_BYTES);
         let label = entry_label(&long);

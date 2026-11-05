@@ -6,7 +6,8 @@
 //! - Il libro è un contenitore: ogni capitolo della spine è un documento con `inner` = il
 //!   suo percorso nel pacchetto (`OEBPS/cap2.xhtml`) e formato [`Format::Epub`]. Un capitolo
 //!   ripetuto nella spine si legge una volta; quelli fuori dalla spine (indice, copertina
-//!   non elencata) no.
+//!   non elencata) no. Come per gli archivi, i capitoli sono un livello più in profondità e
+//!   contano tra le voci del file radice.
 //! - Un'unità per blocco di testo non vuoto del capitolo ([`Location::Paragraph`], numerati
 //!   da 1 in ogni capitolo): paragrafi, titoli, voci di elenco, celle, citazioni, `div` con
 //!   testo proprio. Gli spazi si riducono a uno, `br` è un a capo; `head`, `script` e `style`
@@ -28,7 +29,7 @@ use lynkeus_core::Location;
 
 use crate::error::ExtractError;
 use crate::event::{Stopped, WarningKind};
-use crate::extract::archive::{Container, entry_label};
+use crate::extract::archive::{Container, check_depth, entry_label};
 use crate::extract::budget::classify_io;
 use crate::extract::ooxml::resolve_target;
 use crate::extract::xml::{Element, Ns, XmlEvent, XmlReader};
@@ -89,7 +90,11 @@ fn corrupt(reason: &str) -> ExtractError {
 }
 
 /// Estrae i capitoli di un EPUB, ognuno come documento.
+///
+/// Il libro è un contenitore come gli archivi: si apre solo se i capitoli stanno entro la
+/// profondità massima, e i capitoli contano tra le voci del file radice.
 pub(crate) fn extract(ctx: &mut Ctx<'_>, input: Input<'_>) -> Result<(), Fail> {
+    check_depth(ctx)?;
     let mut container = Container::open(ctx, input)?;
     if let Some(part) = container.part(ctx, MIMETYPE)? {
         let mut declared = Vec::new();
@@ -113,12 +118,15 @@ pub(crate) fn extract(ctx: &mut Ctx<'_>, input: Input<'_>) -> Result<(), Fail> {
         return Err(corrupt("pacchetto OPF assente").into());
     };
     let base = opf_path.rsplit_once('/').map_or("", |(dir, _)| dir);
-    let chapters = spine(XmlReader::new(BufReader::new(opf)), base)?;
     let mut seen = HashSet::new();
+    let chapters: Vec<String> = spine(XmlReader::new(BufReader::new(opf)), base)?
+        .into_iter()
+        .filter(|path| seen.insert(path.clone()))
+        .collect();
+    ctx.budget()
+        .add_entries(u64::try_from(chapters.len()).unwrap_or(u64::MAX))
+        .map_err(ExtractError::LimitExceeded)?;
     for path in chapters {
-        if !seen.insert(path.clone()) {
-            continue;
-        }
         let is_encrypted = encrypted.contains(&path);
         ctx.within(entry_label(&path), |ctx| {
             read_chapter(ctx, &mut container, &path, is_encrypted)
