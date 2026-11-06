@@ -96,6 +96,17 @@ const EXIT_PARENT_GONE: i32 = 3;
 /// principale chiude lo stdin, o subito quando il processo principale termina (anche a metà
 /// di un file: un decodificatore occupato non controlla nulla, e non c'è niente da salvare).
 fn extract_worker(args: impl Iterator<Item = OsString>) -> ExitCode {
+    // SAFETY: prima di ogni altra cosa del processo estrattore, chiamato dall'inizio di
+    // `main` (che ha solo letto gli argomenti e ristretto la ricerca delle DLL): un solo
+    // thread, nessun file aperto dal programma.
+    #[allow(
+        unsafe_code,
+        reason = "contratto di close_inherited_descriptors, l'unico unsafe fuori da windows_ffi"
+    )]
+    let closed = unsafe { worker::close_inherited_descriptors() };
+    if closed.is_err() {
+        return ExitCode::FAILURE;
+    }
     let Ok(config) = WorkerConfig::from_args(args) else {
         return ExitCode::from(2);
     };

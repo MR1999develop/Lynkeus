@@ -372,6 +372,14 @@ mod tests {
         }
     }
 
+    /// Il nome del file di [`exe`]: con `.exe` solo su Windows.
+    fn exe_file_name() -> String {
+        exe()
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    }
+
     fn entry() -> MenuEntry {
         MenuEntry::new(
             &exe(),
@@ -463,12 +471,12 @@ mod tests {
         assert!(is_own_command(
             &legacy,
             MenuTarget::FolderBackground,
-            "lynkeus-searcher.exe"
+            &exe_file_name()
         ));
         assert!(!is_own_command(
             &legacy,
             MenuTarget::Folders,
-            "lynkeus-searcher.exe"
+            &exe_file_name()
         ));
         let mut found = found(entry.label(), |t| entry.windows_command(t));
         found[2] = Some(FoundItem {
@@ -586,7 +594,7 @@ mod tests {
         let moved_exe = if cfg!(windows) {
             r"E:\nuova\lynkeus-searcher.exe"
         } else {
-            "/nuova/lynkeus-searcher.exe"
+            "/nuova/lynkeus-searcher"
         };
         let moved = found(entry.label(), |t| windows_command(moved_exe, t));
         assert_eq!(classify_windows(&moved, &entry), MenuState::Outdated);

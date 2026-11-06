@@ -62,7 +62,7 @@ use lynkeus_extract::protocol::{
     EntryRequest, ExtractRequest, FrameReader, FrameWriter, ProtocolError, Request, RequestId,
     Response,
 };
-use lynkeus_extract::worker::{WorkerConfig, watch_parent};
+use lynkeus_extract::worker::{self, WorkerConfig, watch_parent};
 use lynkeus_extract::{
     EntrySink, EventSink, ExtractEvent, ExtractOptions, Format, Stopped, WarningKind,
     extract_entry, extract_path,
@@ -99,6 +99,13 @@ const FOREVER: Duration = Duration::from_secs(3600);
 const ORPHAN_EXIT: i32 = 4;
 
 fn main() -> ExitCode {
+    // Come il `main` dell'app con `--extract-worker`, per prima cosa.
+    // SAFETY: inizio del `main`, un solo thread, nessun file aperto dal programma.
+    #[allow(unsafe_code, reason = "contratto di close_inherited_descriptors")]
+    let closed = unsafe { worker::close_inherited_descriptors() };
+    if closed.is_err() {
+        return ExitCode::FAILURE;
+    }
     let mut args = std::env::args_os().skip(1).peekable();
     let first = args.next();
     if first == Some(OsString::from(ORPHAN_PARENT_FLAG))

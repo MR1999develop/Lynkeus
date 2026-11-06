@@ -165,6 +165,27 @@ pub fn watch_parent(
     platform::watch_parent(expected, on_gone)
 }
 
+/// Chiude i descrittori ereditati dal padre oltre stdin, stdout e stderr (Linux; altrove non
+/// fa nulla): un estrattore compromesso da un file ostile non deve avere in mano pipe o file
+/// del processo che ha avviato l'app. [`run`] non la chiama, perché gira anche in un thread di
+/// un processo di prova: la chiama il `main` del processo estrattore, prima di [`run`].
+///
+/// Errore se i descrittori aperti non si leggono: il processo non deve servire richieste.
+///
+/// # Safety
+///
+/// Per prima cosa nel `main` del processo estrattore, con un solo thread e senza file aperti
+/// dal programma: ogni descrittore da 3 in su deve essere ereditato, senza un proprietario
+/// nel programma che lo userebbe o lo chiuderebbe dopo.
+#[allow(
+    unsafe_code,
+    reason = "chiude descrittori per numero: il chiamante garantisce che nessuno li possiede"
+)]
+pub unsafe fn close_inherited_descriptors() -> io::Result<()> {
+    // SAFETY: stesso contratto, garantito dal chiamante.
+    unsafe { platform::close_inherited_descriptors() }
+}
+
 /// Il ciclo del processo estrattore su `input` (stdin) e `output` (stdout).
 ///
 /// Prima di leggere qualunque richiesta avvia la sorveglianza del padre di `config` e impone

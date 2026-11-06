@@ -2843,6 +2843,7 @@ dependencies = [
  "proptest",
  "quick-xml 0.42.0",
  "rlimit",
+ "rustix 1.1.6",
  "serde",
  "sevenz-rust2",
  "tar",

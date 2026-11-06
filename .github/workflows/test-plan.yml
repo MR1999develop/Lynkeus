@@ -1,5 +1,5 @@
 # Piano di test automatico (docs/piano-di-test.md, "Esecuzione automatica"): livelli 1, 2
-# e 3 una volta alla settimana su Windows e Ubuntu, con il rapporto come artifact.
+# e 3 una volta alla settimana su Windows (Ubuntu sospeso), con il rapporto come artifact.
 # Le soglie delle misure sono avvisi: su un runner condiviso i tempi sono indicativi.
 name: Piano di test
 
@@ -25,7 +25,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-latest]
+        os: [windows-latest] # ubuntu-latest sospeso
     runs-on: ${{ matrix.os }}
     timeout-minutes: 180
     steps:

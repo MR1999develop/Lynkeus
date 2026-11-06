@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Copyright (C) 2026 MR
 
-//! Differenze tra sistemi operativi (apertura dei file, limite di memoria e padre del
-//! processo estrattore); nessun altro modulo usa `cfg`.
+//! Differenze tra sistemi operativi (apertura dei file, descrittori ereditati, limite di
+//! memoria e padre del processo estrattore); nessun altro modulo usa `cfg` né `unsafe`.
 
 use std::fs::File;
 use std::io;
@@ -58,6 +58,31 @@ pub fn watch_parent(
     imp::watch_parent(expected, on_gone)
 }
 
+/// Chiude i descrittori di file ereditati dal processo padre oltre stdin, stdout e stderr,
+/// prima di leggere qualunque richiesta: un estrattore compromesso da un file ostile non deve
+/// avere in mano pipe o file aperti dal processo che ha avviato l'app (per esempio le pipe del
+/// jobserver di cargo, o descrittori lasciati aperti da un file manager).
+///
+/// Linux: elenca `/proc/self/fd` e chiude ogni numero da 3 in su. Windows: non fa nulla, il
+/// processo principale passa al figlio solo gli handle elencati. Altri sistemi: non fa nulla.
+///
+/// Errore se `/proc/self/fd` non si legge: chi chiama non serve richieste.
+///
+/// # Safety
+///
+/// Va chiamata per prima cosa nel `main` di un processo estrattore, con un solo thread e
+/// senza file aperti dal programma: ogni descrittore da 3 in su deve essere ereditato, senza
+/// un proprietario nel programma (`File`, `OwnedFd`, pipe, …) che lo userebbe o lo
+/// chiuderebbe dopo.
+#[allow(
+    unsafe_code,
+    reason = "la funzione chiude descrittori per numero: il chiamante garantisce che nessuno li possiede"
+)]
+pub unsafe fn close_inherited_descriptors() -> io::Result<()> {
+    // SAFETY: le condizioni sono quelle di questa funzione, garantite dal chiamante.
+    unsafe { imp::close_inherited_descriptors() }
+}
+
 /// Intervallo dei controlli del padre.
 #[cfg(any(target_os = "linux", test))]
 const PARENT_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
@@ -105,6 +130,15 @@ mod imp {
 
     #[expect(
         clippy::unnecessary_wraps,
+        reason = "stessa firma della versione Linux, che può fallire"
+    )]
+    #[allow(unsafe_code, reason = "stessa firma della versione Linux")]
+    pub unsafe fn close_inherited_descriptors() -> io::Result<()> {
+        Ok(())
+    }
+
+    #[expect(
+        clippy::unnecessary_wraps,
         reason = "stessa firma della versione Unix, che può fallire"
     )]
     pub fn limit_address_space(_bytes: u64) -> io::Result<MemoryLimitOwner> {
@@ -133,6 +167,46 @@ mod imp {
 
     pub fn open_for_reading(path: &Path) -> io::Result<File> {
         File::open(path)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[allow(
+        unsafe_code,
+        reason = "chiudere un descrittore ereditato, che nessun oggetto del programma possiede"
+    )]
+    pub unsafe fn close_inherited_descriptors() -> io::Result<()> {
+        /// Il primo descrittore dopo stdin, stdout e stderr.
+        const FIRST_INHERITED: i32 = 3;
+
+        // Prima l'elenco, poi le chiusure: l'elenco tiene aperto un descrittore suo, che
+        // risulta nell'elenco ed è già chiuso quando si chiude (EBADF, ignorato).
+        let mut inherited = Vec::new();
+        for entry in std::fs::read_dir("/proc/self/fd")? {
+            let name = entry?.file_name();
+            if let Some(fd) = name.to_str().and_then(|name| name.parse::<i32>().ok())
+                && fd >= FIRST_INHERITED
+            {
+                inherited.push(fd);
+            }
+        }
+        for fd in inherited {
+            // SAFETY: per il contratto della funzione `fd` è un descrittore ereditato (o quello
+            // dell'elenco, già chiuso): nessun oggetto del programma lo possiede né lo userà, e
+            // con un solo thread nessuno può aprire un file che riceva lo stesso numero prima
+            // della chiusura. `close` su un numero già chiuso fallisce con EBADF senza effetti.
+            unsafe { rustix::io::close(fd) };
+        }
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "stessa firma della versione Linux, che può fallire"
+    )]
+    #[allow(unsafe_code, reason = "stessa firma della versione Linux")]
+    pub unsafe fn close_inherited_descriptors() -> io::Result<()> {
+        Ok(())
     }
 
     pub fn limit_address_space(bytes: u64) -> io::Result<MemoryLimitOwner> {

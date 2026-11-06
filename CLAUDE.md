@@ -18,7 +18,8 @@ Solo ciò che è specifico di questo progetto. Le decisioni stanno in `PLAN.md`.
 
 ## `unsafe`
 
-- `#![forbid(unsafe_code)]` in core, extract ed engine; nell'app `#![deny(unsafe_code)]` con un solo modulo ammesso, `crates/lynkeus-app/src/platform/windows_ffi.rs`.
+- `#![forbid(unsafe_code)]` in core ed engine; nell'app `#![deny(unsafe_code)]` con un solo modulo ammesso, `crates/lynkeus-app/src/platform/windows_ffi.rs`.
+- In extract `#![deny(unsafe_code)]` con una sola eccezione: `unsafe fn close_inherited_descriptors` (`crates/lynkeus-extract/src/platform.rs`, esposta da `worker`), che su Linux chiude i descrittori ereditati oltre 0, 1 e 2. È `unsafe` perché chiude descrittori per numero: si chiama solo all'inizio del `main` di un processo estrattore (`extract_worker` in `crates/lynkeus-app/src/main.rs` e il processo di prova del motore), mai da `worker::run`, che gira anche in un thread dei test.
 - Nei test, solo `crates/lynkeus-engine/tests/misura/mod.rs` (una chiamata a `K32GetProcessMemoryInfo` per la memoria di picco), con `// SAFETY:` e interfaccia safe.
 
 ## Documenti di stato e decisioni
@@ -60,6 +61,12 @@ Dipendenze in una sola direzione: `app → engine → extract → core`.
 - `revisore-codice` (opus): rivede un diff o un ramo rispetto al piano e alle skill; solo lettura.
 
 Orchestrazione: si lavora in parallelo solo su file che non si sovrappongono; i lavori paralleli sul codice usano un worktree ciascuno.
+
+## GitHub
+
+- Repository `MR1999develop/Lynkeus`, pubblico. Il ruleset di `main` vieta push diretti, force push e cancellazione: ogni modifica passa da un ramo e da una PR, unita con un merge commit quando `check (windows-latest)` è verde, senza eccezioni.
+- Ubuntu è sospeso nella CI, nel rilascio e nel piano di test (decisione del 2026-11-06), finché i test Linux non passano: la PR #1 ha corretto i primi errori, il resto è da verificare. Per riattivarlo si rimette `ubuntu-latest` nelle matrici e `check (ubuntu-latest)` nel ruleset di `main`.
+- Rilascio: tag `v<versione di Cargo.toml>`; `release.yml` crea una bozza, pubblicata a mano dopo il controllo. I tag `v*` non si spostano né si cancellano e le release pubblicate sono immutabili.
 
 ## Eccezioni alle regole generali
 
