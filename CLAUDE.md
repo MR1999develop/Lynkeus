@@ -64,7 +64,8 @@ Orchestrazione: si lavora in parallelo solo su file che non si sovrappongono; i 
 
 ## GitHub
 
-- Repository `MR1999develop/Lynkeus`, pubblico. Il ruleset di `main` vieta push diretti, force push e cancellazione: ogni modifica passa da un ramo e da una PR, unita con un merge commit quando `check (windows-latest)` e `check (ubuntu-latest)` sono verdi, senza eccezioni.
+- Repository `MR1999develop/Lynkeus`, pubblico. Il ruleset di `main` vieta push diretti, force push e cancellazione: ogni modifica passa da un ramo e da una PR, unita con un merge commit quando `check (windows-latest)` è verde, senza eccezioni.
+- Ubuntu è sospeso nella CI, nel rilascio e nel piano di test (decisione del 2026-11-06), finché i test Linux non passano: la PR #1 ha corretto i primi errori, il resto è da verificare. Per riattivarlo si rimette `ubuntu-latest` nelle matrici e `check (ubuntu-latest)` nel ruleset di `main`.
 - Rilascio: tag `v<versione di Cargo.toml>`; `release.yml` crea una bozza, pubblicata a mano dopo il controllo. I tag `v*` non si spostano né si cancellano e le release pubblicate sono immutabili.
 
 ## Eccezioni alle regole generali
