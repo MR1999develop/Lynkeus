@@ -61,6 +61,11 @@ Dipendenze in una sola direzione: `app → engine → extract → core`.
 
 Orchestrazione: si lavora in parallelo solo su file che non si sovrappongono; i lavori paralleli sul codice usano un worktree ciascuno.
 
+## GitHub
+
+- Repository `MR1999develop/Lynkeus`, pubblico. Il ruleset di `main` vieta push diretti, force push e cancellazione: ogni modifica passa da un ramo e da una PR, unita con un merge commit quando `check (windows-latest)` e `check (ubuntu-latest)` sono verdi, senza eccezioni.
+- Rilascio: tag `v<versione di Cargo.toml>`; `release.yml` crea una bozza, pubblicata a mano dopo il controllo. I tag `v*` non si spostano né si cancellano e le release pubblicate sono immutabili.
+
 ## Eccezioni alle regole generali
 
 1. **Firma degli eseguibili** (permanente). Eccezione alla regola che chiede la firma SHA-256 con marca temporale di ogni EXE distribuito.
