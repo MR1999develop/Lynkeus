@@ -23,7 +23,8 @@
 //! mandare all'estrattore), [`event`] e [`protocol`]: i decoder dei formati complessi girano
 //! solo nel processo estrattore (ADR 0001).
 
-#![forbid(unsafe_code)]
+// Un solo blocco `unsafe`, in `platform` (chiusura dei descrittori ereditati su Linux).
+#![deny(unsafe_code)]
 
 pub mod error;
 pub mod event;

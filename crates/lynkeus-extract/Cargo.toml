@@ -34,6 +34,10 @@ zip.workspace = true
 [target.'cfg(unix)'.dependencies]
 rlimit.workspace = true
 
+# Chiusura dei descrittori ereditati nel processo estrattore (`platform.rs`).
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix.workspace = true
+
 [dev-dependencies]
 proptest.workspace = true
 

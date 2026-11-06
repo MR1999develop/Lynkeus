@@ -62,7 +62,7 @@ use lynkeus_extract::protocol::{
     EntryRequest, ExtractRequest, FrameReader, FrameWriter, ProtocolError, Request, RequestId,
     Response,
 };
-use lynkeus_extract::worker::{WorkerConfig, watch_parent};
+use lynkeus_extract::worker::{self, WorkerConfig, watch_parent};
 use lynkeus_extract::{
     EntrySink, EventSink, ExtractEvent, ExtractOptions, Format, Stopped, WarningKind,
     extract_entry, extract_path,
@@ -99,6 +99,10 @@ const FOREVER: Duration = Duration::from_secs(3600);
 const ORPHAN_EXIT: i32 = 4;
 
 fn main() -> ExitCode {
+    // Come `lynkeus_extract::worker::run`, per prima cosa.
+    if worker::close_inherited_descriptors().is_err() {
+        return ExitCode::FAILURE;
+    }
     let mut args = std::env::args_os().skip(1).peekable();
     let first = args.next();
     if first == Some(OsString::from(ORPHAN_PARENT_FLAG))

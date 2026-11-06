@@ -140,6 +140,9 @@ pub enum WorkerError {
     /// Il limite di memoria manca nella configurazione o non si è potuto impostare.
     #[error("limite di memoria non impostato")]
     MemoryLimit(#[source] io::Error),
+    /// I descrittori ereditati dal processo padre non si sono potuti elencare.
+    #[error("descrittori ereditati non chiusi")]
+    InheritedDescriptors(#[source] io::Error),
     /// La sorveglianza del processo principale non è partita.
     #[error("sorveglianza del processo principale non avviata")]
     ParentWatch(#[source] io::Error),
@@ -165,9 +168,18 @@ pub fn watch_parent(
     platform::watch_parent(expected, on_gone)
 }
 
+/// Chiude i descrittori ereditati oltre stdin, stdout e stderr (Linux; altrove non fa nulla).
+/// [`run`] la chiama da sé, per prima cosa; serve a parte solo a un processo di prova che non
+/// usa [`run`], all'avvio, prima di aprire file o avviare thread.
+///
+/// Errore se i descrittori aperti non si leggono.
+pub fn close_inherited_descriptors() -> io::Result<()> {
+    platform::close_inherited_descriptors()
+}
+
 /// Il ciclo del processo estrattore su `input` (stdin) e `output` (stdout).
 ///
-/// Prima di leggere qualunque richiesta avvia la sorveglianza del padre di `config` e impone
+/// Prima di leggere qualunque richiesta chiude i descrittori ereditati, avvia la sorveglianza del padre di `config` e impone
 /// il limite di memoria di `config`, obbligatorio: senza, [`WorkerError::MemoryLimit`] e
 /// nessuna richiesta servita. Quando il padre termina chiama `on_parent_gone` (l'app termina
 /// il processo: in questo crate nessun modulo gestisce i processi); se torna, l'estrazione in
@@ -185,6 +197,7 @@ pub fn run<R: Read, W: Write>(
             "limite di memoria mancante",
         )));
     };
+    platform::close_inherited_descriptors().map_err(WorkerError::InheritedDescriptors)?;
     let parent_gone = Arc::new(AtomicBool::new(false));
     let signal = Arc::clone(&parent_gone);
     watch_parent(config.parent_pid, move || {

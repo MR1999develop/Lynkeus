@@ -18,7 +18,8 @@ Solo ciò che è specifico di questo progetto. Le decisioni stanno in `PLAN.md`.
 
 ## `unsafe`
 
-- `#![forbid(unsafe_code)]` in core, extract ed engine; nell'app `#![deny(unsafe_code)]` con un solo modulo ammesso, `crates/lynkeus-app/src/platform/windows_ffi.rs`.
+- `#![forbid(unsafe_code)]` in core ed engine; nell'app `#![deny(unsafe_code)]` con un solo modulo ammesso, `crates/lynkeus-app/src/platform/windows_ffi.rs`.
+- In extract `#![deny(unsafe_code)]` con un solo blocco ammesso: `close_inherited_descriptors` in `crates/lynkeus-extract/src/platform.rs` (Linux), che all'avvio del processo estrattore chiude i descrittori ereditati oltre 0, 1 e 2.
 - Nei test, solo `crates/lynkeus-engine/tests/misura/mod.rs` (una chiamata a `K32GetProcessMemoryInfo` per la memoria di picco), con `// SAFETY:` e interfaccia safe.
 
 ## Documenti di stato e decisioni
