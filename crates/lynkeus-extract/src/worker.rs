@@ -140,9 +140,6 @@ pub enum WorkerError {
     /// Il limite di memoria manca nella configurazione o non si è potuto impostare.
     #[error("limite di memoria non impostato")]
     MemoryLimit(#[source] io::Error),
-    /// I descrittori ereditati dal processo padre non si sono potuti elencare.
-    #[error("descrittori ereditati non chiusi")]
-    InheritedDescriptors(#[source] io::Error),
     /// La sorveglianza del processo principale non è partita.
     #[error("sorveglianza del processo principale non avviata")]
     ParentWatch(#[source] io::Error),
@@ -168,18 +165,30 @@ pub fn watch_parent(
     platform::watch_parent(expected, on_gone)
 }
 
-/// Chiude i descrittori ereditati oltre stdin, stdout e stderr (Linux; altrove non fa nulla).
-/// [`run`] la chiama da sé, per prima cosa; serve a parte solo a un processo di prova che non
-/// usa [`run`], all'avvio, prima di aprire file o avviare thread.
+/// Chiude i descrittori ereditati dal padre oltre stdin, stdout e stderr (Linux; altrove non
+/// fa nulla): un estrattore compromesso da un file ostile non deve avere in mano pipe o file
+/// del processo che ha avviato l'app. [`run`] non la chiama, perché gira anche in un thread di
+/// un processo di prova: la chiama il `main` del processo estrattore, prima di [`run`].
 ///
-/// Errore se i descrittori aperti non si leggono.
-pub fn close_inherited_descriptors() -> io::Result<()> {
-    platform::close_inherited_descriptors()
+/// Errore se i descrittori aperti non si leggono: il processo non deve servire richieste.
+///
+/// # Safety
+///
+/// Per prima cosa nel `main` del processo estrattore, con un solo thread e senza file aperti
+/// dal programma: ogni descrittore da 3 in su deve essere ereditato, senza un proprietario
+/// nel programma che lo userebbe o lo chiuderebbe dopo.
+#[allow(
+    unsafe_code,
+    reason = "chiude descrittori per numero: il chiamante garantisce che nessuno li possiede"
+)]
+pub unsafe fn close_inherited_descriptors() -> io::Result<()> {
+    // SAFETY: stesso contratto, garantito dal chiamante.
+    unsafe { platform::close_inherited_descriptors() }
 }
 
 /// Il ciclo del processo estrattore su `input` (stdin) e `output` (stdout).
 ///
-/// Prima di leggere qualunque richiesta chiude i descrittori ereditati, avvia la sorveglianza del padre di `config` e impone
+/// Prima di leggere qualunque richiesta avvia la sorveglianza del padre di `config` e impone
 /// il limite di memoria di `config`, obbligatorio: senza, [`WorkerError::MemoryLimit`] e
 /// nessuna richiesta servita. Quando il padre termina chiama `on_parent_gone` (l'app termina
 /// il processo: in questo crate nessun modulo gestisce i processi); se torna, l'estrazione in
@@ -197,7 +206,6 @@ pub fn run<R: Read, W: Write>(
             "limite di memoria mancante",
         )));
     };
-    platform::close_inherited_descriptors().map_err(WorkerError::InheritedDescriptors)?;
     let parent_gone = Arc::new(AtomicBool::new(false));
     let signal = Arc::clone(&parent_gone);
     watch_parent(config.parent_pid, move || {

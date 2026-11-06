@@ -63,14 +63,24 @@ pub fn watch_parent(
 /// avere in mano pipe o file aperti dal processo che ha avviato l'app (per esempio le pipe del
 /// jobserver di cargo, o descrittori lasciati aperti da un file manager).
 ///
-/// Linux: elenca `/proc/self/fd` e chiude ogni numero da 3 in su. Va chiamata all'avvio,
-/// con un solo thread e senza file aperti da questo processo: i numeri chiusi non
-/// appartengono a nessun oggetto del programma. Windows: non fa nulla, il processo principale
-/// passa al figlio solo gli handle elencati. Altri sistemi: non fa nulla.
+/// Linux: elenca `/proc/self/fd` e chiude ogni numero da 3 in su. Windows: non fa nulla, il
+/// processo principale passa al figlio solo gli handle elencati. Altri sistemi: non fa nulla.
 ///
 /// Errore se `/proc/self/fd` non si legge: chi chiama non serve richieste.
-pub fn close_inherited_descriptors() -> io::Result<()> {
-    imp::close_inherited_descriptors()
+///
+/// # Safety
+///
+/// Va chiamata per prima cosa nel `main` di un processo estrattore, con un solo thread e
+/// senza file aperti dal programma: ogni descrittore da 3 in su deve essere ereditato, senza
+/// un proprietario nel programma (`File`, `OwnedFd`, pipe, …) che lo userebbe o lo
+/// chiuderebbe dopo.
+#[allow(
+    unsafe_code,
+    reason = "la funzione chiude descrittori per numero: il chiamante garantisce che nessuno li possiede"
+)]
+pub unsafe fn close_inherited_descriptors() -> io::Result<()> {
+    // SAFETY: le condizioni sono quelle di questa funzione, garantite dal chiamante.
+    unsafe { imp::close_inherited_descriptors() }
 }
 
 /// Intervallo dei controlli del padre.
@@ -122,7 +132,8 @@ mod imp {
         clippy::unnecessary_wraps,
         reason = "stessa firma della versione Linux, che può fallire"
     )]
-    pub fn close_inherited_descriptors() -> io::Result<()> {
+    #[allow(unsafe_code, reason = "stessa firma della versione Linux")]
+    pub unsafe fn close_inherited_descriptors() -> io::Result<()> {
         Ok(())
     }
 
@@ -163,7 +174,7 @@ mod imp {
         unsafe_code,
         reason = "chiudere un descrittore ereditato, che nessun oggetto del programma possiede"
     )]
-    pub fn close_inherited_descriptors() -> io::Result<()> {
+    pub unsafe fn close_inherited_descriptors() -> io::Result<()> {
         /// Il primo descrittore dopo stdin, stdout e stderr.
         const FIRST_INHERITED: i32 = 3;
 
@@ -179,10 +190,10 @@ mod imp {
             }
         }
         for fd in inherited {
-            // SAFETY: `fd` è un descrittore ereditato all'avvio (o quello dell'elenco, già
-            // chiuso): nessun oggetto di questo programma lo possiede né lo userà, e con un
-            // solo thread nessuno può aprire un file che riceva lo stesso numero prima della
-            // chiusura. `close` su un numero già chiuso fallisce con EBADF senza effetti.
+            // SAFETY: per il contratto della funzione `fd` è un descrittore ereditato (o quello
+            // dell'elenco, già chiuso): nessun oggetto del programma lo possiede né lo userà, e
+            // con un solo thread nessuno può aprire un file che riceva lo stesso numero prima
+            // della chiusura. `close` su un numero già chiuso fallisce con EBADF senza effetti.
             unsafe { rustix::io::close(fd) };
         }
         Ok(())
@@ -193,7 +204,8 @@ mod imp {
         clippy::unnecessary_wraps,
         reason = "stessa firma della versione Linux, che può fallire"
     )]
-    pub fn close_inherited_descriptors() -> io::Result<()> {
+    #[allow(unsafe_code, reason = "stessa firma della versione Linux")]
+    pub unsafe fn close_inherited_descriptors() -> io::Result<()> {
         Ok(())
     }
 

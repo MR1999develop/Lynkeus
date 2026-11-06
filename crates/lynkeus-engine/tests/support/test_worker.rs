@@ -99,8 +99,11 @@ const FOREVER: Duration = Duration::from_secs(3600);
 const ORPHAN_EXIT: i32 = 4;
 
 fn main() -> ExitCode {
-    // Come `lynkeus_extract::worker::run`, per prima cosa.
-    if worker::close_inherited_descriptors().is_err() {
+    // Come il `main` dell'app con `--extract-worker`, per prima cosa.
+    // SAFETY: inizio del `main`, un solo thread, nessun file aperto dal programma.
+    #[allow(unsafe_code, reason = "contratto di close_inherited_descriptors")]
+    let closed = unsafe { worker::close_inherited_descriptors() };
+    if closed.is_err() {
         return ExitCode::FAILURE;
     }
     let mut args = std::env::args_os().skip(1).peekable();
