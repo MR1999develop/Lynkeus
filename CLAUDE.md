@@ -5,7 +5,8 @@ Solo ciò che è specifico di questo progetto. Le decisioni stanno in `PLAN.md`.
 ## Lingue
 
 - Interfaccia in italiano e inglese (Fluent, `locales/it` e `locales/en`).
-- Identificatori nel codice in inglese; commenti, documenti e messaggi di commit in italiano.
+- In inglese (regola generale del 2026-11-07): identificatori, commenti, test, messaggi di commit, nomi dei rami, PR, `README`, `docs/`, `PLAN.md`, `SECURITY.md`. In italiano solo questo file, la skill del progetto (`lynkeus-internals`) e le istruzioni degli agenti (`.claude/agents/`).
+- Migrazione in corso: commenti e documenti scritti prima del 2026-11-07 sono ancora in italiano (circa 160 file di codice e 15 documenti). Un file che si modifica si traduce nello stesso ramo, in un commit `tidy:` separato; `docs/` e `PLAN.md` si traducono in un blocco di lavoro dedicato. I dati di prova (`fixtures/`) restano nella loro lingua: sono input dei test.
 
 ## Comandi
 
